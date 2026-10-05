@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+task_root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app/Contents/Developer ]; then
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+mkdir -p "$task_root/mac-host/.build/module-cache" "$task_root/mac-host/.build/spm-cache"
+export CLANG_MODULE_CACHE_PATH="$task_root/mac-host/.build/module-cache"
+export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
+cd "$task_root/mac-host"
+swift build -c release --cache-path "$task_root/mac-host/.build/spm-cache" "$@"
+task_binary="$(swift build -c release --show-bin-path --cache-path "$task_root/mac-host/.build/spm-cache" "$@")"
+task_app="$task_root/dist/ThunderDisplayHost.app"
+mkdir -p "$task_app/Contents/MacOS"
+cp "$task_binary/ThunderDisplayHost" "$task_app/Contents/MacOS/ThunderDisplayHost.new"
+mv "$task_app/Contents/MacOS/ThunderDisplayHost.new" "$task_app/Contents/MacOS/ThunderDisplayHost"
+cp "$task_root/mac-host/Info.plist" "$task_app/Contents/Info.plist"
+cp "$task_binary/ThunderDisplayBoot" "$task_app/Contents/MacOS/ThunderDisplayBoot"
+mkdir -p "$task_app/Contents/Library/LaunchAgents" "$task_app/Contents/Library/LaunchDaemons" "$task_app/Contents/Resources"
+cp "$task_root/mac-host/Services/dev.thunderdisplay.host.agent.plist" "$task_app/Contents/Library/LaunchAgents/"
+# Retire the old bundle daemon resource as well as its system registration.
+rm -f "$task_app/Contents/Library/LaunchDaemons/dev.thunderdisplay.boot.plist"
+cp "$task_root/mac-host/Services/dev.thunderdisplay.boot.system.plist" "$task_app/Contents/Resources/"
+cp "$task_root/mac-host/Services/dev.thunderdisplay.loginwindow.plist" "$task_app/Contents/Resources/"
+cp "$task_root/scripts/install-boot-service.sh" "$task_app/Contents/Resources/"
+python3 "$task_root/scripts/sign-mac.py" "$task_app"
+printf 'Built %s\n' "$task_app"

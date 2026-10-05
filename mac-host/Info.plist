@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.thunderdisplay.host</string>
+<key>CFBundleName</key><string>ThunderDisplayHost</string>
+<key>CFBundleExecutable</key><string>ThunderDisplayHost</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.8.1</string>
+<key>CFBundleVersion</key><string>21</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><true/>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSScreenCaptureUsageDescription</key><string>将 Mac 桌面通过本地雷雳网桥传输到你的 Windows 电脑。</string>
+<key>NSLocalNetworkUsageDescription</key><string>Connect to your paired Windows computer over the local Thunderbolt Bridge.</string>
+</dict></plist>
