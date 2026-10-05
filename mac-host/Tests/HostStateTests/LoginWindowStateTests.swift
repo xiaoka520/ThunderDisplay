@@ -49,4 +49,60 @@ final class LoginWindowStateTests: XCTestCase {
         XCTAssertTrue(decoded.captureChecked); XCTAssertFalse(decoded.inputChecked)
         XCTAssertFalse(decoded.ownsPort(at: 101))
     }
+    func testPreviousBootHeartbeatIsReadableOnlyAsHistory() throws {
+        // Written 96 s into the previous boot, exactly like the observed record.
+        // Uptime restarts at 0, so a freshness-checked read must reject it while the
+        // age-independent read still explains why pre-login capture never started.
+        let record = LoginWindowState(pid: 279, uptime: 96.3, phase: .stopped, detail: "LoginWindow agent stopped",
+                                      previousPhase: .blocked, previousDetail: "Thunderbolt Bridge unavailable")
+        XCTAssertFalse(record.fresh(at: 12, maximumAge: 86400))
+        XCTAssertFalse(record.ownsPort(at: 12))
+        XCTAssertTrue(record.isWellFormedRecord)
+        XCTAssertEqual(record.previousPhase, .blocked)
+        XCTAssertEqual(record.previousDetail, "Thunderbolt Bridge unavailable")
+        XCTAssertEqual(try JSONDecoder().decode(LoginWindowState.self, from: JSONEncoder().encode(record)), record)
+    }
+    func testHeartbeatWithoutSnapshotFieldsStillDecodes() throws {
+        // Verbatim shape of a heartbeat written by an already-installed binary. New
+        // fields must stay optional or an upgrade would hide the last record.
+        let legacy = Data(#"{"detail":"LoginWindow agent stopped","pid":279,"uptime":96.32592204166667,"inputChecked":false,"phase":"stopped","captureChecked":false,"port":47990,"version":1}"#.utf8)
+        let decoded = try JSONDecoder().decode(LoginWindowState.self, from: legacy)
+        XCTAssertNil(decoded.previousPhase); XCTAssertNil(decoded.previousDetail); XCTAssertNil(decoded.recordedAt)
+        XCTAssertTrue(decoded.isWellFormedRecord)
+        XCTAssertFalse(decoded.ownsPort(at: 12))
+    }
+    func testSnapshotFieldsAreBoundedAndCannotForgeAListener() throws {
+        let object: [String: Any] = ["version": 1, "pid": 1, "uptime": 10, "phase": "stopped", "detail": "d", "port": 47990,
+                                     "captureChecked": false, "inputChecked": false,
+                                     "previousDetail": String(repeating: "x", count: 1025)]
+        let decoded = try JSONDecoder().decode(LoginWindowState.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertFalse(decoded.isWellFormedRecord)
+        XCTAssertFalse(decoded.ownsPort(at: 11))
+        // A crafted snapshot must not promote a stopped record into a live claim.
+        var claiming = object
+        claiming["previousDetail"] = "short"; claiming["previousPhase"] = "listening"
+        let stopped = try JSONDecoder().decode(LoginWindowState.self, from: JSONSerialization.data(withJSONObject: claiming))
+        XCTAssertFalse(stopped.ownsPort(at: 11))
+    }
+    func testConsoleOwnershipRulesLeaveNoGapBetweenBootAndAgent() {
+        // A missing console user means the login window owns the display: the boot
+        // helper already reads it that way, and the graphical agent must not wait for
+        // a session that has already arrived.
+        XCTAssertTrue(ConsoleSession.isPreLogin(consoleUser: nil, uid: 0))
+        XCTAssertFalse(ConsoleSession.isLoggedIn(consoleUser: nil, uid: 0))
+        XCTAssertTrue(ConsoleSession.isPreLogin(consoleUser: "loginwindow", uid: 0))
+        XCTAssertTrue(ConsoleSession.isPreLogin(consoleUser: "_mbsetupuser", uid: 248))
+        XCTAssertFalse(ConsoleSession.isLoggedIn(consoleUser: "_mbsetupuser", uid: 248))
+        XCTAssertTrue(ConsoleSession.isLoggedIn(consoleUser: "caoenming", uid: 501))
+        XCTAssertFalse(ConsoleSession.isPreLogin(consoleUser: "caoenming", uid: 501))
+        // System accounts never own a desktop session, whatever the uid range.
+        XCTAssertFalse(ConsoleSession.isLoggedIn(consoleUser: "_windowserver", uid: 88))
+        XCTAssertTrue(ConsoleSession.isPreLogin(consoleUser: "_windowserver", uid: 88))
+        // The predicates must stay exact complements inside the accepted range: a gap
+        // is what silently blocked pre-login capture.
+        let cases: [(String?, uid_t)] = [(nil, 0), ("loginwindow", 0), ("_mbsetupuser", 248), ("caoenming", 501), ("root", 0)]
+        for (name, uid) in cases {
+            XCTAssertNotEqual(ConsoleSession.isLoggedIn(consoleUser: name, uid: uid), ConsoleSession.isPreLogin(consoleUser: name, uid: uid))
+        }
+    }
 }

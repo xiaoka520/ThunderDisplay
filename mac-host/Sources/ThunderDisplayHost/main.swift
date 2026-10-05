@@ -420,8 +420,16 @@ do {
     if options.loginWindowFrameCheck {
         try loginWindowFrameCheck()
     } else if options.loginWindowCheck {
-        print("LoginWindow diagnostic: uid=\(geteuid()), manager=\(ConsoleSession.managerName), securityGraphics=\(ConsoleSession.graphicsAvailable), consoleLoggedIn=\(ConsoleSession.loggedIn), ordinaryScreen=\(CGPreflightScreenCaptureAccess()), eventPost=\(CGPreflightPostEventAccess())")
-        if let state = LoginWindowState.read() { print("LoginWindow agent: \(state.phase.rawValue); \(state.detail)") }
+        print("LoginWindow diagnostic: uid=\(geteuid()), manager=\(ConsoleSession.managerName), securityGraphics=\(ConsoleSession.graphicsAvailable), consoleLoggedIn=\(ConsoleSession.loggedIn), preLogin=\(ConsoleSession.preLogin), ordinaryScreen=\(CGPreflightScreenCaptureAccess()), eventPost=\(CGPreflightPostEventAccess())")
+        if let state = LoginWindowState.read() { print("LoginWindow agent (live): \(state.phase.rawValue); \(state.detail)") }
+        // The pre-login heartbeat is written before login, so it is usually stale or
+        // belongs to a previous boot by the time this runs; report it either way,
+        // with the phase and reason the agent was leaving when it stopped.
+        if let last = LoginWindowState.readLastRecorded() {
+            print("LoginWindow agent (last recorded): \(last.phase.rawValue); \(last.detail); captureChecked=\(last.captureChecked), inputChecked=\(last.inputChecked), lastFailure=\(last.lastFailure ?? "none"), stoppedFrom=\(last.previousPhase?.rawValue ?? "none"); \(last.previousDetail ?? "none"), recordedAt=\(last.recordedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "unknown")")
+        } else {
+            print("LoginWindow agent (last recorded): no readable heartbeat")
+        }
     } else if options.loginWindow {
         let manager = ConsoleSession.managerName
         guard geteuid() == 0, manager == "LoginWindow" else {

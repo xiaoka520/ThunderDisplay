@@ -296,3 +296,18 @@ VideoToolbox 未接受 `MaxFrameDelayCount=1`（-12900），程序已记录并�
 - 现有快捷键回归测试通过，包含窗口/全屏 Caps Lock 放行及普通键、Win/Alt+Tab 继续拦截。Windows -Wall/-Wextra/-Werror GUI 严格交叉构建通过。Mac release、持久项目签名和 deep/strict 校验通过；Mac 只更新发布版本号，未重复运行 Swift 测试。
 - 两平台 ZIP 完整性通过，dist 仅保留各自最新构建。Windows GUI SHA256：`8135e372ce9564b2b022885eb397a8ed1706fa5a7fc79faabb33ea0e990e98ec`。Mac 0.8.1（build21）Host SHA256：`4453457313f5f8830526d9720adbaf51339fe371c8db92a73e3e11337b0772f5`。
 - 待 ROG 实机确认：窗口/全屏连续两次切换及长按，本地切换后返回远程，以及释放/恢复输入后的大小写和指示灯表现。未声称已观察到真实键盘指示灯变化。
+
+## 登录前组件控制台判定修复（2026-10-05）
+
+- 用户报告“系统启动后、用户登录前不能工作”。两个组件都按设计自启动了，失败发生在启动之后：本轮两次冷启动，17:15:49 开机后 LoginWindow agent PID279 在 96.3 秒写心跳，17:23:49 开机后 PID276 在 132.1 秒写心跳。
+- 根因由系统日志直接给出。17:23:55.120 agent 记录 `LoginWindow phase: blocked; Waiting for a confirmed LoginWindow console session`；同一时刻 17:23:54.473 system daemon 记录 `Console logged in: false`。两者使用同一个 `SCDynamicStoreCopyConsoleUser`，判定却相反：`ThunderDisplayBoot.consoleLoggedIn()` 把“没有 console 用户”当作未登录，即登录前（回退就绪，符合预期）；而 `ConsoleSession.preLogin` 要求必须匹配到 `loginwindow` 且 uid<500，于是返回 false。agent 因此在整个登录界面期间停在 `.blocked`，从未探测采集，直到 17:25:55.718 用户登录后直接发布 `stopped`。
+- 两次心跳的 `captureChecked`/`inputChecked` 都是 false 且 `lastFailure` 为空，与该路径一致：探测从未运行，所以从未抛出捕获错误。此前把这一现象解读为“登录前授权被拒”不成立。
+- 修复：`ConsoleSession` 拆出可测试的纯判定 `isLoggedIn(consoleUser:uid:)`，`isPreLogin` 定义为其补集，主 App 与 system daemon 共用同一实现（`ThunderDisplayBoot.consoleLoggedIn()` 改为委托 `ConsoleSession.loggedIn`）。登录前不再有第二套定义，两者不可能再分歧。
+- 修复：`LoginWindowHost.refresh()` 删除重复派生 `preLogin` 的分支——该分支正是掩盖真实阻塞的位置；保留真正需要的图形会话检查，以及“普通 preflight 为假但实际流可用”的既有容错。
+- 可观测性：agent 首次发布 `stopped` 时，把离开时的 phase 与 detail 快照进心跳新字段 `previousPhase`/`previousDetail`，并记录墙上时钟 `recordedAt`。此前 `applicationWillTerminate` 固定覆盖为 “LoginWindow agent stopped”，把唯一的原因抹掉，本轮两次心跳都因此无法解释，只能靠日志反推。
+- 可观测性：新增 `LoginWindowState.readLastRecorded()`，跳过新鲜度校验但保留 root 所有权、非符号链接、大小与版本等结构校验。`fresh()` 要求 `now >= uptime`，而 `uptime` 跨重启重置，导致重启后永远读不到上一次开机的心跳，这也是此前无法诊断的原因之一。端口让与实时监听判定仍只用 `read(maximumAge:)`。
+- 新字段为可选附加项，`version` 保持 1：已安装的旧二进制写出的心跳仍可解码，用磁盘上真实心跳（PID276）验证通过，避免升级瞬间丢失记录。
+- 可执行的失败说明：登录界面上下文中 ScreenCaptureKit 的拒绝原本显示为 Apple 的“用户已拒绝”，但登录界面没有用户可拒绝、也没有可打开的系统设置。现映射为明确指引（PPPC/MDM 预授权或自动登录），辅助功能（事件注入）授权失败同样处理。
+- 已验证：`swift build` 通过；42 项 Swift 测试通过（17 Wire、22 HostState、3 CursorSupport），其中 `LoginWindowStateTests` 由 5 项增至 9 项，新增覆盖“上一次开机的心跳只能作历史读取”“旧格式心跳缺少新字段仍可解码”“快照字段有长度上限且不能伪造监听状态”“无 console 用户时两个判定互补”。8 组 C++ 测试通过。新编译的 `--login-window-check` 成功读取磁盘上由旧二进制写出的真实心跳。
+- 未验证：本轮**没有**在真实未登录会话中复测。修复后 agent 应能越过该闸门并真正探测采集；若届时被 TCC 拒绝，心跳会记录明确的授权指引而不是笼统信息。登录前画面与输入的实机验收，以及 PPPC/MDM 描述文件或自动登录的实际可用性，仍未确认。
+- 本轮未修改版本号、未重新签名或打包 dist、未注销或重启用户机器，未修改 TCC 数据库或系统安全策略。

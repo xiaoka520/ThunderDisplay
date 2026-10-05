@@ -19,20 +19,40 @@ final class StartupServices {
     var loginWindowStatus: String {
         guard loginWindowInstalled else { return ui("登录界面组件未安装；请更新开机组件", "LoginWindow component missing; update startup components") }
         if ConsoleSession.loggedIn {
-            if let previous = LoginWindowState.read(maximumAge: 86400) {
-                if let failure = previous.lastFailure { return ui("最近登录前检查失败：", "Recent pre-login check failed: ") + failure }
-                if previous.captureChecked && previous.inputChecked { return ui("最近登录前画面与输入授权检查通过；远控仍需实测", "Recent pre-login frame / input authorization check passed; remote control still needs verification") }
-            }
+            // The heartbeat describing the pre-login run may have been written during
+            // the previous boot, and `uptime` is monotonic within one boot only, so a
+            // freshness-checked read rejects it after a restart. Without the
+            // age-independent read a failed pre-login start can never be explained.
+            guard let previous = LoginWindowState.readLastRecorded() else { return ui("组件已安装，等待登录前会话实测", "Component installed; pre-login verification pending") }
+            if let failure = previous.lastFailure, !failure.isEmpty { return ui("最近登录前检查失败：", "Recent pre-login check failed: ") + failure }
+            if previous.captureChecked && previous.inputChecked { return ui("最近登录前画面与输入授权检查通过；远控仍需实测", "Recent pre-login frame / input authorization check passed; remote control still needs verification") }
+            if let blocker = loginWindowBlocker(previous) { return ui("最近登录前未启动采集：", "Recent pre-login run did not start capture: ") + blocker }
             return ui("组件已安装，等待登录前会话实测", "Component installed; pre-login verification pending")
         }
-        guard let state = LoginWindowState.read() else { return ui("组件已安装但没有有效运行状态", "Installed; no valid runtime status") }
+        guard let state = LoginWindowState.read() else {
+            guard let last = LoginWindowState.readLastRecorded(), let blocker = loginWindowBlocker(last) else { return ui("组件已安装但没有有效运行状态", "Installed; no valid runtime status") }
+            return ui("组件已安装但没有有效运行状态；上次未启动采集：", "Installed; no live status. Last run did not start capture: ") + blocker
+        }
         switch state.phase {
         case .checking: return ui("正在验证登录界面捕获", "Checking login-screen capture")
         case .claiming: return ui("捕获与输入通过检查，正在启动", "Capture / input checked; starting")
         case .listening: return ui("登录界面主机正在监听", "Login-screen host listening")
         case .blocked: return ui("登录界面主机不可用：", "Login-screen host unavailable: ") + state.detail
-        case .stopped: return ui("登录界面组件已停止", "LoginWindow component stopped")
+        case .stopped:
+            guard let blocker = loginWindowBlocker(state) else { return ui("登录界面组件已停止", "LoginWindow component stopped") }
+            return ui("登录界面组件已停止；最近未启动采集：", "LoginWindow component stopped; last run did not start capture: ") + blocker
         }
+    }
+    /// Why a login-window run that never reached `listening` did not start. Returns
+    /// nil once capture and input both checked out. The agent records the phase and
+    /// reason it was leaving, so a handover that published `stopped` no longer hides
+    /// the blocker behind a fixed "agent stopped" message.
+    private func loginWindowBlocker(_ state: LoginWindowState) -> String? {
+        if let failure = state.lastFailure, !failure.isEmpty { return failure }
+        if state.captureChecked && state.inputChecked { return nil }
+        if let stopping = state.previousDetail, !stopping.isEmpty { return stopping }
+        if state.phase == .blocked, !state.detail.isEmpty { return state.detail }
+        return nil
     }
     var bootState: LaunchServiceState {
         if Date().timeIntervalSince(checkedAt) >= 5 {

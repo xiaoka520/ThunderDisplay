@@ -16,6 +16,21 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
     private var checkStarted: TimeInterval = 0
     private var captureChecked = false, inputChecked = false
     private var lastFailure: String?
+    /// Snapshot taken the first time this agent publishes `stopped`, so the reason
+    /// it never started capture survives the login handover in the heartbeat file
+    /// instead of being replaced by a fixed "agent stopped" message.
+    private var stoppingPhase: LoginWindowState.Phase?
+    private var stoppingDetail: String?
+    /// Apple reports a pre-login denial as a user declining, but there is no user
+    /// session at the login window: the request can never be presented and the
+    /// operator cannot approve it in System Settings either. Record what actually
+    /// has to change rather than a message implying somebody clicked No.
+    static let consentRefusalReason = ui(
+        "登录界面没有屏幕录制授权；第三方进程无法在登录前请求或弹窗授权。请用 PPPC/MDM 描述文件为 dev.thunderdisplay.host 预授权屏幕录制，或改用自动登录。",
+        "Screen Recording is not authorized for the login window, and a third-party process cannot request it before login. Pre-authorize it for dev.thunderdisplay.host with a PPPC/MDM profile, or enable automatic login.")
+    static let inputRefusalReason = ui(
+        "登录界面没有辅助功能（事件注入）授权；需要同一份 PPPC/MDM 描述文件，或改用自动登录。",
+        "Accessibility (event post) is not authorized for the login window; it needs the same PPPC/MDM profile, or automatic login.")
     private var options: Options
     init(options: Options) { self.options = options }
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -41,11 +56,14 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         refresh()
     }
     private func publish(_ value: LoginWindowState.Phase, _ reason: String = "") {
+        if value == .stopped, stoppingPhase == nil, phase != .stopped {
+            stoppingPhase = phase; stoppingDetail = detail
+        }
         if phase != value || detail != reason {
             logger.notice("LoginWindow phase: \(value.rawValue, privacy: .public); \(reason, privacy: .public)")
         }
         phase = value; detail = reason
-        do { try LoginWindowState(pid: getpid(), uptime: ProcessInfo.processInfo.systemUptime, phase: value, detail: reason, port: options.port, captureChecked: captureChecked, inputChecked: inputChecked, lastFailure: lastFailure).write() }
+        do { try LoginWindowState(pid: getpid(), uptime: ProcessInfo.processInfo.systemUptime, phase: value, detail: reason, port: options.port, captureChecked: captureChecked, inputChecked: inputChecked, lastFailure: lastFailure, previousPhase: stoppingPhase, previousDetail: stoppingDetail).write() }
         catch { logger.error("Cannot publish LoginWindow state: \(error.localizedDescription, privacy: .public)") }
     }
     private func refresh() {
@@ -55,9 +73,18 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil); return
         }
         publish(phase, detail)
-        guard ConsoleSession.preLogin else {
+        // `isPreLogin` is the exact complement of `isLoggedIn`, so the guard above
+        // already establishes it. Re-deriving it here masked the real blocker: the
+        // old predicate also demanded a positive "loginwindow" console user, so a
+        // host that reports no console user waited forever in this branch and never
+        // probed capture. What still needs confirming is that a graphical login
+        // session exists at all, because capture cannot start before the window
+        // server does.
+        guard CGSessionCopyCurrentDictionary() != nil else {
             if server != nil { stop() }
-            publish(.blocked, "Waiting for a confirmed LoginWindow console session"); return
+            publish(.blocked, "Waiting for the LoginWindow graphics session")
+            nextCheck = ProcessInfo.processInfo.systemUptime + 3
+            return
         }
         if busy && ProcessInfo.processInfo.systemUptime - checkStarted >= 60 {
             probe?.cancel(); lastFailure = "LoginWindow capture service timed out; restarting agent"
@@ -76,7 +103,6 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
             nextCheck = ProcessInfo.processInfo.systemUptime + 3; return
         }
         guard let ip = bridgeAddress() else { publish(.blocked, "Thunderbolt Bridge unavailable"); nextCheck = ProcessInfo.processInfo.systemUptime + 3; return }
-        guard CGSessionCopyCurrentDictionary() != nil else { publish(.blocked, "Waiting for LoginWindow graphics session"); nextCheck = ProcessInfo.processInfo.systemUptime + 3; return }
         busy = true; publish(.checking, "Checking a real ScreenCaptureKit frame")
         checkStarted = ProcessInfo.processInfo.systemUptime
         attemptedWithoutScreenAccess = !CGPreflightScreenCaptureAccess()
@@ -87,7 +113,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 attemptedWithoutScreenAccess = false // A valid stream overrides a false ordinary preflight.
                 guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
                 captureChecked = true
-                guard CGPreflightPostEventAccess() else { throw HostError("LoginWindow event-post permission unavailable") }
+                guard CGPreflightPostEventAccess() else { throw HostError(Self.inputRefusalReason) }
                 inputChecked = true; lastFailure = nil
                 let token = options.requirePairing ? try pairingCode(options.token) : ""
                 options.bind = ip; options.display = display
@@ -115,8 +141,9 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 // Retry transient display / service failures even when ordinary
                 // preflight is false; only an actual consent refusal suppresses
                 // another automatic request in the same graphical session.
-                attemptedWithoutScreenAccess = !CGPreflightScreenCaptureAccess() && systemError.domain == SCStreamErrorDomain && systemError.code == SCStreamError.Code.userDeclined.rawValue
-                fail(error.localizedDescription)
+                let refused = systemError.domain == SCStreamErrorDomain && systemError.code == SCStreamError.Code.userDeclined.rawValue
+                attemptedWithoutScreenAccess = !CGPreflightScreenCaptureAccess() && refused
+                fail(refused ? Self.consentRefusalReason : error.localizedDescription)
             }
             busy = false; self.probe = nil
         }
@@ -130,6 +157,8 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
     }
     private func stop() { probe?.cancel(); server?.stop(); server = nil; selectedIP = "" }
     func applicationWillTerminate(_ notification: Notification) {
+        // `publish` snapshots the phase and reason it is leaving, so the login
+        // handover keeps the evidence of why pre-login capture never started.
         timer?.invalidate(); stop(); publish(.stopped, "LoginWindow agent stopped")
     }
 }

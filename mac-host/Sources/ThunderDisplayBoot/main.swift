@@ -16,11 +16,11 @@ func closeSockets() {
     if discovery >= 0 { close(discovery); discovery = -1 }
     selectedIP = ""
 }
-func consoleLoggedIn() -> Bool {
-    var uid: uid_t = 0, gid: gid_t = 0
-    guard let user = SCDynamicStoreCopyConsoleUser(nil, &uid, &gid) as String? else { return false }
-    return uid >= 500 && user != "loginwindow" && user != "_mbsetupuser"
-}
+// Console ownership comes from HostState so this daemon and the LoginWindow agent
+// can never disagree about who holds the display. They did: this side treated a
+// missing console user as pre-login while the agent demanded a positive
+// "loginwindow" match, which left the agent blocked for the whole login window.
+func consoleLoggedIn() -> Bool { ConsoleSession.loggedIn }
 func bridge() -> (String, UInt32)? {
     var first: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&first) == 0 else { return nil }; defer { freeifaddrs(first) }
