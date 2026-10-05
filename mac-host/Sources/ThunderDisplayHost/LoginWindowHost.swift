@@ -125,14 +125,22 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 let host = HostServer(ip: ip, options: options, token: token)
                 host.allowClipboard = false; host.restrictToLocalSubnet = true
                 host.inputAllowed = { ConsoleSession.preLogin && CGPreflightPostEventAccess() }
-                host.displayCapabilities = hostDisplays().first(where: { $0.id == display })?.payload
+                // The loginwindow session can hold a different display mode than the
+                // user session, and this session's mode is what the client negotiates
+                // its stream size against. Record both so a wrong pre-login aspect can
+                // be attributed to the advertised mode instead of guessed at.
+                let advertised = hostDisplays().first(where: { $0.id == display })
+                logger.notice("Pre-login display: \(advertised?.name ?? "unknown", privacy: .public) render \(advertised?.renderText ?? "?", privacy: .public) logical \(advertised?.logicalWidth ?? 0, privacy: .public)x\(advertised?.logicalHeight ?? 0, privacy: .public) hz \(advertised?.captureHz ?? 0, privacy: .public)")
+                host.displayCapabilities = advertised?.payload
                 host.onCaptureFailure = { [weak self, weak host] reason in DispatchQueue.main.async {
                     guard let self, let host, self.server === host else { return }; self.fail(reason)
                 } }
-                host.onStatus = { [weak self, weak host] _ in DispatchQueue.main.async {
+                host.onStatus = { [weak self, weak host] value in DispatchQueue.main.async {
                     guard let self, let host, self.server === host else { return }
-                    // Never log keyboard data, credentials, or a captured frame.
-                    self.logger.notice("LoginWindow client session negotiated")
+                    // Never log keyboard data, credentials, or a captured frame. The
+                    // negotiated stream size is what the client asked for, and it is
+                    // the other half of any aspect mismatch.
+                    self.logger.notice("LoginWindow client negotiated: \(value, privacy: .public)")
                 } }
                 try host.start(); server = host; selectedIP = ip
                 publish(.listening, "Capture and input checked; waiting for client")
