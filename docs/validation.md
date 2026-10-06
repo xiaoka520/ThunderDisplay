@@ -410,3 +410,13 @@ VideoToolbox 未接受 `MaxFrameDelayCount=1`（-12900），程序已记录并�
 
 - 最终解码合批改动后的严格Windows GUI构建、包版本/GUI子系统/ZIP校验通过。Mac0.8.9 build29 Host SHA256：`72e394bd2a912c253204ec610c508f71fa1d9f27bca8ea0bf67e9f853a914c45`；Windows GUI SHA256：`9eb111bd35f091b3c964b9841aec2e267990ab15206ac9c6a67a44c422831036`。
 - 原生管理员安装完成；发布、/Applications和系统App三份0.8.9 build29/Host哈希一致，deep/strict签名通过。核对UID501/绝对路径后正常退出旧主机PID857，以已注册桌面任务启动新版PID2909，执行系统App，实际监听10.0.0.2:47990 TCP与UDP；发现daemon PID2830运行。当前仅有一个GUI主机。dist仅保留0.8.9；0.8.7签名包保存在忽略的build/checkpoint-0.8.7，main/v0.8.7仍为63487b0。本轮未注销/重启用户；登录冻结与真实ROG输入延迟等待复测。
+
+## 2026-10-06: Windows 0.8.10 transient blank-frame recovery
+
+The recent Mac log had no socket disconnect or capture failure during the reported sub-second black flashes. This identifies risky client clearing paths, not the proven cause of the ROG flashes.
+
+Visible pixels are independent of live-frame freshness. WM_PAINT redraws a saved image, resize and precision changes immediately refill the new swap-chain buffer, and brief decode pauses hold pixels/request IDR without opening setup. Saved-image redraw does not update presentation freshness or enable input. The existing 12-second stall timeout, actual socket disconnect and bounded authenticated handover expiry still clear stale pixels. Release-all input remains allowed while other input is paused.
+
+Local Windows diagnostics use an asynchronous bounded queue and two rotating logs of approximately 2 MiB. Events contain presentation gaps, slow Present, occlusion, resize/precision changes, decode counters, clear/hold reasons and HRESULT/device removal codes; no input/clipboard/pairing contents. The settings diagnostics show the file path.
+
+Nine native C++ regression groups passed, including stale-but-visible pixels, input gating, recovery deadlines, resumed-frame notifications and release while paused. Windows strict GUI x64 cross-build passed. Native ROG GPU/black-flash verification remains pending; no Mac code or startup component changes are required.

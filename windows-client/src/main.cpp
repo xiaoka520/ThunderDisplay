@@ -293,6 +293,8 @@ struct App {
                 description.replace(pos,wcslen(entry.first),replacement); pos+=replacement.size();
             }
         }
+        auto logPath=ClientDiagnostics::instance().path();
+        if(!logPath.empty()) description+=std::wstring(tr(L"\r\n诊断日志：",L"\r\nDiagnostics log: "))+logPath;
         if(setup) setup->status(state,description);
         auto caption=std::wstring(L"ThunderDisplay " TD_VERSION_WIDE L" | ")+state+L" | "+shortcutName()+tr(L" 全屏 · Ctrl+Alt+Shift+Esc 释放输入",L" fullscreen · Ctrl+Alt+Shift+Esc release input");
         if(!capture) caption+=tr(L" | 输入已释放",L" | Input released");
@@ -473,13 +475,14 @@ struct App {
             title(); return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps{}; auto dc=BeginPaint(window,&ps);
-            bool frozen=false;
-            if(renderer && renderer->hasFrozenFrame()) {
-                try { frozen=renderer->repaintFrozen(); } catch(const std::exception& e) { std::cerr<<e.what()<<std::endl; }
+            bool image=false;
+            if(renderer) {
+                try { image=renderer->repaintImage(); }
+                catch(const std::exception& e) { diagnosticLog("display.repaint.error",e.what()); }
             }
             // A newly presented desktop frame may precede the worker's input
             // handover flag update. Do not paint black over those valid pixels.
-            if(!(renderer && renderer->hasFrame()) && !frozen) {
+            if(!(renderer && renderer->hasImage()) && !image) {
                 RECT r{}; GetClientRect(window,&r); FillRect(dc,&r,reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
                 SetBkMode(dc,TRANSPARENT); SetTextColor(dc,RGB(220,220,220));
                 auto text=std::wstring(tr(L"等待远程画面…\n连接状态与详细信息见设置窗口。",L"Waiting for remote display…\nSee the setup window for connection status and details."));
@@ -488,7 +491,7 @@ struct App {
             EndPaint(window,&ps); return 0;
         }
         case WM_SIZE:
-            if(renderer) try { renderer->resize(); } catch(const std::exception& e) { std::cerr<<e.what()<<std::endl; }
+            if(renderer) try { renderer->resize(); } catch(const std::exception& e) { diagnosticLog("display.resize.error",e.what()); }
             return 0;
         case WM_ERASEBKGND: return 1;
         case WM_SETCURSOR:
@@ -527,6 +530,7 @@ App* App::instance=nullptr;
 }
 
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
+    diagnosticLog("client.launch");
     SetConsoleOutputCP(CP_UTF8); SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     td::UITheme::enableNativeAppTheme();
     bool winsock=false,mf=false,com=false;

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <atomic>
 
 namespace td {
 // A round includes discovery, connection, negotiation and retry waits.
@@ -39,6 +40,23 @@ struct VideoHealth {
     static constexpr uint64_t StaleAfter=3000000, RestartAfter=12000000;
     static bool fresh(uint64_t now,uint64_t last) { return last && now>=last && now-last<StaleAfter; }
     static bool stalled(uint64_t now,uint64_t last) { return now>=last && now-last>=RestartAfter; }
+};
+// Visible pixels and live-stream health have different lifetimes. Repainting
+// saved pixels must never refresh the clock that authorizes remote input.
+class DisplayedFrame {
+    enum class Kind { Empty, Live, Held };
+    std::atomic<Kind> kind{Kind::Empty};
+    std::atomic<uint64_t> time{0};
+public:
+    bool present(uint64_t now) {
+        time=now;
+        return kind.exchange(Kind::Live)!=Kind::Live;
+    }
+    void reset(bool hold) { kind=hold?Kind::Held:Kind::Empty; }
+    bool hasImage() const { return kind!=Kind::Empty; }
+    bool held() const { return kind==Kind::Held; }
+    bool fresh(uint64_t now) const { return kind==Kind::Live && VideoHealth::fresh(now,time); }
+    uint64_t lastPresentation() const { return time; }
 };
 // Explicit host notice only. Repeated reconnects cannot extend a frozen image
 // indefinitely; it is not a live frame and must never permit remote input.

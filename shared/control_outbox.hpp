@@ -20,7 +20,9 @@ public:
     Result push(Bytes message) {
         std::lock_guard<std::mutex> lock(mutex);
         if(stopped || message.empty()) return Result::Ignored;
-        if(message[0]==uint8_t(Message::Input) && !inputEnabled) return Result::Ignored;
+        // Releasing held input is safe while live-video input is paused.
+        const bool release=message.size()==14 && message[0]==uint8_t(Message::Input) && message[1]==5;
+        if(message[0]==uint8_t(Message::Input) && !inputEnabled && !release) return Result::Ignored;
         // Only adjacent moves can coalesce; retain key/button/release ordering.
         if(message.size()==14 && message[0]==uint8_t(Message::Input) && message[1]==1 &&
            !priority.empty() && priority.back().size()==14 &&

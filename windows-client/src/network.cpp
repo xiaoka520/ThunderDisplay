@@ -77,7 +77,7 @@ void ClientSession::checkRecoveryDeadline() {
 }
 void ClientSession::expireHandover() {
     if(holdingFrame && !handoverHold.active(micros())) {
-        holdingFrame=false; handoverHold.clear(); renderer.resetFrame();
+        holdingFrame=false; handoverHold.clear(); renderer.resetFrame(false,false,"handover expired");
         PostMessageW(window,DisconnectedMessage,0,0);
     }
 }
@@ -143,7 +143,7 @@ void ClientSession::run() {
         expireHandover();
         retryBudget.begin(micros());
         if(retryBudget.exhausted(micros())) {
-            holdingFrame=false; handoverHold.clear(); renderer.resetFrame();
+            holdingFrame=false; handoverHold.clear(); renderer.resetFrame(false,false,"recovery exhausted");
             recoveryStopped=true; setStatus("Recovery limit reached: stopped after 10 minutes or 150 attempts"); break;
         }
         if(!retryBudget.startAttempt(micros())) {
@@ -157,17 +157,18 @@ void ClientSession::run() {
             if(host.empty() && retryBudget.fastHandover(micros())) host=lastStreamHost;
             setStatus(host.empty()?"Discovering Thunderbolt host…":"Connecting to "+host);
             if(host.empty()) host=discover();
+            diagnosticLog("connection.attempt","attempt="+std::to_string(retryBudget.attempts)+" host="+host);
             checkRecoveryDeadline(); connectAndStream(host);
-        } catch(const std::exception& e) { if(!stopFlag) setStatus(e.what()); }
+        } catch(const std::exception& e) { diagnosticLog("connection.error",e.what()); if(!stopFlag) setStatus(e.what()); }
         online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false;
-        expireHandover(); renderer.resetFrame(holdingFrame);
+        expireHandover(); renderer.resetFrame(holdingFrame,false,stopFlag?"client stopped":"connection ended");
         { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
         PostMessageW(window,DisconnectedMessage,0,0);
     }
     CoUninitialize();
 }
 void ClientSession::connectAndStream(const std::string& host) {
-    online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(holdingFrame); overflow=false; wantIDR=false;
+    online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(holdingFrame,false,"new connection"); overflow=false; wantIDR=false;
     Socket tcp(SOCK_STREAM); tcp.nonblocking();
     BOOL yes=TRUE; setsockopt(tcp.fd,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&yes),sizeof(yes));
     auto remote=endpoint(host,options.port);
@@ -208,7 +209,7 @@ void ClientSession::connectAndStream(const std::string& host) {
     sender->send(querying?capabilityQuery:td::hello(options.settings,ntohs(local.sin_port),options.token));
     td::ControlFramer framer; std::unique_ptr<Decoder> decoder; std::unique_ptr<td::Reassembler> assembler;
     uint64_t accepted=micros(),lastControl=accepted,lastPing=accepted,lastIDR=0,lastFrame=accepted;
-    uint64_t sessionID=0,videoPackets=0,completeFrames=0,readyAt=0,lastStatus=0,lastProbe=0;
+    uint64_t sessionID=0,videoPackets=0,completeFrames=0,readyAt=0,lastStatus=0,lastProbe=0,lastDiagnostic=0;
     td::Codec codec=td::Codec::H264;
     sockaddr_in videoEndpoint=remote; bool haveVideoPort=false;
     std::string streamDescription;
@@ -279,7 +280,8 @@ void ClientSession::connectAndStream(const std::string& host) {
         if(overflow) throw std::runtime_error("Input queue overflow; reconnecting to release held keys");
         auto now=micros();
         if(decoder && decoder->decodedFrames()!=decodedCount) {
-            decodedCount=decoder->decodedFrames(); lastDecoded=now; videoInterrupted=false;
+            decodedCount=decoder->decodedFrames(); lastDecoded=now;
+            if(videoInterrupted.exchange(false)) diagnosticLog("video.resumed","decoded="+std::to_string(decodedCount));
         }
         if(!transitionReceived && !confirmedFrame && renderer.hasFrame()) {
             holdingFrame=false; handoverHold.clear();
@@ -290,9 +292,12 @@ void ClientSession::connectAndStream(const std::string& host) {
         sender->allowInput(online && !transitionReceived && !holdingFrame && renderer.hasFrame());
         if(!transitionReceived && confirmedFrame && !td::VideoHealth::fresh(now,lastDecoded) && !videoInterrupted.exchange(true)) {
             sender->allowInput(false);
-            // Hide stale live video, but keep a snapshot until the current
-            // session can announce a bounded handover (or disconnect normally).
-            renderer.resetFrame(false,true); PostMessageW(window,DisconnectedMessage,0,0);
+            // This is still the same control session. Hold pixels without
+            // refreshing frame health or opening the setup window. The 12s
+            // stall deadline and real socket failures still clear the image.
+            diagnosticLog("video.interrupted","decode_gap_us="+std::to_string(now-lastDecoded));
+            renderer.resetFrame(true,true,"brief video interruption"); wantIDR=true;
+            PostMessageW(window,ReleaseInputMessage,0,0);
         }
         if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastDecoded)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
         if(now-lastControl>10000000 || (!decoder && now-accepted>15000000)) throw std::runtime_error("Host timed out");
@@ -304,6 +309,12 @@ void ClientSession::connectAndStream(const std::string& host) {
             setStatus(streamDescription+"\r\n"+renderer.colorDescription()+"\r\n"+stageText()+"\r\nClipboard active: "+(clipboardOnline?"yes":"no")+"\r\nVideo packets: "+std::to_string(videoPackets)+
                 " | Complete frames: "+std::to_string(completeFrames)+" | Submitted: "+std::to_string(decoder->submittedFrames())+
                 " | Decoded: "+std::to_string(decoder->decodedFrames())); lastStatus=now;
+        }
+        if(decoder && now-lastDiagnostic>5000000) {
+            diagnosticLog("video.counters","packets="+std::to_string(videoPackets)+" complete="+std::to_string(completeFrames)+
+                " submitted="+std::to_string(decoder->submittedFrames())+" decoded="+std::to_string(decoder->decodedFrames())+
+                " decode_gap_us="+std::to_string(now-lastDecoded)+" live="+std::to_string(renderer.hasFrame()));
+            lastDiagnostic=now;
         }
         if(decoder && !renderer.hasFrame() && decoder->decodedFrames()==0 && now-readyAt>12000000) {
             if(completeFrames && (nativeNegotiated || td::fallbackCodecMask(codec,options.settings.codecMask,options.colorDepth)))
@@ -332,7 +343,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                         throw std::runtime_error("Invalid session transition notice");
                     if(!transitionReceived) {
                         retryBudget.sessionTransition(micros());
-                        if(confirmedFrame && renderer.resetFrame(true)) {
+                        if(confirmedFrame && renderer.resetFrame(true,false,"authenticated session handover")) {
                             handoverHold.begin(micros()); holdingFrame=true;
                         }
                     }
@@ -375,7 +386,6 @@ void ClientSession::connectAndStream(const std::string& host) {
                 }
                 if((type==td::Message::Welcome || type==td::Message::WelcomeWide) && !decoder && !querying) {
                     td::Welcome welcome(message);
-                    renderer.retainForHandover(options.capabilityVersion>=8);
                     sessionID=welcome.session; codec=welcome.codec;
                     if(!(options.settings.codecMask&uint8_t(welcome.codec))) throw std::runtime_error("Host selected an unrequested codec");
                     try { renderer.configureBitDepth(welcome.settings.bitDepth); decoder=std::make_unique<Decoder>(renderer,welcome,desktopSRGB); }
@@ -396,6 +406,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                         (welcome.settings.bitrate!=options.settings.bitrate?"\r\nHardware encoder bitrate limit: requested "+std::to_string(options.settings.bitrate/1000000)+" Mbps, accepted "+std::to_string(welcome.settings.bitrate/1000000)+" Mbps":"")+
                         (fallbackDescription.empty()?"":"\r\nLast fallback: "+fallbackDescription);
                     setStatus(streamDescription);
+                    diagnosticLog("connection.stream",streamDescription);
                 } else if(type==td::Message::CursorImage && cursorSupported && decoder) {
                     if(auto image=cursorAssembler.push(message,td::Message::CursorImage,td::CursorImageLimit)) {
                         { std::lock_guard<std::mutex> lock(mutex);cursorIncoming=std::move(*image); }

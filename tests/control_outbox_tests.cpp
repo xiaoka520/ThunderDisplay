@@ -10,6 +10,13 @@ int main() {
     assert(queue.push(td::input(3,65,1))==Result::Ignored);
     assert(queue.push({uint8_t(td::Message::Ready)})==Result::Queued);
     assert(queue.take()->message[0]==uint8_t(td::Message::Ready));
+    // A video pause must release remote held keys/buttons while rejecting new
+    // presses. Ready and IDR continue to flow so recovery is not deadlocked.
+    assert(queue.push(td::input(5,0,0))==Result::Queued);
+    assert(queue.take()->message==td::input(5,0,0));
+    assert(queue.push(td::input(2,0,1))==Result::Ignored);
+    assert(queue.push({uint8_t(td::Message::RequestIDR)})==Result::Queued);
+    assert(queue.take()->message[0]==uint8_t(td::Message::RequestIDR));
     queue.allowInput(true);
     queue.push(td::input(1,0,0,10,10)); queue.push(td::input(1,0,0,20,20));
     queue.push(td::input(2,0,1,20,20)); queue.push(td::input(3,65,1)); queue.push(td::input(3,65,0));

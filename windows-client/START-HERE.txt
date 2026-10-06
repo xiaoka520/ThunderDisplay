@@ -1,6 +1,6 @@
-ThunderDisplay 0.8.9 · Windows 图形客户端 / Windows GUI client
+ThunderDisplay 0.8.10 · Windows 图形客户端 / Windows GUI client
 
-1. 最新构建为 0.8.9。双击 ThunderDisplay-GUI-0.8.9-x64.exe；中文 / English / 跟随系统。
+1. 最新构建为 0.8.10。双击 ThunderDisplay-GUI-0.8.10-x64.exe；中文 / English / 跟随系统。
    登录前键鼠修复需更新 Mac，并点击“更新开机组件与连接配置”以更新系统副本。
 2. 填写 Mac 网桥 IPv4 或留空自动发现；配对码默认关闭。
 3. 显示模式为“自动 / 自定义”；帧率由两端屏幕协商，上限240，目标不等于实测。
@@ -31,7 +31,7 @@ ThunderDisplay 0.8.9 · Windows 图形客户端 / Windows GUI client
 Windows 10 1703+ / Windows 11 x64；需Media Foundation / D3D11，Windows N需媒体组件。
 保留licenses目录。构建与协议/原生Mac测试通过，ROG原生主题、动态指针、GPU和两机图片粘贴待实机验收。
 
-Latest build: 0.8.9. Run the GUI EXE; pairing is optional on the bridge.
+Latest build: 0.8.10. Run the GUI EXE; pairing is optional on the bridge.
 Pre-login input requires the Mac update and Update startup components and connection settings, which updates the system copy.
 Caps Lock now also updates the Windows toggle state/keyboard LED; refocusing the display or recapturing input resynchronizes local state.
 Auto preserves Mac HiDPI source pixels. Custom changes resolution/bitrate; FPS follows detected displays.
@@ -71,3 +71,6 @@ Version 0.8.8: authenticated session transitions use 15 seconds of 250 ms retrie
 
 0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
 Version 0.8.9: frozen handovers allow Ready/Ping/IDR; only input is paused. Independent TCP writing prioritizes input, pointer geometry no longer waits on GPU presentation, and decoder bursts present only the newest output. Mac RGB transfer/VT submission use a one-frame worker. Update both platforms and Mac startup components; native ROG latency and visual continuity still need verification.
+
+Windows 0.8.10：修复短暂停顿与显示缓冲区重建时的主动清屏。普通视频停顿保留最后一帧并请求关键帧，暂停输入；12秒持续停顿、真实断连仍清除画面并恢复连接。窗口重绘、尺寸和色深改变时立即重画，重画不刷新串流健康时间、不显示交接文字。新增异步本地诊断，位置为 %LOCALAPPDATA%\ThunderDisplay\Logs\client.log，设置窗口诊断区可查看路径；仅记录帧间隔、计数、重建与错误，不记录键盘内容、剪贴板或配对码。每个日志约2 MiB，最多保留当前与前一份。本次只需更新 Windows，Mac 继续使用0.8.9。
+Version 0.8.10 (Windows only): retain pixels during brief stalls and repaint after swap-chain changes. Repaint never refreshes stream/input health. True disconnects and the 12-second video stall deadline still clear the image. Asynchronous rotating logs: %LOCALAPPDATA%\ThunderDisplay\Logs\client.log. Mac 0.8.9 is compatible.

@@ -3,6 +3,7 @@
 #include <d3d11_1.h>
 #include "presentation.hpp"
 #include "recovery.hpp"
+#include "diagnostics.hpp"
 
 class Renderer {
     HWND window;
@@ -50,17 +51,16 @@ class Renderer {
     void presentBackBuffer();
     bool initScaling(UINT frameWidth,UINT frameHeight,UINT targetWidth,UINT cropHeight);
     void scaleToBackBuffer(ID3D11Texture2D* back,const td::PresentationGeometry& geometry,ID3D11ShaderResourceView* nativeRGB=nullptr);
-    std::atomic<bool> presented{false};
-    std::atomic<uint64_t> presentationTime{0};
-    bool rememberFrames=false;
-    std::atomic<bool> frozen{false};
+    td::DisplayedFrame frameState;
+    bool occluded=false;
     ComPtr<ID3D11Texture2D> retainedRGB;
     ComPtr<ID3D11ShaderResourceView> retainedView;
     ComPtr<ID3D11VertexShader> frozenVertex;
     ComPtr<ID3D11PixelShader> frozenPixel;
     ComPtr<ID3D11SamplerState> frozenSampler;
-    bool repaintFrozenLocked();
-    void resizeLocked();
+    bool repaintImageLocked();
+    bool resizeLocked();
+    void checkPresent(HRESULT result,const char* operation);
 public:
     Renderer(HWND hwnd, bool vsync);
     ID3D11Device* device() const { return device_.Get(); }
@@ -72,10 +72,9 @@ public:
     bool pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y);
     void setPixelExact(bool value) { std::lock_guard<std::mutex> lock(mutex); pixelExact=value; updatePointerGeometryLocked(); }
     void setScalingQuality(uint8_t value) { std::lock_guard<std::mutex> lock(mutex); scalingQuality=std::min<uint8_t>(value,1); }
-    bool hasFrame() const { return presented && td::VideoHealth::fresh(micros(),presentationTime); }
+    bool hasFrame() const { return frameState.fresh(micros()); }
+    bool hasImage() const { return frameState.hasImage(); }
     std::string colorDescription();
-    void retainForHandover(bool value) { std::lock_guard<std::mutex> lock(mutex); rememberFrames=value; }
-    bool hasFrozenFrame() const { return frozen; }
-    bool repaintFrozen() { std::lock_guard<std::mutex> lock(mutex); return repaintFrozenLocked(); }
-    bool resetFrame(bool preserve=false,bool keepSnapshot=false);
+    bool repaintImage() { std::lock_guard<std::mutex> lock(mutex); return repaintImageLocked(); }
+    bool resetFrame(bool preserve=false,bool keepSnapshot=false,const char* reason="session reset");
 };

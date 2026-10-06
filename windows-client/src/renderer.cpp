@@ -99,19 +99,22 @@ void Renderer::updatePointerGeometryLocked() {
         auto d=pointerGeometry->destination; pointerViewport={d.left,d.top,d.right,d.bottom};
     } else { pointerGeometry.reset(); pointerViewport={0,0,LONG(width),LONG(height)}; }
 }
-void Renderer::resizeLocked() {
+bool Renderer::resizeLocked() {
     RECT r; GetClientRect(window,&r); UINT w=std::max<LONG>(1,r.right),h=std::max<LONG>(1,r.bottom);
-    if(w==width && h==height) return;
+    if(w==width && h==height) return false;
+    diagnosticLog("display.resize",std::to_string(width)+"x"+std::to_string(height)+" -> "+std::to_string(w)+"x"+std::to_string(h));
     context->ClearState();
     check(swap->ResizeBuffers(0,w,h,DXGI_FORMAT_UNKNOWN,DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT|
         (tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0)),"Resize swap chain");
     width=w; height=h; enumerator.Reset(); processor.Reset();
     updatePointerGeometryLocked();
+    return true;
 }
 void Renderer::configureBitDepth(uint8_t depth) {
     std::lock_guard<std::mutex> lock(mutex);
     if(depth!=8 && depth!=10) throw std::runtime_error("Unsupported stream precision");
     if(bitDepth==depth) return;
+    diagnosticLog("display.precision",std::to_string(bitDepth)+" -> "+std::to_string(depth));
     auto format=depth==10?DXGI_FORMAT_R10G10B10A2_UNORM:DXGI_FORMAT_B8G8R8A8_UNORM;
     UINT support=0; check(device_->CheckFormatSupport(format,&support),"Check RGB output precision");
     if(!(support&D3D11_FORMAT_SUPPORT_RENDER_TARGET)) throw std::runtime_error("GPU does not support 10-bit RGB output");
@@ -123,13 +126,13 @@ void Renderer::configureBitDepth(uint8_t depth) {
     bitDepth=depth; outputFormat=format; enumerator.Reset(); processor.Reset(); explicitVideoColor=false;
     convertedRGB.Reset(); horizontalRGB.Reset(); scalingFailure.clear();
     colorRGB.Reset(); colorTarget.Reset(); colorRGBView.Reset();
-    if(frozen) repaintFrozenLocked();
+    repaintImageLocked();
 }
 bool Renderer::pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y) {
     std::lock_guard<std::mutex> lock(pointerMutex);
     return pointerGeometry && pointerGeometry->pointer(px,py,dragging,pointerWidth,pointerHeight,x,y);
 }
-void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); resizeLocked(); if(frozen) repaintFrozenLocked(); }
+void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); if(resizeLocked()) repaintImageLocked(); }
 RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(pointerMutex); return pointerViewport; }
 std::string Renderer::colorDescription() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -214,7 +217,7 @@ void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UIN
     presentBackBuffer();
 }
 void Renderer::presentBackBuffer() {
-    if(rememberFrames) {
+    {
         ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Handover frame buffer");
         D3D11_TEXTURE2D_DESC d{},old{}; back->GetDesc(&d); if(retainedRGB) retainedRGB->GetDesc(&old);
         if(!retainedRGB || d.Width!=old.Width || d.Height!=old.Height || d.Format!=old.Format) {
@@ -225,17 +228,43 @@ void Renderer::presentBackBuffer() {
         }
         context->ClearState(); context->CopyResource(retainedRGB.Get(),back.Get());
     }
+    auto started=micros();
     auto result=swap->Present(vsync?1:0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+    checkPresent(result,"Present");
     if(result!=DXGI_STATUS_OCCLUDED) {
-        check(result,"Present");
-        presentationTime=micros();
-        if(!presented.exchange(true)) PostMessageW(window,FramePresentedMessage,0,0);
-        frozen=false;
+        auto now=micros(),previous=frameState.lastPresentation();
+        if(now-started>100000) diagnosticLog("display.present.slow","duration_us="+std::to_string(now-started));
+        if(previous && now>previous && now-previous>500000)
+            diagnosticLog("display.frame.gap","duration_us="+std::to_string(now-previous));
+        if(frameState.present(now)) {
+            diagnosticLog("display.live","first or resumed frame");
+            PostMessageW(window,FramePresentedMessage,0,0);
+        }
     }
 }
-bool Renderer::repaintFrozenLocked() {
-    if(!frozen || !retainedRGB || IsIconic(window)) return false;
+void Renderer::checkPresent(HRESULT result,const char* operation) {
+    if(FAILED(result)) {
+        std::ostringstream error;
+        error<<operation<<" HRESULT=0x"<<std::hex<<uint32_t(result)
+             <<" device_removed=0x"<<uint32_t(device_->GetDeviceRemovedReason());
+        diagnosticLog("display.error",error.str());
+        check(result,operation);
+    }
+    const bool hidden=result==DXGI_STATUS_OCCLUDED;
+    if(hidden!=occluded) diagnosticLog("display.occlusion",hidden?"occluded":"visible");
+    occluded=hidden;
+}
+bool Renderer::repaintImageLocked() {
+    if(!frameState.hasImage() || !retainedRGB || IsIconic(window)) return false;
     resizeLocked();
+    ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Retained frame output");
+    D3D11_TEXTURE2D_DESC saved{},output{}; retainedRGB->GetDesc(&saved); back->GetDesc(&output);
+    // Preserve pixels exactly whenever the buffer geometry/precision matches.
+    if(saved.Width==output.Width && saved.Height==output.Height && saved.Format==output.Format) {
+        context->ClearState(); context->CopyResource(back.Get(),retainedRGB.Get());
+        checkPresent(swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0),"Present retained frame");
+        return true;
+    }
     if(!frozenVertex) {
         const char* shader=R"(
 Texture2D<float4> image : register(t0); SamplerState sampleImage : register(s0);
@@ -252,10 +281,8 @@ float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
         s.AddressU=s.AddressV=s.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP; s.MaxLOD=D3D11_FLOAT32_MAX;
         check(device_->CreateSamplerState(&s,&frozenSampler),"Handover sampler");
     }
-    ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Handover output");
     ComPtr<ID3D11RenderTargetView> target; check(device_->CreateRenderTargetView(back.Get(),nullptr,&target),"Handover output view");
-    D3D11_TEXTURE2D_DESC d{}; retainedRGB->GetDesc(&d);
-    td::PresentationGeometry geometry(d.Width,d.Height,width,height,false); auto& r=geometry.destination;
+    td::PresentationGeometry geometry(saved.Width,saved.Height,width,height,false); auto& r=geometry.destination;
     context->ClearState(); const float black[4]={0,0,0,1}; context->ClearRenderTargetView(target.Get(),black);
     auto render=target.Get(); auto view=retainedView.Get(); auto sampler=frozenSampler.Get();
     context->OMSetRenderTargets(1,&render,nullptr); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -265,14 +292,24 @@ float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
     context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
     // A repaint of the saved pixels never advances live-frame freshness.
     auto result=swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
-    if(result!=DXGI_STATUS_OCCLUDED) check(result,"Present handover frame");
+    checkPresent(result,"Present retained frame");
     return true;
 }
-bool Renderer::resetFrame(bool preserve,bool keepSnapshot) {
+bool Renderer::resetFrame(bool preserve,bool keepSnapshot,const char* reason) {
     std::lock_guard<std::mutex> lock(mutex);
-    frozen=preserve && retainedRGB;
-    presented=false; presentationTime=0;
-    if(frozen) { repaintFrozenLocked(); InvalidateRect(window,nullptr,FALSE); return true; }
+    const bool hold=preserve && retainedRGB;
+    diagnosticLog(hold?"display.hold":"display.clear",reason);
+    frameState.reset(hold);
+    if(hold) {
+        try { repaintImageLocked(); InvalidateRect(window,nullptr,FALSE); return true; }
+        catch(const std::exception& e) {
+            // A removed device cannot keep a valid snapshot. Recovery/teardown
+            // must proceed instead of letting a worker exception terminate us.
+            diagnosticLog("display.hold.error",e.what());
+            frameState.reset(false); keepSnapshot=false;
+            diagnosticLog("display.clear","retained image repaint failed");
+        }
+    }
     if(!keepSnapshot) { retainedView.Reset(); retainedRGB.Reset(); }
     // The swap chain owns the visible pixels. A GDI repaint does not retire them.
     if(swap) {
@@ -280,7 +317,9 @@ bool Renderer::resetFrame(bool preserve,bool keepSnapshot) {
         ComPtr<ID3D11RenderTargetView> target;
         if(SUCCEEDED(swap->GetBuffer(0,IID_PPV_ARGS(&back))) && SUCCEEDED(device_->CreateRenderTargetView(back.Get(),nullptr,&target))) {
             const float black[4]={0,0,0,1}; context->ClearRenderTargetView(target.Get(),black);
-            swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+            auto result=swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+            // Teardown must still complete even if the GPU was removed.
+            if(FAILED(result)) diagnosticLog("display.clear.error","HRESULT="+std::to_string(uint32_t(result)));
         }
     }
     InvalidateRect(window,nullptr,FALSE);

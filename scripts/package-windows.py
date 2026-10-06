@@ -28,6 +28,8 @@ def validate_gui(data, version):
         raise ValueError("Missing desktop color conversion build marker")
     if b"ThunderDisplay handover" not in data or b"Invalid session transition notice" not in data:
         raise ValueError("Missing authenticated session handover / retained GPU frame support")
+    if b"brief video interruption" not in data or b"display.frame.gap" not in data or b"display.resize" not in data:
+        raise ValueError("Missing retained live-frame repaint / local display diagnostics")
     if "正在进入桌面".encode("utf-16-le") in data:
         raise ValueError("Login handover must retain the frame without a text overlay")
     for preset in ("缩放与边缘", "1:1 原始像素显示（窗口较小时裁剪画面）", "60 Hz · 高画质", "120 Hz · 超清", "165 Hz · 超清", "240 Hz · 低延迟"):
@@ -45,6 +47,7 @@ def main():
     header = (ROOT / "windows-client/version.h").read_text()
     version = re.search(r'#define TD_VERSION_TEXT "([0-9.]+)"', header).group(1)
     source = ROOT / "dist/windows-x64"
+    (source / "licenses/ThunderDisplay-AGPL-3.0.txt").write_bytes((ROOT / "LICENSE").read_bytes())
     data = (source / "ThunderDisplayClient.exe").read_bytes()
     validate_gui(data, version)
     folder = f"ThunderDisplay-GUI-{version}-x64"

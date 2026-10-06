@@ -62,6 +62,29 @@ int main() {
     assert(!td::VideoHealth::fresh(start+td::VideoHealth::StaleAfter,start));
     assert(!td::VideoHealth::stalled(start+td::VideoHealth::RestartAfter-1,start));
     assert(td::VideoHealth::stalled(start+td::VideoHealth::RestartAfter,start));
+    td::DisplayedFrame image;
+    assert(!image.hasImage() && !image.fresh(start));
+    assert(image.present(start));
+    assert(!image.present(start+1)); // A normal frame does not reopen the UI.
+    assert(image.hasImage() && image.fresh(start+2));
+    const auto last=start+1;
+    assert(!image.fresh(last+td::VideoHealth::StaleAfter));
+    assert(image.hasImage()); // Freshness expiration must not paint black.
+    image.reset(true); // Brief interruption or authenticated session handover.
+    assert(image.held() && image.hasImage());
+    assert(!image.fresh(last+2)); // Saved pixels never authorize input.
+    for(unsigned i=0;i<100;++i) {
+        assert(image.hasImage()); // UI repaint/resize leaves the source clock alone.
+        assert(image.lastPresentation()==last);
+    }
+    assert(td::VideoHealth::stalled(last+td::VideoHealth::RestartAfter,image.lastPresentation()));
+    image.reset(false); // Actual disconnect/stall deadline clears visibility.
+    assert(!image.hasImage() && !image.held() && !image.fresh(last+2));
+    assert(image.present(last+td::VideoHealth::RestartAfter+1));
+    assert(image.fresh(last+td::VideoHealth::RestartAfter+2));
+    image.reset(true);
+    assert(image.present(last+td::VideoHealth::RestartAfter+3)); // Resume notifies UI.
+    assert(!image.held());
     td::HandoverHold hold;
     assert(!hold.active(start)); hold.begin(start); assert(hold.active(start));
     hold.begin(start+1000000); // A retry/duplicate notice cannot renew the hold.
