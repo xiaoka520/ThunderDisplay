@@ -51,7 +51,11 @@ final class CaptureEngine: @unchecked Sendable {
         }
     }
 }
-final class InputInjector {
+protocol InputControlling: AnyObject {
+    func apply(_ input: Input) throws
+    func releaseAll()
+}
+final class InputInjector: InputControlling {
     init(display: UInt32, captureSize: CGSize, contentRect: CGRect) {}
     func apply(_ input: Input) throws {
         if input.code == 66 { throw HostError("Synthetic system input failure") }

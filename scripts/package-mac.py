@@ -20,6 +20,24 @@ for name in ['ThunderDisplayHost', 'ThunderDisplayBoot']:
     data = path.read_bytes()
     assert data[:4] == b'\xcf\xfa\xed\xfe' and struct.unpack_from('<I', data, 4)[0] == 0x100000c, 'Expected arm64 Mach-O'
     assert path.stat().st_mode & 0o111, 'Missing executable permissions'
+    if name == 'ThunderDisplayHost':
+        # Inspect real load commands, not a marker string in a log message.
+        count = struct.unpack_from('<I', data, 16)[0]
+        offset = 32
+        found = False
+        for _ in range(count):
+            command, size = struct.unpack_from('<II', data, offset)
+            assert size >= 8 and offset + size <= len(data), 'Malformed Mach-O load command'
+            if command == 0x19:  # LC_SEGMENT_64
+                sections = struct.unpack_from('<I', data, offset + 64)[0]
+                assert 72 + sections * 80 <= size, 'Malformed Mach-O section table'
+                for index in range(sections):
+                    section = offset + 72 + index * 80
+                    if (data[section:section+16].rstrip(b'\0') == b'__cgpreloginapp' and
+                        data[section+16:section+32].rstrip(b'\0') == b'__CGPreLoginApp'):
+                        found = True
+            offset += size
+        assert found, 'Missing login-screen graphics marker in the host executable'
 for name, folder in [('dev.thunderdisplay.host.agent', 'LaunchAgents')]:
     service = plistlib.loads((app / 'Contents/Library' / folder / (name+'.plist')).read_bytes())
     assert service['Label'] == name and service['RunAtLoad'] is True
@@ -30,6 +48,10 @@ assert service['ProgramArguments'] == ['/Library/PrivilegedHelperTools/dev.thund
 assert 'BundleProgram' not in service and service['UserName'] == 'nobody'
 assert service['RunAtLoad'] is True and service['KeepAlive'] is True
 assert (app / 'Contents/Resources/install-boot-service.sh').is_file()
+loginwindow = plistlib.loads((app / 'Contents/Resources/dev.thunderdisplay.loginwindow.plist').read_bytes())
+assert loginwindow['LimitLoadToSessionType'] == 'LoginWindow'
+assert loginwindow['ProcessType'] == 'Interactive'
+assert loginwindow['ProgramArguments'][0] == '/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost'
 desktop = plistlib.loads((app / 'Contents/Resources/dev.thunderdisplay.desktop.plist').read_bytes())
 assert desktop['Label'] == 'dev.thunderdisplay.desktop' and desktop['RunAtLoad'] is True
 assert desktop['LimitLoadToSessionType'] == 'Aqua' and 'UserName' not in desktop
@@ -50,7 +72,7 @@ App 启动即自动运行主机，唤醒或显示器恢复后自动重建，不�
 随系统启动需系统管理员确认，安装独立发现daemon与LoginWindow图形组件；检查有效帧和输入授权后接受连接，登录后桌面主机接管。
 0.8.2 登录前键鼠改用系统HID输入；安装后点击“更新开机组件与连接配置”更新系统副本。仅替换桌面App不足以更新登录前程序。
 0.8.3 移除登录前输入准备的全局状态查询，增加独立超时恢复与分阶段日志；需要更新开机组件。
-0.8.6 将授权备用键盘定向投递给系统登录进程；鼠标保留原路径。Windows会话恢复时重新建立按键捕获。交接保留最后一帧、不加提示文字。需要更新开机组件，真实冷启动键盘仍需复测。
+0.8.7重写登录前键鼠：包含登录前图形标记，主线程发送Quartz会话输入，取消HID失败回退与PID定向投递。需要更新开机组件；真实冷启动输入仍需复测。
 0.8.4 先释放交接端口再清理采集，增加限定用户的Aqua桌面启动任务；需更新开机组件。HID拒绝本地用户上下文时，仅在Quartz事件发送授权有效后尝试标准输入路径，冷启动控制仍需实测。
 0.7.5 修复旧开机注册在重启时抢占任务的问题；已有配置需重新启用此项以迁移，不能只替换 .app。
 FileVault 解锁不支持；macOS 登录界面捕获与控制仍待真实未登录会话验收，安装成功不等于已经验证可用。

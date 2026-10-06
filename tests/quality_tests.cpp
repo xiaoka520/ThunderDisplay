@@ -8,15 +8,15 @@ int main() {
     REQUIRE(negotiatedFrameRate({4096,2560,120},{2560,1600,90})==90);
     REQUIRE(negotiatedFrameRate({4096,2560,360},{2560,1600,480})==240);
     auto settings=bestQuality({1984,1240,60},{2560,1600,240});
-    REQUIRE(settings.width==1984 && settings.height==1240 && settings.fps==60 && settings.bitrate==160000000);
+    REQUIRE(settings.width==1984 && settings.height==1240 && settings.fps==60 && settings.bitrate==200000000);
     settings=bestQuality({5120,3200,120},{2560,1600,240});
-    REQUIRE(settings.width==2560 && settings.height==1600 && settings.fps==120 && settings.bitrate==450000000);
+    REQUIRE(settings.width==2560 && settings.height==1600 && settings.fps==120 && settings.bitrate==670000000);
     settings=bestQuality({3840,2160,240},{2560,1600,144});
     REQUIRE(settings.width==2560 && settings.height==1440 && settings.fps==144);
     settings=bestQuality({7680,4320,360},{7680,4320,480});
     REQUIRE(settings.width==4096 && settings.height==2304 && settings.fps==240 && settings.bitrate==1000000000);
     auto native=bestQuality({4096,2560,60},{2560,1600,240},7,true);
-    REQUIRE(native.width==4096 && native.height==2560 && native.fps==60 && native.bitrate==570000000);
+    REQUIRE(native.width==4096 && native.height==2560 && native.fps==60 && native.bitrate==850000000);
     auto oldHost=bestQuality({4096,2560,60},{2560,1600,240},7,true,0,300000000);
     REQUIRE(oldHost.width==native.width && oldHost.height==native.height && oldHost.fps==native.fps && oldHost.bitrate==300000000);
     auto explicitLow=bestQuality({4096,2560,60},{2560,1600,240},7,true,120000000);

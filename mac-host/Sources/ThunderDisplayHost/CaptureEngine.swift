@@ -114,17 +114,24 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         log("Hardware bitrate limit: requested \(hello.bitrate / 1_000_000) Mbps, accepted \(effectiveBitrate / 1_000_000) Mbps")
     }
     private func configureDetailPreservation() {
-        // A QP ceiling with an inadequate budget can force encoder frame drops.
-        // Keep explicitly low custom rates usable; apply the ceiling only with
-        // enough bits per source pixel per frame for the selected codec.
+        // With Thunderbolt bandwidth (15-20 Gbps available), prioritize quality.
+        // Lower QP ceiling to preserve desktop text and UI detail.
         let pixelsPerSecond = Double(hello.width) * Double(hello.height) * Double(hello.fps)
         let budget = Double(effectiveBitrate) / pixelsPerSecond
-        guard budget >= (codec == .h264 ? 1.2 : 0.75) else {
+        
+        // Use stricter QP limits for better text clarity with available bandwidth
+        let qpLimit: Int
+        if budget >= (codec == .h264 ? 2.0 : 1.5) {
+            qpLimit = 18  // Very high quality for high bitrate
+        } else if budget >= (codec == .h264 ? 1.2 : 0.75) {
+            qpLimit = 20  // High quality for adequate bitrate
+        } else {
             log("Encoder detail budget: \(effectiveBitrate / 1_000_000) Mbps; QP ceiling skipped for limited per-frame budget")
             return
         }
+        
         let key = kVTCompressionPropertyKey_MaxAllowedFrameQP
-        let result = VTSessionSetProperty(compression!, key: key, value: NSNumber(value: 22))
+        let result = VTSessionSetProperty(compression!, key: key, value: NSNumber(value: qpLimit))
         guard result == noErr else {
             log("Encoder does not expose maximum frame QP (\(result)); higher bitrate budget remains active")
             return
@@ -132,9 +139,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var value: Unmanaged<CFTypeRef>?
         let copied = VTSessionCopyProperty(compression!, key: key, allocator: nil, valueOut: &value)
         let property = value?.takeRetainedValue()
-        if copied == noErr, let number = property as? NSNumber, number.intValue == 22 {
+        if copied == noErr, let number = property as? NSNumber, number.intValue == qpLimit {
             maximumFrameQP = number.intValue
-            log("Encoder detail budget: \(effectiveBitrate / 1_000_000) Mbps; verified maximum frame QP \(number.intValue)")
+            log("Encoder detail budget: \(effectiveBitrate / 1_000_000) Mbps; verified maximum frame QP \(number.intValue) for enhanced text clarity")
         } else {
             log("Encoder accepted maximum frame QP request; readback unavailable (\(copied))")
         }

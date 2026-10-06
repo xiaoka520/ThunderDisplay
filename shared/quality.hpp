@@ -21,9 +21,10 @@ inline Settings bestQuality(DisplayLimits source,DisplayLimits target,uint8_t co
     result.height=uint16_t(std::floor(source.height*scale/2)*2);
     if(result.width<320 || result.height<240) throw std::runtime_error("Display aspect ratio is outside the supported range");
     result.fps=negotiatedFrameRate(source,target); result.codecMask=codecMask;
-    // Direct-bridge desktop budget: retain more fine detail instead of optimizing bandwidth.
-    // Chroma remains 4:2:0; this reduces quantization loss, not chroma subsampling.
-    double bitsPerPixel=(codecMask&6)?0.90:1.44;
+    // Thunderbolt direct-bridge budget: prioritize quality over bandwidth conservation.
+    // Higher bitrate significantly improves text and UI clarity despite 4:2:0 chroma.
+    // Increased from 0.90/1.44 to 1.35/2.16 for enhanced detail preservation.
+    double bitsPerPixel=(codecMask&6)?1.35:2.16;
     auto mbps=unsigned(std::ceil(double(result.width)*result.height*result.fps*bitsPerPixel/10000000))*10;
     if(bitrateOverride && (bitrateOverride<10000000 || bitrateOverride>MaxBitrate)) throw std::runtime_error("Invalid custom bitrate");
     if(automaticCeiling<160000000 || automaticCeiling>LegacyMaxBitrate) throw std::runtime_error("Invalid automatic bitrate ceiling");

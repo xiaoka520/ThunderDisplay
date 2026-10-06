@@ -12,7 +12,7 @@ private final class Peer: @unchecked Sendable {
     var negotiated = false, ready = false, lastSeen = DispatchTime.now().uptimeNanoseconds
     let accepted = DispatchTime.now().uptimeNanoseconds
     var session: UInt64 = 0, frame: UInt32 = 0, videoAddress: sockaddr_in?
-    var engine: CaptureEngine?, injector: InputInjector?
+    var engine: CaptureEngine?, injector: (any InputControlling)?
     var richFeatures = false, extendedFeatures = false, highBitrate = false, localCursor = false, clipboard = false
     var clipboardRequested = false
     var desktopSRGB = false, cursorVariants = false
@@ -45,7 +45,7 @@ final class HostServer: @unchecked Sendable {
     var restrictToLocalSubnet = false // Always true in the root LoginWindow agent.
     var inputAllowed: (() -> Bool)? // Recheck the session before every injected packet.
     var handoverOnSessionEnd = false // Only the LoginWindow host may announce desktop handover.
-    var makeInputInjector: ((CGDirectDisplayID, CGSize, CGRect) throws -> InputInjector)?
+    var makeInputInjector: ((CGDirectDisplayID, CGSize, CGRect) throws -> any InputControlling)?
     var onInputFailure: ((String) -> Void)?
     var onKeyboardPacket: (() -> Void)?
     func updateClipboardPermission(_ allowed: Bool) {

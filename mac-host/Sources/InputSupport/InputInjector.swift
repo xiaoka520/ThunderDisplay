@@ -3,10 +3,15 @@ import ApplicationServices
 import AppKit
 import Wire
 
-public final class InputInjector {
+public protocol InputControlling: AnyObject {
+    func apply(_ input: Input) throws
+    func releaseAll()
+}
+
+public final class InputInjector: InputControlling {
     private let bounds: CGRect
     private let captureSize: CGSize, contentRect: CGRect
-    private let source = CGEventSource(stateID: .privateState)
+    private let source: CGEventSource?
     private let authorized: () -> Bool
     private let post: (CGEvent) throws -> Void
     private var keys = Set<CGKeyCode>(), buttons = Set<UInt16>()
@@ -15,14 +20,17 @@ public final class InputInjector {
     private var clickButton: UInt16?, clickPoint = CGPoint.zero, clickTime: UInt64 = 0, clickCount: Int64 = 1
     public convenience init(display: CGDirectDisplayID, captureSize: CGSize, contentRect: CGRect,
                             authorized: @escaping () -> Bool = { CGPreflightPostEventAccess() },
-                            post: @escaping (CGEvent) throws -> Void = { $0.post(tap: .cghidEventTap) }) {
-        self.init(bounds: CGDisplayBounds(display), captureSize: captureSize, contentRect: contentRect, authorized: authorized, post: post)
+                            post: @escaping (CGEvent) throws -> Void = { $0.post(tap: .cghidEventTap) },
+                            eventSource: CGEventSource? = CGEventSource(stateID: .privateState)) {
+        self.init(bounds: CGDisplayBounds(display), captureSize: captureSize, contentRect: contentRect, authorized: authorized, post: post, eventSource: eventSource)
     }
     public init(bounds: CGRect, captureSize: CGSize, contentRect: CGRect,
-                authorized: @escaping () -> Bool, post: @escaping (CGEvent) throws -> Void) {
+                authorized: @escaping () -> Bool, post: @escaping (CGEvent) throws -> Void,
+                eventSource: CGEventSource? = CGEventSource(stateID: .privateState)) {
         self.bounds = bounds; point = CGPoint(x: bounds.midX, y: bounds.midY)
         self.captureSize = captureSize; self.contentRect = contentRect
         self.authorized = authorized; self.post = post
+        self.source = eventSource
     }
     private func flags(_ bits: UInt16) -> CGEventFlags {
         var f: CGEventFlags = []

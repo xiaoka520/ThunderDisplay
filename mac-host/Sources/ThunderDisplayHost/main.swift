@@ -1,6 +1,7 @@
 import AppKit
 import ScreenCaptureKit
 import HostState
+import InputSupport
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var server: HostServer?, item: NSStatusItem?, setup: SetupWindow?, timer: Timer?
@@ -165,6 +166,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func displayConfigurationChanged() {
         guard !options.previewUI else { return }
         recovery.displaysChanged(at: ProcessInfo.processInfo.systemUptime)
+        
+        // Check if the currently captured display is still valid before disconnecting.
+        // This reduces unnecessary disconnections for minor display parameter changes.
+        if let selectedDisplay = setup?.selectedDisplay {
+            let displayID = selectedDisplay.id
+            let oldBounds = CGDisplayBounds(displayID)
+            
+            // Query current display bounds synchronously
+            let newBounds = CGDisplayBounds(displayID)
+            
+            // Check if display is still online (online displays have non-zero bounds)
+            let displayOnline = newBounds.width > 0 && newBounds.height > 0
+            if displayOnline {
+                let widthUnchanged = newBounds.width == oldBounds.width
+                let heightUnchanged = newBounds.height == oldBounds.height
+                if widthUnchanged && heightUnchanged {
+                    // Resolution unchanged - likely just refresh rate or color space change
+                    // Keep the connection alive to avoid unnecessary disruption
+                    log("Display parameters changed but resolution unchanged (\(Int(newBounds.width))×\(Int(newBounds.height))); maintaining connection")
+                    setup?.refreshDisplays()
+                    refresh()
+                    return
+                } else {
+                    log("Display resolution changed from \(Int(oldBounds.width))×\(Int(oldBounds.height)) to \(Int(newBounds.width))×\(Int(newBounds.height)); rebuilding")
+                }
+            } else {
+                log("Display went offline; rebuilding capture")
+            }
+        }
+        
+        // Display removed, resolution changed, or no active connection - rebuild
         stopServer(); permissions.resetCaptureHealth(); statusIsError = false
         refresh()
     }
@@ -439,6 +471,7 @@ do {
     } else if options.loginWindowFrameCheck {
         try loginWindowFrameCheck()
     } else if options.loginWindowCheck {
+        print("Pre-login executable marker: \(LoginWindowInput.executableHasMarker)")
         print("LoginWindow diagnostic: uid=\(geteuid()), manager=\(ConsoleSession.managerName), securityGraphics=\(ConsoleSession.graphicsAvailable), consoleLoggedIn=\(ConsoleSession.loggedIn), preLogin=\(ConsoleSession.preLogin), ordinaryScreen=\(CGPreflightScreenCaptureAccess()), eventPost=\(CGPreflightPostEventAccess())")
         if let state = LoginWindowState.read() { print("LoginWindow agent (live): \(state.phase.rawValue); \(state.detail)") }
         // The pre-login heartbeat is written before login, so it is usually stale or

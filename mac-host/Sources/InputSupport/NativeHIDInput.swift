@@ -3,14 +3,16 @@ import Foundation
 import HIDBridge
 
 public enum InputPostingError: Error, CustomStringConvertible, LocalizedError {
-    case permissionDenied, allocation, system(Int32), cursor(Int32), loginTargetUnavailable
+    case permissionDenied, allocation, system(Int32), cursor(Int32), missingPreLoginMarker, queueFull, sessionEnded
     public var description: String {
         switch self {
         case .permissionDenied: return "Keyboard/mouse event posting is not authorized"
         case .allocation: return "Cannot create keyboard/mouse event"
         case .system(let status): return String(format: "System HID input rejected (0x%08x)", UInt32(bitPattern: status))
         case .cursor(let status): return "Graphical-session cursor positioning failed (\(status))"
-        case .loginTargetUnavailable: return "System login keyboard target is unavailable or changed"
+        case .missingPreLoginMarker: return "LoginWindow executable is missing its pre-login graphics marker; update startup components"
+        case .queueFull: return "LoginWindow input queue is full"
+        case .sessionEnded: return "LoginWindow input session ended"
         }
     }
     public var errorDescription: String? { description }

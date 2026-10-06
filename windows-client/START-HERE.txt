@@ -1,12 +1,12 @@
-ThunderDisplay 0.8.6 · Windows 图形客户端 / Windows GUI client
+ThunderDisplay 0.8.7 · Windows 图形客户端 / Windows GUI client
 
-1. 最新构建为 0.8.6。双击 ThunderDisplay-GUI-0.8.6-x64.exe；中文 / English / 跟随系统。
+1. 最新构建为 0.8.7。双击 ThunderDisplay-GUI-0.8.7-x64.exe；中文 / English / 跟随系统。
    登录前键鼠修复需更新 Mac，并点击“更新开机组件与连接配置”以更新系统副本。
 2. 填写 Mac 网桥 IPv4 或留空自动发现；配对码默认关闭。
 3. 显示模式为“自动 / 自定义”；帧率由两端屏幕协商，上限240，目标不等于实测。
    自动模式默认保留 Mac HiDPI 捕获源像素。2048×1280逻辑桌面可对应4096×2560渲染像素。
 4. 自定义码率默认上限20000 Mbps（20 Gbps），以64位协商，避免溢出；需要新Mac。
-   自动采用较低压缩，推荐160–1000 Mbps；4096×2560@60 Hz HEVC约570 Mbps。目标不是恒定输出，网桥上限不等于硬件编码器输出能力。
+   自动采用较低压缩，推荐160–1000 Mbps；4096×2560@60 Hz HEVC约850 Mbps。目标不是恒定输出，网桥上限不等于硬件编码器输出能力。
    编码器拒绝超高目标时检测其接受范围，诊断明确显示请求 / 实际接受目标，避免连接失败。
 5. “本地指针 · macOS 原生”默认关闭，连接前开启。Mac 视频从首帧起隐藏指针，Windows 本地显示。
    动态同步Mac系统原始指针形状 / 隐藏状态 / 热点，按Windows DPI缩放，不能再乘Mac HiDPI比例。
@@ -21,9 +21,9 @@ ThunderDisplay 0.8.6 · Windows 图形客户端 / Windows GUI client
    Caps Lock 同时更新 Windows 大小写状态与键盘指示灯，并传给 Mac；切回远程窗口或恢复输入时重新读取本地状态。
 10. 色深为自动 / 8-bit SDR / 10-bit SDR；新版两端为sRGB SDR / BT.709矩阵 / 4:2:0，未实现HDR/P3/4:4:4/音频。
 11. Mac设置可启用“随系统启动”，安装独立系统守护进程与LoginWindow图形会话组件，需管理员批准。
-    登录前组件先检查真实画面和系统 HID 输入，通过后接受连接，用户登录后桌面主机接管。
+    登录前组件先检查真实画面、登录前图形标记和事件发送授权，再接受连接，用户登录后桌面主机接管。
     鼠标按显示器逻辑坐标定位；键盘传递物理键码与修饰键。发送失败会断开并显示系统错误。
-    0.8.6 冷启动备用键盘改为投递给系统登录进程；Windows新会话首帧与返回窗口时更新键盘捕获。实际登录页面仍需复测。
+    0.8.7 键鼠统一在主线程发送到当前图形会话，移除失败回退和 PID 定向键盘投递；Windows新会话首帧与返回窗口时更新键盘捕获。实际登录页面仍需复测。
     登录成功交接时保留最后一帧，不显示文字、不弹出设置；桌面新帧到达后替换。期间停止远程输入，最多保留30秒；普通断网仍清除旧画面。需要同时更新两端。
     0.8.3 修复输入准备读取全局状态引发卡住；捕获检查60秒、输入准备各步骤15秒超时后重建组件。需更新Mac开机组件。
     若系统拒绝权限，客户端显示登录界面捕获/输入不可用；仅安装成功不代表已验证登录前远控。FileVault开机解锁不支持。
@@ -31,11 +31,11 @@ ThunderDisplay 0.8.6 · Windows 图形客户端 / Windows GUI client
 Windows 10 1703+ / Windows 11 x64；需Media Foundation / D3D11，Windows N需媒体组件。
 保留licenses目录。构建与协议/原生Mac测试通过，ROG原生主题、动态指针、GPU和两机图片粘贴待实机验收。
 
-Latest build: 0.8.6. Run the GUI EXE; pairing is optional on the bridge.
+Latest build: 0.8.7. Run the GUI EXE; pairing is optional on the bridge.
 Pre-login input requires the Mac update and Update startup components and connection settings, which updates the system copy.
 Caps Lock now also updates the Windows toggle state/keyboard LED; refocusing the display or recapturing input resynchronizes local state.
 Auto preserves Mac HiDPI source pixels. Custom changes resolution/bitrate; FPS follows detected displays.
-The bitrate ceiling is 20000 Mbps (20 Gbps), using 64-bit negotiation. Auto uses lighter compression at 160–1000 Mbps (4096×2560@60 Hz HEVC: 570 Mbps).
+The bitrate ceiling is 20000 Mbps (20 Gbps), using 64-bit negotiation. Auto uses lighter compression at 160–1000 Mbps (4096×2560@60 Hz HEVC: 850 Mbps).
 Hardware rejection of an ultra-high target triggers range detection; diagnostics report the actual accepted target.
 This is not a measured Thunderbolt throughput or a promise of constant 20 Gbps video output.
 Optional local cursor mode streams the Mac system's real cursor pixels, visibility and hotspot, scaled once to Windows DPI.
@@ -44,11 +44,11 @@ Scaling/edge and pixel-exact GUI controls were removed; full desktop aspect-fit 
 Clipboard sync now supports new copied text (64 KiB) and PNG images (32 MiB / 16M pixels / 8192 side), with native TIFF/DIB conversion.
 No existing clipboard content is exported on connect. File transfer is not implemented.
 Mac settings install a system discovery daemon and a separate LoginWindow graphics agent with administrator authentication.
-Before login, the agent verifies an actual frame and system HID input before serving; the desktop host takes over after login.
+Before login, the agent checks an actual frame, its graphical executable marker and event-post authorization before serving; the desktop host takes over after login.
 Mouse positions use Quartz display coordinates; keyboard input carries physical keys and modifier state. Posting failures close the session and report the system error.
 Version 0.8.3 removes the global input-state query during pre-login preparation and adds independent recovery deadlines. Update Mac startup components.
-0.8.6：登录交接时优先快速重连，总上限仍为10分钟/150次。Mac新增限定用户的桌面启动任务，需更新开机组件。
-Version 0.8.6 uses fast reconnect attempts after a previously displayed stream. The total limit remains 10 minutes / 150 attempts. Update Mac startup components for automatic desktop handover.
+0.8.4：登录交接时优先快速重连，总上限仍为10分钟/150次。Mac新增限定用户的桌面启动任务，需更新开机组件。
+Version 0.8.4 uses fast reconnect attempts after a previously displayed stream. The total limit remains 10 minutes / 150 attempts. Update Mac startup components for automatic desktop handover.
 Installation alone does not establish working pre-login control. Permission failures are reported explicitly. FileVault preboot is unsupported.
 Ctrl+Alt+Enter toggles fullscreen; customize it in settings. Task Manager shortcuts remain available.
 Updated platforms use sRGB SDR with a BT.709 YCbCr matrix and 8/10-bit 4:2:0. Older hosts retain the legacy BT.709 path. HDR/P3/4:4:4/audio remain unimplemented.
@@ -63,3 +63,5 @@ Mac 端默认“保持 Mac 可连接”，防止系统自动睡眠。雷雳不�
 0.7.6：动态本地指针优先使用 Mac 系统提供的高密度原图；Windows 按显示器 DPI 只缩放一次，保留原生尺寸和点击热点。两端需同时更新。
 
 0.8.0：本地指针按 Windows 当前显示缩放自动选择 macOS 原生倍率图；存在对应倍率时直接显示原像素，移动到不同缩放的显示器会自动切换。两端需同时更新。
+
+0.8.7: Mac登录前输入已重写为带图形标记的Quartz会话输入，键鼠在主线程处理；需要更新Mac开机组件。真实冷启动登录字段仍需复测。

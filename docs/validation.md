@@ -375,3 +375,14 @@ VideoToolbox 未接受 `MaxFrameDelayCount=1`（-12900），程序已记录并�
 - 56项Swift、8组C++测试及真实主机回环全部通过；HID桥C源Wall/Wextra/Werror检查与Mac签名release构建通过。Windows严格GUI交叉构建通过，GUI SHA-256为`5bc0997cb60868d17497a5e199f3969ec486a6e8a08b3fa5d93ff8d8128b0874`；Mac最终Host SHA-256为`39cbeb38b78c92f24536b6edd98941dd23a7ed7890c2b24cabdbbf36358e81a4`。
 - 两端ZIP完整性与版本/GUI检查通过；dist仅保留0.8.6 App、Windows运行目录、单EXE和两个ZIP共5项，旧包已清理。真实冷启动键盘送达与ROG捕获恢复仍待双机复测，本轮不自动注销或重启用户机器。
 - 原生管理员安装已完成，发布App、`/Applications`与root所有系统副本均为0.8.6/build26，三份Host SHA-256一致且deep/strict签名通过。关闭临时测试主机后，正式`gui/501/dev.thunderdisplay.desktop`任务启动PID3412，以UID501运行系统副本并实际监听`10.0.0.2:47990`；原生主App登录项与系统守护进程状态正常。此结果证明当前桌面恢复及系统副本更新，不替代下一次冷启动键盘验收。
+## 0.8.7 重写登录前键鼠（2026-10-06）
+
+- 用户确认冷启动只有画面，键鼠均无效。真实日志已收到 Windows 键盘包（14:26:16），失败点在系统事件送达。旧代码把无回执的 flagsChanged 调用当作“verified input”；这一判断不成立，已删除。
+- 旧安装的主可执行文件缺少 `__CGPreLoginApp/__cgpreloginapp` Mach-O 图形标记。新版加入该标记，并在生产入口验证主映像；不改变 TCC、系统安全策略或受限 entitlement。参考 [Chromium 登录前主机标记](https://chromium.googlesource.com/chromium/src/+/master/remoting/host/remoting_me2me_host.cc) 与 [Chromium macOS 输入实现](https://raw.githubusercontent.com/chromium/chromium/main/remoting/host/input_injector_mac.cc)。这是已确认的架构差异，不能单凭它宣称新版冷启动送达已经通过。
+- 删除生产登录前 HID 参数客户端初始化、失败重试、PID 定向键盘路径与探测按键。鼠标使用当前图形会话的公开 CGPostMouseEvent，键盘/滚轮使用 CGSession 事件入口，事件源为空，全部在 AppKit 主队列创建和发送。保留 root/LoginWindow bootstrap、每包控制台会话和事件发送授权守卫；系统发现 daemon 仍为 nobody。原生 HID 只用于显式 Aqua 诊断。
+- 每连接输入队列有上限，仅合并相邻鼠标移动，不跨点击合并或丢弃按键释放；每次处理最多32项。断连取消未送达事件并释放已按下的键鼠；发送前再次确认仍为登录前会话，避免旧队列落到新桌面。保留最后一帧交接、无文字覆盖和原重连预算。
+- 61项 Swift、8组 C++、真实 TCP/UDP 合成视频回环通过。C 桥严格语法检查、Windows 严格 GUI 交叉构建及两端 ZIP 检查通过。XCTest 由未标记的系统 XCTestRunner 加载，验证该进程拒绝初始化；打包器检查实际 Host Mach-O 节，实际应用 --login-window-check 返回 marker=true。
+- 签名 release 自有窗口实际收到鼠标定位/点击、协议物理键码、Shift、方向键、退格、Tab、Shift-Tab、回车和 SecureEventInput 下的输入；内容匹配断言通过，没有记录用户输入或密码。此证据来自当前用户 Aqua，会话不同，不能代替冷启动 LoginWindow 验收。
+- Mac0.8.7 build27 Host SHA256：`dce0e9d2e49460142ef083f2076cf75ab6b5e76f395bdfa448c8d0823ef3c937`。Windows GUI SHA256：`9d5b68ef9d90b733d341e2a926f1987960d5d7a67adee491c62243bfab76feb2`。dist只保留最新版本。
+- 已通过原生管理员流程安装更新。发布、/Applications 和 root 所有系统应用三者均为0.8.7/build27，Host哈希相同且 deep/strict 签名通过；系统副本 marker=true。LoginWindow全局组件为LoginWindow/Interactive；发现daemon为nobody。当前 discovery PID2831 和桌面主机 PID2838 均 running，桌面实际监听10.0.0.2:47990 TCP/UDP。不存在另一个旧主机实例。安装时移除旧会话心跳，避免把旧检查当新版结果。
+- 待用户保存工作后重启，停在macOS登录界面验证鼠标选择用户、聚焦、Tab/回车、物理键盘、修饰键、密码输入以及进入桌面时的交接。本轮未自动注销或重启，FileVault开机解锁仍不支持。

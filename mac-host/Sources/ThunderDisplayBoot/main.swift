@@ -12,8 +12,17 @@ var listener: Int32 = -1, discovery: Int32 = -1
 var selectedIP = ""
 let port = UInt16(ProcessInfo.processInfo.environment["TD_BOOT_PORT"] ?? "47990") ?? 47990
 func closeSockets() {
-    if listener >= 0 { close(listener); listener = -1 }
-    if discovery >= 0 { close(discovery); discovery = -1 }
+    // Set SO_LINGER(0) to avoid TIME_WAIT state and release ports immediately
+    // for fast handover to the desktop host after login.
+    var linger = Darwin.linger(l_onoff: 1, l_linger: 0)
+    if listener >= 0 {
+        setsockopt(listener, SOL_SOCKET, SO_LINGER, &linger, socklen_t(MemoryLayout<Darwin.linger>.size))
+        close(listener); listener = -1
+    }
+    if discovery >= 0 {
+        setsockopt(discovery, SOL_SOCKET, SO_LINGER, &linger, socklen_t(MemoryLayout<Darwin.linger>.size))
+        close(discovery); discovery = -1
+    }
     selectedIP = ""
 }
 // Console ownership comes from HostState so this daemon and the LoginWindow agent

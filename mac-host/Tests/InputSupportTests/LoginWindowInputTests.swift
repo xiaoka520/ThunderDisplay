@@ -1,23 +1,27 @@
 import XCTest
-import Darwin
+import CoreGraphics
 import HIDBridge
 @testable import InputSupport
 
 final class LoginWindowInputTests: XCTestCase {
-    func testLoginKeyboardDestinationRejectsOtherProcessesAndInvalidIDs() {
-        XCTAssertFalse(TDIsLoginWindowKeyboardTarget(0))
-        XCTAssertFalse(TDIsLoginWindowKeyboardTarget(-1))
-        XCTAssertFalse(TDIsLoginWindowKeyboardTarget(getpid()))
-        XCTAssertFalse(TDIsLoginWindowKeyboardTarget(getppid()))
-        XCTAssertFalse(TDIsLoginWindowKeyboardTarget(1))
-        if geteuid() != 0 { XCTAssertEqual(TDLoginWindowKeyboardTarget(), 0) }
-    }
-    func testQuartzFallbackRequiresItsOwnAuthorizationAndLocalUserRejection() {
-        let notPrivileged = Int32(bitPattern: 0xe00002c1)
-        XCTAssertTrue(LoginWindowInput.mayUseQuartz(after: notPrivileged, authorized: true))
-        XCTAssertFalse(LoginWindowInput.mayUseQuartz(after: notPrivileged, authorized: false))
-        for status: UInt32 in [0, 0xe00002c0, 0xe00002c2, 0xe00002e2] {
-            XCTAssertFalse(LoginWindowInput.mayUseQuartz(after: Int32(bitPattern: status), authorized: true))
+    func testUnmarkedProcessCannotInitializePreLoginInput() throws {
+        // Xcode loads this test bundle into XCTestRunner, whose main executable
+        // is unmarked. The real host's section is checked when packaging it.
+        guard !TDPreLoginAppMarkerPresent() else { throw XCTSkip("Main executable has the marker; package validation checks the host") }
+        XCTAssertThrowsError(try LoginWindowInput()) { error in
+            guard case InputPostingError.missingPreLoginMarker = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
         }
+    }
+    func testSessionMouseRejectsKeyboardWithoutChangingButtonState() throws {
+        let event = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true))
+        var buttons: UInt8 = 5
+        XCTAssertNotEqual(TDSessionPostMouse(event, &buttons), 0)
+        XCTAssertEqual(buttons, 5)
+    }
+    func testNoConsentIsNotTreatedAsReady() throws {
+        guard !CGPreflightPostEventAccess() else { throw XCTSkip("Explicit signed app diagnostic covers authorized delivery") }
+        XCTAssertThrowsError(try LoginWindowInput())
     }
 }

@@ -110,7 +110,15 @@ final class StartupServices {
             if bootConfigured { try administratorInstall(uninstall: true) }
         }
         checkedAt = .distantPast
-        if enabled, bootState != .running || !loginWindowInstalled || !desktopStartupInstalled { throw HostError(ui("系统、登录界面或桌面启动组件安装未完成；请检查系统后台项目权限。", "System / LoginWindow / desktop component installation incomplete; check background item permissions.")) }
+        if enabled {
+            // Give the system a moment to start the daemon after installation
+            Thread.sleep(forTimeInterval: 0.5)
+            checkedAt = .distantPast
+            _ = bootState // Force refresh
+            if bootState != .running || !loginWindowInstalled || !desktopStartupInstalled { 
+                throw HostError(ui("系统、登录界面或桌面启动组件安装未完成；请检查系统后台项目权限。", "System / LoginWindow / desktop component installation incomplete; check background item permissions.")) 
+            }
+        }
     }
     private func administratorInstall(uninstall: Bool) throws {
         guard let script = Bundle.main.url(forResource: "install-boot-service", withExtension: "sh") else { throw HostError(ui("开机服务安装组件缺失", "Boot installer is missing")) }

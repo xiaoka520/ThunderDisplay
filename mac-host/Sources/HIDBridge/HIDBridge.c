@@ -6,29 +6,45 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#include <libproc.h>
-#include <unistd.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 
-bool TDIsLoginWindowKeyboardTarget(int32_t pid) {
-    if (pid <= 0) return false;
-    struct proc_bsdinfo info = {0};
-    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != (int)sizeof(info) ||
-        info.pbi_uid != 0 || info.pbi_ruid != 0 || proc_pidpath(pid, path, sizeof(path)) <= 0) return false;
-    return strcmp(path, "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow") == 0;
+// A graphical pre-login executable must identify its Quartz connection.
+// Chromium and RustDesk use this Mach-O section for login-screen input.
+// This is not an entitlement; ordinary event-post authorization still applies.
+__attribute__((used, section("__CGPreLoginApp,__cgpreloginapp")))
+static const char TDPreLoginAppMarker[] = "";
+
+bool TDPreLoginAppMarkerPresent(void) {
+    unsigned long size = 0;
+    const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    return header && getsectiondata(header, "__CGPreLoginApp", "__cgpreloginapp", &size) && size > 0;
 }
 
-int32_t TDLoginWindowKeyboardTarget(void) {
-    if (geteuid() != 0) return 0;
-    ProcessSerialNumber front = {0, 0}; pid_t pid = 0;
-    // The foreground process is read in the LoginWindow graphical bootstrap.
-    // Never redirect a password to another frontmost app, a caller-supplied PID,
-    // or an executable outside the immutable macOS loginwindow location.
+int32_t TDSessionPostMouse(CGEventRef event, uint8_t *buttons) {
+    if (!event || !buttons) return kCGErrorIllegalArgument;
+    CGEventType type = CGEventGetType(event);
+    bool down = type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown;
+    bool up = type == kCGEventLeftMouseUp || type == kCGEventRightMouseUp || type == kCGEventOtherMouseUp;
+    bool motion = type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+        type == kCGEventRightMouseDragged || type == kCGEventOtherMouseDragged;
+    if (!down && !up && !motion) return kCGErrorIllegalArgument;
+    CGPoint point = CGEventGetLocation(event);
+    if (!isfinite(point.x) || !isfinite(point.y)) return kCGErrorIllegalArgument;
+    uint8_t next = *buttons;
+    if (down || up) {
+        int64_t button = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber);
+        if (button < 0 || button > 2) return kCGErrorIllegalArgument;
+        if (down) next |= (uint8_t)(1u << button); else next &= (uint8_t)~(1u << button);
+    }
+    // This public API generates movement, dragging and click transitions in
+    // the current graphical session and returns an actual posting error.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    if (GetFrontProcess(&front) != noErr || GetProcessPID(&front, &pid) != noErr) return 0;
+    CGError result = CGPostMouseEvent(point, true, 3, (next & 1) != 0, (next & 2) != 0, (next & 4) != 0);
 #pragma clang diagnostic pop
-    return TDIsLoginWindowKeyboardTarget(pid) ? pid : 0;
+    if (result == kCGErrorSuccess) *buttons = next;
+    return result;
 }
 
 struct TDHIDConnection {
@@ -89,8 +105,9 @@ static UInt16 translate(TDHIDConnection *connection, UInt16 key, UInt32 modifier
     return character;
 }
 
-// This public, deprecated API serves the LoginWindow host and the explicit
-// input diagnostic. It returns status and enforces macOS HID authorization.
+// This public, deprecated API is retained for the explicit Aqua diagnostic.
+// Production pre-login input uses the marked Quartz session above.
+// The diagnostic returns status and enforces macOS HID authorization.
 // User-session input continues using CGEvent; no raw user-client selectors or
 // entitlement/TCC bypasses are used.
 #pragma clang diagnostic push

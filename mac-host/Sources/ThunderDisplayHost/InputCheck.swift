@@ -19,12 +19,11 @@ func checkNativeInput(useQuartz: Bool = false, keyboardOnly: Bool = false) throw
     }
     let originalPoint = CGEvent(source: nil)?.location
     let originalFlags = CGEventSource.flagsState(.hidSystemState)
-    let eventSource = CGEventSource(stateID: .privateState)
+    let eventSource = useQuartz ? nil : CGEventSource(stateID: .privateState)
     let post: (CGEvent) throws -> Void
     if useQuartz {
-        guard CGPreflightPostEventAccess() else { throw InputPostingError.permissionDenied }
-        // The diagnostic routes only to its own temporary window/process.
-        post = { try LoginWindowInput.postQuartz($0, keyboardTarget: getpid()) }
+        let session = try LoginWindowInput()
+        post = session.post
     } else {
         let native = try NativeHIDInput(); post = native.post
     }
@@ -49,7 +48,7 @@ func checkNativeInput(useQuartz: Bool = false, keyboardOnly: Bool = false) throw
     var failure: Error?, secureInput = false
     var stage = "launch"
     let input = InputInjector(display: CGMainDisplayID(), captureSize: CGSize(width: 640, height: 360),
-        contentRect: CGRect(x: 0, y: 0, width: 640, height: 360), authorized: { true }, post: post)
+        contentRect: CGRect(x: 0, y: 0, width: 640, height: 360), authorized: { true }, post: post, eventSource: eventSource)
     func requireFocus() throws {
         guard app.isActive, window.isKeyWindow else { throw HostError("Input check lost focus during \(stage); typing cancelled (active=\(app.isActive), keyWindow=\(window.isKeyWindow))") }
     }
@@ -145,5 +144,5 @@ func checkNativeInput(useQuartz: Bool = false, keyboardOnly: Bool = false) throw
     }
     app.run(); window.close()
     if let failure { throw failure }
-    print("\(useQuartz ? "Authorized targeted Quartz" : "System HID") input verified: \(keyboardOnly ? "keyboard only" : "mouse and keyboard"), protocol keyboard, Shift, arrows, Backspace, Tab, Shift-Tab, Return and secure field. No user text or password recorded.")
+    print("\(useQuartz ? "Pre-login Quartz session" : "System HID") input verified: \(keyboardOnly ? "keyboard only" : "mouse and keyboard"), protocol keyboard, Shift, arrows, Backspace, Tab, Shift-Tab, Return and secure field. No user text or password recorded.")
 }

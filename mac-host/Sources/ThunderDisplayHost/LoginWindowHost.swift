@@ -99,23 +99,17 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 attemptedWithoutScreenAccess = false // A valid stream overrides a false ordinary preflight.
                 guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
                 captureChecked = true
-                publish(.checking, "Screen frame verified; checking system HID input")
-                watchdog?.arm("System HID input", timeout: 15)
-                let nativeInput = try LoginWindowInput { [self] step in
-                    publish(.checking, "Screen frame verified; " + step.rawValue)
-                    watchdog?.arm(step.rawValue, timeout: 15)
-                }
-                input = nativeInput
-                logger.notice("LoginWindow input backend: \(nativeInput.backend.rawValue, privacy: .public); authorization checked, delivery awaits real client verification")
-                if let pid = nativeInput.keyboardTarget {
-                    logger.notice("LoginWindow keyboard destination verified: system login process PID \(pid, privacy: .public); authorized application event routing")
-                }
+                publish(.checking, "Screen frame verified; checking pre-login graphics marker and input authorization")
+                watchdog?.arm("Pre-login Quartz input", timeout: 15)
+                let input = try LoginWindowInput()
+                self.input = input
+                logger.notice("LoginWindow input: pre-login executable marker present; authorized Quartz session; delivery awaits client verification")
                 inputChecked = true; lastFailure = nil
                 let token = options.requirePairing ? try pairingCode(options.token) : ""
                 options.bind = ip; options.display = display
                 // Tell the nobody discovery daemon to relinquish its port. Its
                 // fallback resumes if this process exits or its heartbeat expires.
-                publish(.claiming, "Valid frame and " + nativeInput.backend.rawValue + " input authorization checked")
+                publish(.claiming, "Valid frame and " + LoginWindowInput.backendName + " input authorization checked")
                 guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
                 let host = HostServer(ip: ip, options: options, token: token)
                 host.allowClipboard = false; host.restrictToLocalSubnet = true
@@ -125,12 +119,14 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 host.onKeyboardPacket = {
                     inputLogger.notice("First remote keyboard packet received in LoginWindow; no key codes or text recorded")
                 }
-                let watchdog = self.watchdog
-                host.makeInputInjector = { id, size, rect in
-                    let ticket = watchdog?.arm("Keyboard / mouse event preparation", timeout: 15)
-                    defer { if let ticket { watchdog?.disarm(ticket: ticket) } }
-                    return InputInjector(display: id, captureSize: size, contentRect: rect,
-                        authorized: { nativeInput.isAuthorized }, post: nativeInput.post)
+                host.makeInputInjector = { [weak self, weak host] id, size, rect in
+                    QueuedInputController(allowed: { ConsoleSession.preLogin }, factory: {
+                        InputInjector(display: id, captureSize: size, contentRect: rect,
+                            authorized: { input.isAuthorized }, post: input.post, eventSource: nil)
+                    }, onFailure: { reason in
+                        guard let self, let host, self.server === host else { return }
+                        self.fail("System input: " + reason)
+                    })
                 }
                 host.onInputFailure = { [weak self, weak host] reason in DispatchQueue.main.async {
                     guard let self, let host, self.server === host else { return }
@@ -163,7 +159,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                     }
                 }
                 server = host; selectedIP = ip
-                publish(.listening, "Screen ready; " + nativeInput.backend.rawValue + " input authorized; waiting for client")
+                publish(.listening, "Screen ready; " + LoginWindowInput.backendName + " input authorized; waiting for client")
             } catch {
                 let systemError = error as NSError
                 // Retry transient display / service failures even when ordinary
