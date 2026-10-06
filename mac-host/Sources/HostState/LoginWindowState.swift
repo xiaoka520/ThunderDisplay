@@ -156,6 +156,13 @@ public struct LoginWindowConfiguration: Codable, Equatable {
     public var valid: Bool {
         port > 0 && (desktopUID == nil || desktopUID! >= 500) && (!requirePairing || (token?.utf8.count == 32 && token!.allSatisfy { $0.isASCII && $0.isHexDigit }))
     }
+    /// The root login component may start only this installed user's fixed job.
+    /// Missing configuration or a different console user leaves startup to macOS.
+    public func desktopStartupTarget(consoleUID: UInt32?) -> String? {
+        guard let desktopUID, desktopUID >= 500, desktopUID < UInt32.max,
+              desktopUID == consoleUID else { return nil }
+        return "gui/\(desktopUID)/dev.thunderdisplay.desktop"
+    }
     public static func read() throws -> Self {
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard fd >= 0 else { throw POSIXError(.ENOENT) }; defer { close(fd) }

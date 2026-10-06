@@ -108,6 +108,7 @@ server.stop()
     env['TD_TEST_CURSOR_STATE'] = str(folder / 'cursor-visible.txt')
     env['TD_TEST_INPUT_ALLOW'] = str(folder / 'allow-input')
     env['TD_TEST_HANDOVER'] = str(folder)
+    (folder / 'allow-input').touch()
     process = subprocess.Popen([str(folder / 'host-check'), '--port', str(port), '--no-pairing'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     try:
@@ -272,6 +273,7 @@ server.stop()
                 raise AssertionError('No complete keyframe after UDP probe')
             # Even a Ready peer must be disconnected on session handover before
             # its input reaches the fatal injection stub.
+            (folder / 'allow-input').unlink()
             control(struct.pack('!BBHHii', 3, 3, 65, 1, 0, 0))
             assert tcp.recv(1) == b'', 'Old-session input was not rejected'
             assert process.poll() is None, 'Denied input reached the injection stub'
@@ -294,6 +296,25 @@ server.stop()
             assert (folder / 'keyboard-received').exists(), 'Accepted keyboard packet did not trigger its diagnostic'
             (folder / 'keyboard-received').unlink()
             print('Ready-session handover and system input failure feedback checks passed (no OS input injection)')
+        # Announce a login transition even with no subsequent keyboard packet,
+        # before the AppKit-side shutdown timer notices the session change.
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as tcp:
+            control(bytes([9, 8, 0]))
+            read_exact(struct.unpack('!I', read_exact(4))[0])
+            control(hello)
+            welcome = read_exact(struct.unpack('!I', read_exact(4))[0])
+            transition_session = struct.unpack('!Q', welcome[3:11])[0]
+            control(bytes([8])); control(bytes([5]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([6])
+            (folder / 'allow-input').unlink()
+            notice = read_exact(struct.unpack('!I', read_exact(4))[0])
+            assert notice == bytes([17]) + struct.pack('!Q', transition_session) + bytes([1])
+            control(bytes([18]) + struct.pack('!Q', transition_session) + bytes([1]))
+            control(bytes([5]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([6])
+            assert not (folder / 'keyboard-received').exists()
+            print('Idle login transition announced before capture/input delivery; control channel remains usable')
+        (folder / 'allow-input').touch()
         # A slow encoder shutdown must not prevent the desktop host claiming
         # both the TCP listener and wildcard UDP discovery port immediately.
         with socket.create_connection(('127.0.0.1', port), timeout=3) as tcp:

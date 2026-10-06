@@ -4,6 +4,7 @@
 #include "blob.hpp"
 #include "recovery.hpp"
 
+class ControlSender;
 class ClientSession {
     ClientOptions options;
     Renderer& renderer;
@@ -12,8 +13,7 @@ class ClientSession {
     std::atomic<bool> stopFlag{false}, online{false}, wantIDR{false}, overflow{false};
     std::thread worker;
     std::mutex mutex;
-    std::deque<td::Bytes> outgoing;
-    std::deque<td::Bytes> clipboardOutgoing;
+    std::shared_ptr<ControlSender> control;
     std::optional<std::string> clipboardIncoming;
     std::optional<td::Bytes> imageIncoming,cursorIncoming;
     std::atomic<bool> richClipboard{false};
@@ -22,6 +22,7 @@ class ClientSession {
     std::atomic<bool> localCursorActive{false};
     std::string status;
     std::string fallbackDescription;
+    std::string lastStreamHost; // Worker-only; verified by a displayed live frame.
     td::RetryBudget retryBudget;
     std::atomic<unsigned> attemptNumber{0};
     std::atomic<bool> recoveryStopped{false}, videoInterrupted{false};

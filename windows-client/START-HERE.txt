@@ -1,6 +1,6 @@
-ThunderDisplay 0.8.7 · Windows 图形客户端 / Windows GUI client
+ThunderDisplay 0.8.9 · Windows 图形客户端 / Windows GUI client
 
-1. 最新构建为 0.8.7。双击 ThunderDisplay-GUI-0.8.7-x64.exe；中文 / English / 跟随系统。
+1. 最新构建为 0.8.9。双击 ThunderDisplay-GUI-0.8.9-x64.exe；中文 / English / 跟随系统。
    登录前键鼠修复需更新 Mac，并点击“更新开机组件与连接配置”以更新系统副本。
 2. 填写 Mac 网桥 IPv4 或留空自动发现；配对码默认关闭。
 3. 显示模式为“自动 / 自定义”；帧率由两端屏幕协商，上限240，目标不等于实测。
@@ -31,7 +31,7 @@ ThunderDisplay 0.8.7 · Windows 图形客户端 / Windows GUI client
 Windows 10 1703+ / Windows 11 x64；需Media Foundation / D3D11，Windows N需媒体组件。
 保留licenses目录。构建与协议/原生Mac测试通过，ROG原生主题、动态指针、GPU和两机图片粘贴待实机验收。
 
-Latest build: 0.8.7. Run the GUI EXE; pairing is optional on the bridge.
+Latest build: 0.8.9. Run the GUI EXE; pairing is optional on the bridge.
 Pre-login input requires the Mac update and Update startup components and connection settings, which updates the system copy.
 Caps Lock now also updates the Windows toggle state/keyboard LED; refocusing the display or recapturing input resynchronizes local state.
 Auto preserves Mac HiDPI source pixels. Custom changes resolution/bitrate; FPS follows detected displays.
@@ -65,3 +65,9 @@ Mac 端默认“保持 Mac 可连接”，防止系统自动睡眠。雷雳不�
 0.8.0：本地指针按 Windows 当前显示缩放自动选择 macOS 原生倍率图；存在对应倍率时直接显示原像素，移动到不同缩放的显示器会自动切换。两端需同时更新。
 
 0.8.7: Mac登录前输入已重写为带图形标记的Quartz会话输入，键鼠在主线程处理；需要更新Mac开机组件。真实冷启动登录字段仍需复测。
+
+0.8.8：密码通过后，确认会话交接的快速重试持续15秒，每250毫秒一次，优先复用刚显示画面的Mac地址；Mac会话切换和桌面启动每100毫秒检查；登录后主动请求配置用户的既有桌面任务。仍最多10分钟/150次，交接保留最后一帧且不显示文字。实际速度取决于macOS桌面和捕获服务就绪时间。需要更新两端与Mac开机组件。
+Version 0.8.8: authenticated session transitions use 15 seconds of 250 ms retries to the last displayed host, with a 500 ms connect deadline. Mac polls session handover/startup every 100 ms. The overall 10-minute / 150-attempt limits and silent retained frame remain. Actual desktop/capture readiness still depends on macOS. Update both platforms and Mac startup components.
+
+0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
+Version 0.8.9: frozen handovers allow Ready/Ping/IDR; only input is paused. Independent TCP writing prioritizes input, pointer geometry no longer waits on GPU presentation, and decoder bursts present only the newest output. Mac RGB transfer/VT submission use a one-frame worker. Update both platforms and Mac startup components; native ROG latency and visual continuity still need verification.

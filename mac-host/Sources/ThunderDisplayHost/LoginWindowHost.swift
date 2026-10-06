@@ -8,7 +8,7 @@ import InputSupport
 /// uses a user's pasteboard, or exposes filesystem / process-control commands.
 final class LoginWindowHost: NSObject, NSApplicationDelegate {
     private let logger = Logger(subsystem: "dev.thunderdisplay.host", category: "loginwindow")
-    private var timer: Timer?, server: HostServer?, probe: LoginWindowFrameProbe?
+    private var timer: Timer?, sessionTimer: Timer?, server: HostServer?, probe: LoginWindowFrameProbe?
     private var signals: [DispatchSourceSignal] = []
     private var phase = LoginWindowState.Phase.checking, detail = "", busy = false
     private var nextCheck: TimeInterval = 0
@@ -16,6 +16,8 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
     private var attemptedWithoutScreenAccess = false
     private var watchdog: PreparationWatchdog?
     private var input: LoginWindowInput?
+    private var configuration: LoginWindowConfiguration?
+    private var handingOver = false
     private var captureChecked = false, inputChecked = false
     private var lastFailure: String?
     /// Snapshot taken the first time this agent publishes `stopped`, so the reason
@@ -32,6 +34,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         }
         do {
             let config = try LoginWindowConfiguration.read()
+            configuration = config
             options.port = config.port; options.requirePairing = config.requirePairing; options.token = config.token
         } catch {
             logger.error("Invalid / missing root-owned LoginWindow configuration")
@@ -57,6 +60,12 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
             source.setEventHandler { NSApp.terminate(nil) }; source.resume(); signals.append(source)
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
+        // Capture/service health needs only the ordinary heartbeat. Detect the
+        // login transition promptly without rewriting its status file at 10 Hz.
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self, ConsoleSession.loggedIn else { return }
+            self.refresh()
+        }
         refresh()
     }
     private func publish(_ value: LoginWindowState.Phase, _ reason: String = "") {
@@ -71,10 +80,10 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         catch { logger.error("Cannot publish LoginWindow state: \(error.localizedDescription, privacy: .public)") }
     }
     private func refresh() {
+        guard !handingOver else { return }
         guard !ConsoleSession.loggedIn else {
             // New input is gated per packet; pending key / button releases are cleaned up.
-            stop(); publish(.stopped, "User session active; desktop host takes over")
-            NSApp.terminate(nil); return
+            handOverToDesktop(); return
         }
         publish(phase, detail)
         // The bootstrap is validated at entry; the real capture/input checks
@@ -161,6 +170,9 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 server = host; selectedIP = ip
                 publish(.listening, "Screen ready; " + LoginWindowInput.backendName + " input authorized; waiting for client")
             } catch {
+                guard !handingOver, !ConsoleSession.loggedIn else {
+                    busy = false; self.probe = nil; return
+                }
                 let systemError = error as NSError
                 // Retry transient display / service failures even when ordinary
                 // preflight is false; only an actual consent refusal suppresses
@@ -179,11 +191,52 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         // display recovery, with a bounded frequency and no interactive UI.
         nextCheck = ProcessInfo.processInfo.systemUptime + 30
     }
+    private func handOverToDesktop() {
+        handingOver = true; timer?.invalidate(); sessionTimer?.invalidate(); watchdog?.disarm()
+        // RunAtLoad can remain pending while the new GUI domain is in
+        // on-demand-only mode. Demand the existing job, without killing an app
+        // that is already running or spawning a root process in the user's GUI.
+        var request = requestDesktopStartup()
+        stop(); publish(.stopped, "User session active; desktop host takes over")
+        Task { @MainActor [self] in
+            let deadline = ProcessInfo.processInfo.systemUptime + 2
+            while let process = request {
+                while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                }
+                if process.isRunning {
+                    process.terminate() // Only our launchctl child, never the desktop job.
+                    logger.error("Desktop startup request timed out; ordinary login startup remains available")
+                    break
+                }
+                if process.terminationStatus == 0 {
+                    logger.notice("Desktop startup job requested; waiting for its real first frame")
+                    break
+                }
+                guard ProcessInfo.processInfo.systemUptime < deadline else {
+                    logger.error("Desktop startup job not yet available; ordinary login startup remains available")
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                request = requestDesktopStartup()
+            }
+            NSApp.terminate(nil)
+        }
+    }
+    private func requestDesktopStartup() -> Process? {
+        guard geteuid() == 0, ConsoleSession.loggedIn,
+              let target = configuration?.desktopStartupTarget(consoleUID: ConsoleSession.uid) else { return nil }
+        let process = Process(); process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["kickstart", target]
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+        do { try process.run(); return process }
+        catch { logger.error("Cannot request the configured desktop startup job"); return nil }
+    }
     private func stop() { probe?.cancel(); server?.stop(handover: ConsoleSession.loggedIn); watchdog?.disarm(); server = nil; input = nil; selectedIP = "" }
     func applicationWillTerminate(_ notification: Notification) {
         // `publish` snapshots the phase and reason it is leaving, so the login
         // handover keeps the evidence of why pre-login capture never started.
-        timer?.invalidate(); stop(); publish(.stopped, "LoginWindow agent stopped")
+        timer?.invalidate(); sessionTimer?.invalidate(); stop(); publish(.stopped, "LoginWindow agent stopped")
     }
 }
 

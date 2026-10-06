@@ -2,6 +2,16 @@ import XCTest
 @testable import HostState
 
 final class LoginWindowStateTests: XCTestCase {
+    func testDesktopDemandIsScopedToConfiguredAndCurrentUser() {
+        let config = LoginWindowConfiguration(port: 47990, requirePairing: false, token: nil, desktopUID: 501)
+        XCTAssertEqual(config.desktopStartupTarget(consoleUID: 501), "gui/501/dev.thunderdisplay.desktop")
+        for uid in [nil, 0, 499, 502, UInt32.max] as [UInt32?] {
+            XCTAssertNil(config.desktopStartupTarget(consoleUID: uid))
+        }
+        for uid in [nil, 0, 499, UInt32.max] as [UInt32?] {
+            XCTAssertNil(LoginWindowConfiguration(port: 47990, requirePairing: false, token: nil, desktopUID: uid).desktopStartupTarget(consoleUID: uid))
+        }
+    }
     func testDiscoveryOnlyRelinquishesPortForLiveClaimOrListener() throws {
         for phase in [LoginWindowState.Phase.checking, .blocked, .stopped] {
             XCTAssertFalse(LoginWindowState(pid: 10, uptime: 100, phase: phase).ownsPort(at: 101))

@@ -1,5 +1,6 @@
 #include "network.hpp"
 #include <iphlpapi.h>
+#include "control_outbox.hpp"
 
 namespace {
 struct Socket {
@@ -18,6 +19,54 @@ bool wouldBlock() { return WSAGetLastError()==WSAEWOULDBLOCK; }
 void bindSocket(SOCKET fd,sockaddr_in a) { if(bind(fd,reinterpret_cast<sockaddr*>(&a),sizeof(a))) throw std::runtime_error("Socket bind failed"); }
 }
 
+// TCP has exactly one writer, independent of Media Foundation and D3D Present.
+// Its connection-scoped lifetime ends before the owning socket is closed.
+class ControlSender {
+    SOCKET socket;
+    td::ControlOutbox outbox;
+    std::atomic<bool> stopped{false}, failed{false};
+    std::mutex errorMutex;
+    std::string error;
+    std::thread writer;
+    void run() {
+        try {
+            while(!stopped) {
+                auto item=outbox.take(); if(!item) continue;
+                auto bytes=td::framed(item->message); size_t offset=0;
+                while(!stopped && offset<bytes.size()) {
+                    // An unstarted old-session packet may be dropped. Once
+                    // partially sent, finish it before the ACK to retain framing.
+                    if(!offset && !outbox.current(*item)) break;
+                    fd_set write; FD_ZERO(&write); FD_SET(socket,&write);
+                    timeval timeout{0,2000}; auto selected=select(0,nullptr,&write,nullptr,&timeout);
+                    if(selected==SOCKET_ERROR) throw std::runtime_error("TCP writer select failed");
+                    if(!selected) continue;
+                    if(!offset && !outbox.current(*item)) break;
+                    auto count=::send(socket,reinterpret_cast<const char*>(bytes.data()+offset),int(bytes.size()-offset),0);
+                    if(count>0) offset+=size_t(count);
+                    else if(count==0 || !wouldBlock()) throw std::runtime_error("TCP send failed");
+                }
+            }
+        } catch(const std::exception& e) {
+            { std::lock_guard<std::mutex> lock(errorMutex); error=e.what(); }
+            failed=true; outbox.stop();
+        }
+    }
+public:
+    explicit ControlSender(SOCKET socket):socket(socket),writer([this]{run();}) {}
+    ~ControlSender() { stop(); }
+    void stop() { stopped=true; outbox.stop(); if(writer.joinable()) writer.join(); }
+    td::ControlOutbox::Result send(td::Bytes message) { return outbox.push(std::move(message)); }
+    void allowInput(bool value) { outbox.allowInput(value); }
+    void clipboard(std::deque<td::Bytes> packets) { outbox.replaceClipboard(std::move(packets)); }
+    void clearClipboard() { outbox.clearClipboard(); }
+    void transition(uint64_t session) { outbox.transition(td::sessionTransition(session,true)); }
+    void checkFailure() {
+        if(!failed) return;
+        std::lock_guard<std::mutex> lock(errorMutex); throw std::runtime_error(error);
+    }
+};
+
 void ClientSession::setStatus(std::string value) {
     std::cout<<"[ThunderDisplay] "<<value<<std::endl;
     { std::lock_guard<std::mutex> lock(mutex); status=std::move(value); }
@@ -33,30 +82,23 @@ void ClientSession::expireHandover() {
     }
 }
 void ClientSession::send(td::Bytes data) {
-    if(!online || holdingFrame) return;
-    std::lock_guard<std::mutex> lock(mutex);
-    if(!online || holdingFrame) return;
-    // Mouse moves can replace only the immediately preceding move, preserving button/key ordering.
-    if(data.size()==14 && data[0]==uint8_t(td::Message::Input) && data[1]==1 && !outgoing.empty() &&
-       outgoing.back().size()==14 && outgoing.back()[0]==uint8_t(td::Message::Input) && outgoing.back()[1]==1) {
-        outgoing.back()=std::move(data); return;
-    }
-    if(outgoing.size()>=256) { overflow=true; return; }
-    outgoing.push_back(std::move(data));
+    std::shared_ptr<ControlSender> sender;
+    { std::lock_guard<std::mutex> lock(mutex); if(!online) return; sender=control; }
+    if(sender && sender->send(std::move(data))==td::ControlOutbox::Result::Full) overflow=true;
 }
 void ClientSession::sendClipboard(const std::string& text) {
     if(!clipboardOnline) return;
     std::lock_guard<std::mutex> lock(mutex);
     if(!clipboardOnline) return;
     if(++clipboardID==0) ++clipboardID;
-    clipboardOutgoing=td::clipboardPackets(text,clipboardID);
+    if(control) control->clipboard(td::clipboardPackets(text,clipboardID));
 }
 void ClientSession::sendClipboardImage(const td::Bytes& png) {
     if(!imageClipboardEnabled()) return;
     std::lock_guard<std::mutex> lock(mutex);
     if(!imageClipboardEnabled()) return;
     if(++clipboardID==0) ++clipboardID;
-    clipboardOutgoing=td::blobPackets(td::Message::ClipboardImage,png,clipboardID,td::ClipboardImageLimit);
+    if(control) control->clipboard(td::blobPackets(td::Message::ClipboardImage,png,clipboardID,td::ClipboardImageLimit));
 }
 std::string ClientSession::discover() {
     Socket socket(SOCK_DGRAM); socket.nonblocking(); BOOL yes=TRUE;
@@ -109,13 +151,17 @@ void ClientSession::run() {
         }
         attemptNumber=retryBudget.attempts;
         try {
-            setStatus(options.host.empty()?"Discovering Thunderbolt host…":"Connecting to "+options.host);
-            auto host=options.host.empty()?discover():options.host;
+            // A session transition does not change the bridge route. Avoid a
+            // fresh broadcast search while the known host changes sessions.
+            auto host=options.host;
+            if(host.empty() && retryBudget.fastHandover(micros())) host=lastStreamHost;
+            setStatus(host.empty()?"Discovering Thunderbolt host…":"Connecting to "+host);
+            if(host.empty()) host=discover();
             checkRecoveryDeadline(); connectAndStream(host);
         } catch(const std::exception& e) { if(!stopFlag) setStatus(e.what()); }
         online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false;
         expireHandover(); renderer.resetFrame(holdingFrame);
-        { std::lock_guard<std::mutex> lock(mutex); outgoing.clear(); clipboardOutgoing.clear(); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
+        { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
         PostMessageW(window,DisconnectedMessage,0,0);
     }
     CoUninitialize();
@@ -128,7 +174,7 @@ void ClientSession::connectAndStream(const std::string& host) {
     auto result=connect(tcp.fd,reinterpret_cast<sockaddr*>(&remote),sizeof(remote));
     if(result && !wouldBlock()) throw std::runtime_error("TCP connect failed");
     if(result) {
-        auto deadline=micros()+3000000; bool connected=false;
+        auto deadline=micros()+(retryBudget.fastHandover(micros())?500000:3000000); bool connected=false;
         while(!stopFlag && micros()<deadline) {
             checkRecoveryDeadline();
             fd_set write,error; FD_ZERO(&write); FD_ZERO(&error); FD_SET(tcp.fd,&write); FD_SET(tcp.fd,&error); timeval t{0,50000};
@@ -150,7 +196,16 @@ void ClientSession::connectAndStream(const std::string& host) {
     auto capabilityQuery=options.capabilityVersion==1?td::Bytes{uint8_t(td::Message::CapabilityQuery)}:td::Bytes{uint8_t(td::Message::CapabilityQuery),options.capabilityVersion};
     if(options.capabilityVersion>=4) capabilityQuery.push_back(options.localCursor && options.capabilityVersion>=5?1:0);
     options.settings.codecMask=requestedCodecMask;
-    td::Bytes output=td::framed(querying?capabilityQuery:td::hello(options.settings,ntohs(local.sin_port),options.token)); size_t outputOffset=0;
+    auto sender=std::make_shared<ControlSender>(tcp.fd);
+    { std::lock_guard<std::mutex> lock(mutex); control=sender; }
+    struct SenderLifetime {
+        std::function<void()> detach;
+        ~SenderLifetime() { detach(); }
+    } senderLifetime{[&]{
+        { std::lock_guard<std::mutex> lock(mutex); if(control==sender) control.reset(); }
+        sender->stop();
+    }};
+    sender->send(querying?capabilityQuery:td::hello(options.settings,ntohs(local.sin_port),options.token));
     td::ControlFramer framer; std::unique_ptr<Decoder> decoder; std::unique_ptr<td::Reassembler> assembler;
     uint64_t accepted=micros(),lastControl=accepted,lastPing=accepted,lastIDR=0,lastFrame=accepted;
     uint64_t sessionID=0,videoPackets=0,completeFrames=0,readyAt=0,lastStatus=0,lastProbe=0;
@@ -220,18 +275,24 @@ void ClientSession::connectAndStream(const std::string& host) {
     while(!stopFlag) {
         expireHandover();
         checkRecoveryDeadline();
+        sender->checkFailure();
         if(overflow) throw std::runtime_error("Input queue overflow; reconnecting to release held keys");
         auto now=micros();
         if(decoder && decoder->decodedFrames()!=decodedCount) {
             decodedCount=decoder->decodedFrames(); lastDecoded=now; videoInterrupted=false;
         }
-        if(!confirmedFrame && renderer.hasFrame()) {
+        if(!transitionReceived && !confirmedFrame && renderer.hasFrame()) {
             holdingFrame=false; handoverHold.clear();
+            lastStreamHost=host;
             confirmedFrame=true; retryBudget.succeeded(); retryBudget.streamDisplayed(); attemptNumber=0;
             PostMessageW(window,FramePresentedMessage,0,0);
         }
+        sender->allowInput(online && !transitionReceived && !holdingFrame && renderer.hasFrame());
         if(!transitionReceived && confirmedFrame && !td::VideoHealth::fresh(now,lastDecoded) && !videoInterrupted.exchange(true)) {
-            renderer.resetFrame(); PostMessageW(window,DisconnectedMessage,0,0);
+            sender->allowInput(false);
+            // Hide stale live video, but keep a snapshot until the current
+            // session can announce a bounded handover (or disconnect normally).
+            renderer.resetFrame(false,true); PostMessageW(window,DisconnectedMessage,0,0);
         }
         if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastDecoded)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
         if(now-lastControl>10000000 || (!decoder && now-accepted>15000000)) throw std::runtime_error("Host timed out");
@@ -254,24 +315,9 @@ void ClientSession::connectAndStream(const std::string& host) {
         if(online && (wantIDR || now-lastFrame>500000) && now-lastIDR>250000) {
             send({uint8_t(td::Message::RequestIDR)}); wantIDR=false; lastIDR=now;
         }
-        if(outputOffset==output.size()) {
-            output.clear(); outputOffset=0;
-            std::lock_guard<std::mutex> lock(mutex);
-            while(!outgoing.empty() && output.size()<16384) {
-                auto b=td::framed(outgoing.front()); outgoing.pop_front(); output.insert(output.end(),b.begin(),b.end());
-            }
-            if(output.empty() && clipboardOnline && !clipboardOutgoing.empty()) {
-                output=td::framed(clipboardOutgoing.front()); clipboardOutgoing.pop_front();
-            }
-        }
-        fd_set read,write; FD_ZERO(&read); FD_ZERO(&write); FD_SET(tcp.fd,&read); FD_SET(udp.fd,&read);
-        if(outputOffset<output.size()) FD_SET(tcp.fd,&write);
-        timeval timeout{0,2000}; auto selected=select(0,&read,&write,nullptr,&timeout);
+        fd_set read; FD_ZERO(&read); FD_SET(tcp.fd,&read); FD_SET(udp.fd,&read);
+        timeval timeout{0,2000}; auto selected=select(0,&read,nullptr,nullptr,&timeout);
         if(selected==SOCKET_ERROR) throw std::runtime_error("Socket select failed");
-        if(FD_ISSET(tcp.fd,&write)) {
-            auto n=::send(tcp.fd,reinterpret_cast<const char*>(output.data()+outputOffset),int(output.size()-outputOffset),0);
-            if(n>0) outputOffset+=size_t(n); else if(n==0 || !wouldBlock()) throw std::runtime_error("TCP send failed");
-        }
         if(FD_ISSET(tcp.fd,&read)) {
             uint8_t b[8192]; auto n=recv(tcp.fd,reinterpret_cast<char*>(b),sizeof(b),0);
             if(n==0) {
@@ -284,15 +330,16 @@ void ClientSession::connectAndStream(const std::string& host) {
                 if(type==td::Message::SessionTransition) {
                     if(options.capabilityVersion<8 || !decoder || !td::validSessionTransition(message,sessionID))
                         throw std::runtime_error("Invalid session transition notice");
-                    if(!transitionReceived && confirmedFrame && renderer.hasFrame()) {
-                        handoverHold.begin(micros()); holdingFrame=true; renderer.resetFrame(true);
+                    if(!transitionReceived) {
+                        retryBudget.sessionTransition(micros());
+                        if(confirmedFrame && renderer.resetFrame(true)) {
+                            handoverHold.begin(micros()); holdingFrame=true;
+                        }
                     }
                     transitionReceived=true; online=false; clipboardOnline=false; localCursorActive=false;
-                    { std::lock_guard<std::mutex> lock(mutex); outgoing.clear(); clipboardOutgoing.clear(); }
                     // Retire queued input before acknowledging the session notice.
                     // A partially sent framed message must finish to keep framing intact.
-                    if(outputOffset==0) output.clear();
-                    auto ack=td::framed(td::sessionTransition(sessionID,true)); output.insert(output.end(),ack.begin(),ack.end());
+                    sender->transition(sessionID);
                     PostMessageW(window,DisconnectedMessage,0,0); continue;
                 }
                 if(type==td::Message::Failure) {
@@ -321,7 +368,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                     if(options.settings.height>2304 && !(capabilities.flags&8)) throw std::runtime_error("Update the Mac host to use native HiDPI pixels above 2304 lines");
                     sourceDescription="Mac display: "+capabilities.name+" | "+std::to_string(capabilities.current.width)+"×"+
                         std::to_string(capabilities.current.height)+" | "+std::to_string(capabilities.current.hz)+" Hz\r\n";
-                    output=td::framed(td::hello(options.settings,ntohs(local.sin_port),options.token,richFeatures)); outputOffset=0; querying=false;
+                    sender->send(td::hello(options.settings,ntohs(local.sin_port),options.token,richFeatures)); querying=false;
                     setStatus("Auto quality negotiated: "+std::to_string(options.settings.width)+"×"+std::to_string(options.settings.height)+
                         " | "+std::to_string(options.settings.fps)+" Hz | "+std::to_string(options.settings.bitrate/1000000)+" Mbps");
                     continue;
@@ -361,7 +408,8 @@ void ClientSession::connectAndStream(const std::string& host) {
                     }
                 } else if(type==td::Message::ClipboardControl && options.clipboard && clipboardSupported && message.size()==2 && message[1]<=1) {
                     clipboardOnline=message[1]!=0;
-                    { std::lock_guard<std::mutex> lock(mutex); clipboardOutgoing.clear(); clipboardIncoming.reset();imageIncoming.reset(); }
+                    sender->clearClipboard();
+                    { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset(); }
                     clipboardAssembler.reset();imageAssembler.reset(); PostMessageW(window,ClipboardMessage,1,0);
                 } else if(type==td::Message::ClipboardText && clipboardOnline) {
                     if(auto text=clipboardAssembler.push(message)) {

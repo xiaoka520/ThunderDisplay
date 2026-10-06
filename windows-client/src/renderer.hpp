@@ -7,6 +7,12 @@
 class Renderer {
     HWND window;
     std::mutex mutex;
+    // Pointer hit testing must never wait for GPU conversion or Present.
+    std::mutex pointerMutex;
+    std::optional<td::PresentationGeometry> pointerGeometry;
+    UINT pointerWidth=0,pointerHeight=0;
+    RECT pointerViewport{};
+    void updatePointerGeometryLocked();
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11VideoDevice> video;
@@ -64,12 +70,12 @@ public:
     void configureBitDepth(uint8_t depth);
     void setDesktopSRGB(bool value) { std::lock_guard<std::mutex> lock(mutex); desktopSRGB=value; }
     bool pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y);
-    void setPixelExact(bool value) { std::lock_guard<std::mutex> lock(mutex); pixelExact=value; }
+    void setPixelExact(bool value) { std::lock_guard<std::mutex> lock(mutex); pixelExact=value; updatePointerGeometryLocked(); }
     void setScalingQuality(uint8_t value) { std::lock_guard<std::mutex> lock(mutex); scalingQuality=std::min<uint8_t>(value,1); }
     bool hasFrame() const { return presented && td::VideoHealth::fresh(micros(),presentationTime); }
     std::string colorDescription();
     void retainForHandover(bool value) { std::lock_guard<std::mutex> lock(mutex); rememberFrames=value; }
     bool hasFrozenFrame() const { return frozen; }
     bool repaintFrozen() { std::lock_guard<std::mutex> lock(mutex); return repaintFrozenLocked(); }
-    void resetFrame(bool preserve=false);
+    bool resetFrame(bool preserve=false,bool keepSnapshot=false);
 };

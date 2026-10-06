@@ -5,8 +5,9 @@ namespace td {
 // A round includes discovery, connection, negotiation and retry waits.
 struct RetryBudget {
     static constexpr uint64_t Duration=600000000, Interval=4000000;
+    static constexpr uint64_t HandoverDuration=15000000, HandoverInterval=250000;
     static constexpr unsigned Total=unsigned(Duration/Interval);
-    uint64_t deadline=0, next=0;
+    uint64_t deadline=0, next=0, handoverUntil=0;
     unsigned attempts=0;
     bool active=false;
     bool resumeStream=false;
@@ -16,12 +17,22 @@ struct RetryBudget {
     }
     bool expired(uint64_t now) const { return active && now>=deadline; }
     bool exhausted(uint64_t now) const { return expired(now) || attempts>=Total; }
+    bool fastHandover(uint64_t now) const { return handoverUntil && now<handoverUntil; }
+    void sessionTransition(uint64_t now) {
+        // A duplicate notice must not renew either recovery or its fast phase.
+        if(handoverUntil) return;
+        handoverUntil=now+HandoverDuration;
+        next=now;
+    }
     bool startAttempt(uint64_t now) {
         begin(now);
         if(exhausted(now) || now<next) return false;
-        ++attempts; next=now+(resumeStream && attempts<=8 ? 250000 : Interval); return true;
+        ++attempts;
+        auto interval=handoverUntil ? (fastHandover(now)?HandoverInterval:Interval) :
+            (resumeStream && attempts<=8 ? HandoverInterval : Interval);
+        next=now+interval; return true;
     }
-    void succeeded() { active=false; attempts=0; deadline=next=0; }
+    void succeeded() { active=false; attempts=0; deadline=next=handoverUntil=0; }
     void streamDisplayed() { resumeStream=true; }
 };
 struct VideoHealth {

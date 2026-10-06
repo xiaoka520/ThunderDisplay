@@ -13,10 +13,13 @@ class Decoder {
     bool desktopSRGB=false;
     unsigned credits=0;
     uint64_t inputs=0, outputs=0;
+    ComPtr<IMFSample> latestOutput;
+    UINT latestWidth=0,latestHeight=0;
     std::deque<td::Frame> pending;
     void configure(IMFTransform* candidate);
     void outputType();
     bool output();
+    void presentLatest();
     void input(const td::Frame& frame);
 public:
     Decoder(Renderer& renderer, const td::Welcome& welcome, bool desktopSRGB=false);

@@ -89,6 +89,15 @@ Renderer::Renderer(HWND hwnd, bool sync): window(hwnd), vsync(sync) {
     check(colorSwap->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709),"Set SDR full-range RGB presentation");
     factory->MakeWindowAssociation(hwnd,DXGI_MWA_NO_ALT_ENTER);
     destination={0,0,LONG(width),LONG(height)};
+    updatePointerGeometryLocked();
+}
+void Renderer::updatePointerGeometryLocked() {
+    std::lock_guard<std::mutex> lock(pointerMutex);
+    pointerWidth=sourceWidth; pointerHeight=sourceHeight;
+    if(sourceWidth>=2 && sourceHeight>=2) {
+        pointerGeometry.emplace(sourceWidth,sourceHeight,width,height,pixelExact);
+        auto d=pointerGeometry->destination; pointerViewport={d.left,d.top,d.right,d.bottom};
+    } else { pointerGeometry.reset(); pointerViewport={0,0,LONG(width),LONG(height)}; }
 }
 void Renderer::resizeLocked() {
     RECT r; GetClientRect(window,&r); UINT w=std::max<LONG>(1,r.right),h=std::max<LONG>(1,r.bottom);
@@ -97,6 +106,7 @@ void Renderer::resizeLocked() {
     check(swap->ResizeBuffers(0,w,h,DXGI_FORMAT_UNKNOWN,DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT|
         (tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0)),"Resize swap chain");
     width=w; height=h; enumerator.Reset(); processor.Reset();
+    updatePointerGeometryLocked();
 }
 void Renderer::configureBitDepth(uint8_t depth) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -116,12 +126,11 @@ void Renderer::configureBitDepth(uint8_t depth) {
     if(frozen) repaintFrozenLocked();
 }
 bool Renderer::pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y) {
-    std::lock_guard<std::mutex> lock(mutex);
-    if(!sourceWidth || !sourceHeight) return false;
-    return td::PresentationGeometry(sourceWidth,sourceHeight,width,height,pixelExact).pointer(px,py,dragging,sourceWidth,sourceHeight,x,y);
+    std::lock_guard<std::mutex> lock(pointerMutex);
+    return pointerGeometry && pointerGeometry->pointer(px,py,dragging,pointerWidth,pointerHeight,x,y);
 }
 void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); resizeLocked(); if(frozen) repaintFrozenLocked(); }
-RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(mutex); return destination; }
+RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(pointerMutex); return pointerViewport; }
 std::string Renderer::colorDescription() {
     std::lock_guard<std::mutex> lock(mutex);
     return std::string(desktopSRGB?"Color pipeline: sRGB SDR / BT.709 matrix | ":"Color pipeline: BT.709 SDR | ")+(bitDepth==10?"P010 64-940 -> RGB10 0-1023 | ":"NV12 16-235 -> RGB8 0-255 | ")+
@@ -172,6 +181,7 @@ void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UIN
         }
     }
     sourceWidth=frameWidth; sourceHeight=frameHeight;
+    updatePointerGeometryLocked();
     if(bitDepth==10 && !explicitVideoColor) throw std::runtime_error("GPU does not support P010 to 10-bit SDR RGB conversion");
     destination={dest.left,dest.top,dest.right,dest.bottom}; sourceRect={crop.left,crop.top,crop.right,crop.bottom};
     RECT output={0,0,LONG(width),LONG(height)};
@@ -218,9 +228,9 @@ void Renderer::presentBackBuffer() {
     auto result=swap->Present(vsync?1:0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
     if(result!=DXGI_STATUS_OCCLUDED) {
         check(result,"Present");
-        frozen=false;
         presentationTime=micros();
         if(!presented.exchange(true)) PostMessageW(window,FramePresentedMessage,0,0);
+        frozen=false;
     }
 }
 bool Renderer::repaintFrozenLocked() {
@@ -258,12 +268,12 @@ float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
     if(result!=DXGI_STATUS_OCCLUDED) check(result,"Present handover frame");
     return true;
 }
-void Renderer::resetFrame(bool preserve) {
+bool Renderer::resetFrame(bool preserve,bool keepSnapshot) {
     std::lock_guard<std::mutex> lock(mutex);
-    presented=false; presentationTime=0;
     frozen=preserve && retainedRGB;
-    if(frozen) { InvalidateRect(window,nullptr,FALSE); return; }
-    retainedView.Reset(); retainedRGB.Reset();
+    presented=false; presentationTime=0;
+    if(frozen) { repaintFrozenLocked(); InvalidateRect(window,nullptr,FALSE); return true; }
+    if(!keepSnapshot) { retainedView.Reset(); retainedRGB.Reset(); }
     // The swap chain owns the visible pixels. A GDI repaint does not retire them.
     if(swap) {
         ComPtr<ID3D11Texture2D> back;
@@ -274,6 +284,7 @@ void Renderer::resetFrame(bool preserve) {
         }
     }
     InvalidateRect(window,nullptr,FALSE);
+    return false;
 }
 void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,UINT fh,const td::PresentationGeometry& geometry) {
     if(!colorVertex || !colorPixel || !colorBlitPixel || !colorConstants || !colorSampler) {
@@ -324,6 +335,7 @@ void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,U
     D3D11_VIEWPORT viewport{0,0,float(fw),float(fh),0,1}; context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
     auto& s=geometry.source; auto& d=geometry.destination;
     sourceWidth=fw; sourceHeight=fh; sourceRect={s.left,s.top,s.right,s.bottom}; destination={d.left,d.top,d.right,d.bottom};
+    updatePointerGeometryLocked();
     bool footprint=double(s.right-s.left)/(d.right-d.left)<=4 && double(s.bottom-s.top)/(d.bottom-d.top)<=4;
     scalingActive=!pixelExact && footprint && initScaling(fw,fh,UINT(d.right-d.left),UINT(s.bottom-s.top));
     ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Desktop back buffer");

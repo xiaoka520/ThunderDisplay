@@ -241,6 +241,7 @@ final class HostServer: @unchecked Sendable {
         case .sessionTransitionAck:
             guard p.ready, p.transitionSent, SessionTransitionWire.matches(data, session: p.session, acknowledgment: true) else { throw WireError.malformed }
             p.transitionAcknowledged = true
+            log("Session transition receipt acknowledged by client")
         case .clipboardControl:
             guard p.ready, p.extendedFeatures, data.count == 2, data[data.startIndex + 1] <= 1 else { throw WireError.malformed }
             p.clipboardRequested = data[data.startIndex + 1] == 1
@@ -295,6 +296,9 @@ final class HostServer: @unchecked Sendable {
         }
     }
     private func sendVideo(_ frame: Data, pts: UInt64, key: Bool, peer p: Peer) -> Bool {
+        // A capture callback can precede the AppKit login timer. Retire the old
+        // stream before it sends pixels from the session transition.
+        if handoverOnSessionEnd, inputAllowed?() == false { announceTransition(p); return false }
         guard !stopping, !p.transitionSent, peer === p else { return false }
         let limit = p.richFeatures ? ProtocolWire.maxFrameSize : p.highBitrate ? ProtocolWire.gigabitMaxFrameSize : ProtocolWire.legacyMaxFrameSize
         guard !frame.isEmpty, frame.count <= limit, var target = p.videoAddress, let codec = p.engine?.codec else { return false }
@@ -314,6 +318,7 @@ final class HostServer: @unchecked Sendable {
         guard !stopping else { return }
         guard let p = peer else { return }
         let now = DispatchTime.now().uptimeNanoseconds
+        if handoverOnSessionEnd, inputAllowed?() == false { announceTransition(p) }
         if (!p.ready && now - p.accepted > 15_000_000_000) || now - p.lastSeen > 10_000_000_000 { disconnect(p, "Client timeout"); return }
         flush(p)
         for _ in 0..<16 {
@@ -378,6 +383,7 @@ final class HostServer: @unchecked Sendable {
         p.transitionSent = true; p.engine?.active = false
         p.clipboardOutput = []; p.cursorOutput = []
         send(SessionTransitionWire.packet(session: p.session), p)
+        log("Session transition notice sent; old video and input retired")
     }
     func stop(handover: Bool = false) {
         if handover && handoverOnSessionEnd {

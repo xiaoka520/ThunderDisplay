@@ -100,13 +100,22 @@ bool Decoder::output() {
     if(hr==MF_E_TRANSFORM_STREAM_CHANGE) { outputType(); continue; }
     if(hr==MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
     check(hr,"Decode output");
-    if(sample) { ++outputs; renderer.present(sample.Get(),outputWidth,outputHeight,welcome.settings.fps); }
+    if(sample) {
+        ++outputs; latestOutput=std::move(sample); latestWidth=outputWidth; latestHeight=outputHeight;
+    }
     return true;
     }
     throw std::runtime_error("Repeated decoder output type changes");
 }
+void Decoder::presentLatest() {
+    if(!latestOutput) return;
+    // Consume every codec output to preserve reference dependencies, but do not
+    // wait for Present once per obsolete output during a decoder event burst.
+    auto sample=std::move(latestOutput);
+    renderer.present(sample.Get(),latestWidth,latestHeight,welcome.settings.fps);
+}
 bool Decoder::submit(td::Frame frame) {
-    if(!async) { input(frame); while(output()) {} return true; }
+    if(!async) { input(frame); while(output()) {} presentLatest(); return true; }
     // Consume newly available input credits before judging the queue as stalled.
     pump();
     if(pending.size()>=2) { flush(); return false; }
@@ -124,10 +133,11 @@ bool Decoder::pump() {
         if(type==METransformHaveOutput) output();
     }
     while(credits && !pending.empty()) { input(pending.front()); pending.pop_front(); --credits; }
+    presentLatest();
     return true;
 }
 void Decoder::flush() {
-    pending.clear(); credits=0; discontinuity=true;
+    pending.clear(); latestOutput.Reset(); credits=0; discontinuity=true;
     check(transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH,0),"Flush decoder");
     if(async) {
         ComPtr<IMFMediaEvent> event;

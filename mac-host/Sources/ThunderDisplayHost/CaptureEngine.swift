@@ -11,6 +11,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     let desktopSRGB: Bool
     private let cursorVisible: Bool
     private let hello: Hello, queue: DispatchQueue
+    // RGB transfer and VT submission can block. Keep socket/input delivery on
+    // the original queue; admit at most one frame to this worker.
+    private let encoderWork = DispatchQueue(label: "ThunderDisplay.encoder", qos: .userInteractive)
     private var compression: VTCompressionSession?, stream: SCStream?
     private var transfer: VTPixelTransferSession?, tenBitPool: CVPixelBufferPool?
     var onInputFormat: ((OSType) -> Void)?
@@ -201,6 +204,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     }
     func stop() {
         stopped = true; active = false; onFrame = nil; onFailure = nil; onFormat = nil; onInputFormat = nil; latestImage = nil
+        // Drain the admitted frame before disposing its transfer/session. The
+        // worker posts results asynchronously and never waits on the socket queue.
+        encoderWork.sync {}
         if let transfer { VTPixelTransferSessionInvalidate(transfer) }; transfer = nil; tenBitPool = nil
         if let compression { VTCompressionSessionInvalidate(compression) }; compression = nil
         if let stream { Task { try? await stream.stopCapture() } }; stream = nil
@@ -228,13 +234,37 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     // Also used by the permission-free synthetic hardware encoder diagnostic.
     func encodeImage(_ image: CVPixelBuffer, time: CMTime) {
         guard active, !stopped, let compression, !busy else { return }
+        onInputFormat?(CVPixelBufferGetPixelFormatType(image))
+        if origin == nil { origin = time }
+        var presentation = CMTimeSubtract(time, origin!)
+        if let lastPresentation, CMTimeCompare(presentation, lastPresentation) <= 0 {
+            presentation = CMTimeAdd(lastPresentation, CMTime(value: 1, timescale: 1_000_000))
+        }
+        lastPresentation = presentation
+        busy = true; submitted += 1
+        let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        forceKey = false
+        let timestamp = presentation
+        encoderWork.async { [self] in
+            do { try encodeAdmittedImage(image, compression: compression, time: timestamp, properties: props) }
+            catch {
+                let reason = error.localizedDescription
+                queue.async { [self] in
+                    guard !stopped else { return }
+                    busy = false; forceKey = true; onFailure?(reason)
+                }
+            }
+        }
+    }
+    private func encodeAdmittedImage(_ image: CVPixelBuffer, compression: VTCompressionSession,
+                                     time: CMTime, properties: CFDictionary?) throws {
         var input = image
-        let format = CVPixelBufferGetPixelFormatType(image); onInputFormat?(format)
+        let format = CVPixelBufferGetPixelFormatType(image)
         let expectedYUV = codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         if (codec == .hevc10 || desktopSRGB) && format != expectedYUV {
             let expectedRGB = codec == .hevc10 ? kCVPixelFormatType_ARGB2101010LEPacked : kCVPixelFormatType_32BGRA
             guard format == expectedRGB, let transfer, let tenBitPool else {
-                onFailure?(desktopSRGB ? "DesktopColorUnavailable: Capture did not produce the requested RGB format" : "Main10Unavailable: Capture did not produce 10-bit pixels"); return
+                throw HostError(desktopSRGB ? "DesktopColorUnavailable: Capture did not produce the requested RGB format" : "Main10Unavailable: Capture did not produce 10-bit pixels")
             }
             if desktopSRGB {
                 // RGB capture is explicitly requested in sRGB. Preserve its curve
@@ -245,23 +275,14 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             }
             var converted: CVPixelBuffer?
             let allocated = CVPixelBufferPoolCreatePixelBuffer(nil, tenBitPool, &converted)
-            guard allocated == kCVReturnSuccess, let converted else { onFailure?("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): YUV buffer allocation failed (\(allocated))"); return }
+            guard allocated == kCVReturnSuccess, let converted else { throw HostError("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): YUV buffer allocation failed (\(allocated))") }
             let result = VTPixelTransferSessionTransferImage(transfer, from: image, to: converted)
-            guard result == noErr else { onFailure?("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): RGB to YUV conversion failed (\(result))"); return }
+            guard result == noErr else { throw HostError("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): RGB to YUV conversion failed (\(result))") }
             input = converted
         }
-        if origin == nil { origin = time }
-        var presentation = CMTimeSubtract(time, origin!)
-        if let lastPresentation, CMTimeCompare(presentation, lastPresentation) <= 0 {
-            presentation = CMTimeAdd(lastPresentation, CMTime(value: 1, timescale: 1_000_000))
-        }
-        lastPresentation = presentation
-        busy = true; submitted += 1
-        let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
-        forceKey = false
-        let result = VTCompressionSessionEncodeFrame(compression, imageBuffer: input, presentationTimeStamp: presentation,
-            duration: CMTime(value: 1, timescale: CMTimeScale(hello.fps)), frameProperties: props, sourceFrameRefcon: nil, infoFlagsOut: nil)
-        if result != noErr { busy = false; forceKey = true; onFailure?("Encode frame: \(result)") }
+        let result = VTCompressionSessionEncodeFrame(compression, imageBuffer: input, presentationTimeStamp: time,
+            duration: CMTime(value: 1, timescale: CMTimeScale(hello.fps)), frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: nil)
+        guard result == noErr else { throw HostError("Encode frame: \(result)") }
     }
     private func output(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?) {
         defer { busy = false }

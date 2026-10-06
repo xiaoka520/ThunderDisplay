@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusIsError = false
     private var signals: [DispatchSourceSignal] = []
     private var handoverRetry: Timer?
+    private var startupRetry: Timer?
     private var recovery = HostRecoveryState()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var lastDisplayRefresh: TimeInterval = 0
@@ -97,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             source.setEventHandler { NSApp.terminate(nil) }; source.resume(); signals.append(source)
         }
         refresh()
+        beginStartupPolling()
         if !options.background { setup.present() }
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.refresh() }
         if options.recoveryCheck { runRecoveryCheck() }
@@ -123,7 +125,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.recovery.sessionBecameActive(at: ProcessInfo.processInfo.systemUptime)
             self.permissions.resetCaptureHealth(); self.setup?.refreshDisplays(); self.refresh()
+            self.beginStartupPolling()
         })
+    }
+    private func beginStartupPolling() {
+        guard !options.previewUI, !options.recoveryCheck, server == nil, recovery.requested,
+              !recovery.sleeping, startupRetry == nil else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        startupRetry = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            guard self.server == nil, self.recovery.requested, !self.recovery.sleeping,
+                  ProcessInfo.processInfo.systemUptime < deadline else {
+                timer.invalidate(); self.startupRetry = nil; return
+            }
+            self.refresh()
+        }
     }
     private func runRecoveryCheck() {
         Task { @MainActor in
@@ -220,7 +236,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissions.refreshCurrent()
             if permissions.needsFreshCheck { permissions.check(verifyCapture: false) }
         }
-        if !options.previewUI && !recovery.sleeping && server == nil && now - lastDisplayRefresh >= 1 {
+        let displayInterval: TimeInterval = startupRetry != nil && setup.selectedDisplay == nil ? 0.1 : 1
+        if !options.previewUI && !recovery.sleeping && server == nil && now - lastDisplayRefresh >= displayInterval {
             lastDisplayRefresh = now; setup.refreshDisplays()
         }
         let screen: PermissionState = options.previewUI ? .notEffective : permissions.screen
@@ -379,6 +396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } }
             try host.start(); server = host; boundIP = ip; boundPort = port; statusIsError = false
             handoverRetry?.invalidate(); handoverRetry = nil
+            startupRetry?.invalidate(); startupRetry = nil
             recovery.started()
             if !options.recoveryCheck {
                 UserDefaults.standard.set(entered, forKey: "hostIPv4")
@@ -394,7 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             status = handingOver ? ui("正在接管监听端口，稍后自动重试…", "Taking over the listening port; retrying shortly…") : ui("启动失败：", "Unable to start: ") + String(describing: error)
             if handingOver {
                 handoverRetry?.invalidate()
-                handoverRetry = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in self?.refresh() }
+                handoverRetry = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in self?.refresh() }
             }
             log(status)
             setup.update(screen: permissions.screen, access: permissions.access, checking: false, running: false, detectedIP: bridgeAddress(), status: status, detail: permissions.detail)
@@ -457,6 +475,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func copyCode() { copyPairing() }
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate(); workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspaceObservers.removeAll()
+        startupRetry?.invalidate(); handoverRetry?.invalidate()
         power.update(enabled: false); clipboard.stop(); cursor.stop(); server?.stop()
     }
 }

@@ -29,6 +29,33 @@ int main() {
     assert(handover.startAttempt(start+8*250000));
     assert(!handover.startAttempt(start+8*250000+td::RetryBudget::Interval-1));
     assert(handover.expired(start+td::RetryBudget::Duration));
+    // An authenticated login transition needs a time window, not just eight
+    // fast attempts: a desktop that appears at 5–15 seconds must not wait 4s.
+    td::RetryBudget login;
+    login.streamDisplayed(); login.sessionTransition(start);
+    for(unsigned i=0;i<60;++i) {
+        assert(login.startAttempt(start+i*td::RetryBudget::HandoverInterval));
+        assert(login.fastHandover(start+i*td::RetryBudget::HandoverInterval));
+        assert(!login.startAttempt(start+i*td::RetryBudget::HandoverInterval+1));
+        login.sessionTransition(start+i*td::RetryBudget::HandoverInterval+1);
+        assert(login.handoverUntil==start+td::RetryBudget::HandoverDuration);
+        assert(login.deadline==start+td::RetryBudget::Duration);
+    }
+    const auto end=start+td::RetryBudget::HandoverDuration;
+    assert(!login.fastHandover(end)); assert(login.startAttempt(end));
+    assert(!login.startAttempt(end+td::RetryBudget::Interval-1));
+    assert(login.startAttempt(end+td::RetryBudget::Interval));
+    while(login.attempts<td::RetryBudget::Total) assert(login.startAttempt(login.next));
+    login.sessionTransition(login.next);
+    assert(!login.startAttempt(login.next)); // Transition never resets total.
+    login.succeeded(); assert(!login.fastHandover(end));
+    assert(login.startAttempt(end)); assert(login.attempts==1);
+    td::RetryBudget delayed;
+    assert(delayed.startAttempt(start));
+    delayed.sessionTransition(start+1000000);
+    assert(delayed.startAttempt(start+1000000)); // Skip an already pending wait.
+    assert(delayed.attempts==2 && delayed.deadline==start+td::RetryBudget::Duration);
+    assert(delayed.expired(start+td::RetryBudget::Duration));
     assert(!td::VideoHealth::fresh(start,0));
     assert(!td::VideoHealth::fresh(start,start+1));
     assert(td::VideoHealth::fresh(start+td::VideoHealth::StaleAfter-1,start));

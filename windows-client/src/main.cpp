@@ -474,7 +474,7 @@ struct App {
         case WM_PAINT: {
             PAINTSTRUCT ps{}; auto dc=BeginPaint(window,&ps);
             bool frozen=false;
-            if(renderer && session && session->handingOver()) {
+            if(renderer && renderer->hasFrozenFrame()) {
                 try { frozen=renderer->repaintFrozen(); } catch(const std::exception& e) { std::cerr<<e.what()<<std::endl; }
             }
             // A newly presented desktop frame may precede the worker's input
