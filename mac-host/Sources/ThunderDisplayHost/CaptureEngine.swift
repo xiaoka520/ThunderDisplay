@@ -148,6 +148,9 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         guard let display = displayID.flatMap({ id in content.displays.first { $0.displayID == id } }) ??
                 (displayID == nil ? content.displays.first { $0.displayID == CGMainDisplayID() } ?? content.displays.first : nil)
         else { throw HostError("Selected display is unavailable") }
+        // Stream output size is independent of the user's desktop scale. This
+        // path reads the existing mode and never selects a different one.
+        let desktopBefore = CGDisplayBounds(display.displayID).size
         let config = SCStreamConfiguration()
         config.width = Int(hello.width); config.height = Int(hello.height)
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(hello.fps))
@@ -171,6 +174,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             self.stream = stream
         }
         try await stream.startCapture()
+        let desktopAfter = CGDisplayBounds(display.displayID).size
+        log("Capture display \(display.displayID): desktop before \(Int(desktopBefore.width))×\(Int(desktopBefore.height)), after \(Int(desktopAfter.width))×\(Int(desktopAfter.height)); stream \(hello.width)×\(hello.height); no display-mode request")
         let cancelled = queue.sync { stopped }
         if cancelled { try? await stream.stopCapture(); throw HostError("Capture cancelled") }
         return display.displayID

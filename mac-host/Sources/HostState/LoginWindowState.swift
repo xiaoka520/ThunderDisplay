@@ -148,11 +148,13 @@ public struct LoginWindowConfiguration: Codable, Equatable {
     public let port: UInt16
     public let requirePairing: Bool
     public let token: String?
-    public init(port: UInt16, requirePairing: Bool, token: String?) {
+    public let desktopUID: UInt32?
+    public init(port: UInt16, requirePairing: Bool, token: String?, desktopUID: UInt32? = nil) {
         self.port = port; self.requirePairing = requirePairing; self.token = requirePairing ? token : nil
+        self.desktopUID = desktopUID
     }
     public var valid: Bool {
-        port > 0 && (!requirePairing || (token?.utf8.count == 32 && token!.allSatisfy { $0.isASCII && $0.isHexDigit }))
+        port > 0 && (desktopUID == nil || desktopUID! >= 500) && (!requirePairing || (token?.utf8.count == 32 && token!.allSatisfy { $0.isASCII && $0.isHexDigit }))
     }
     public static func read() throws -> Self {
         let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)

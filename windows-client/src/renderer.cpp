@@ -113,13 +113,14 @@ void Renderer::configureBitDepth(uint8_t depth) {
     bitDepth=depth; outputFormat=format; enumerator.Reset(); processor.Reset(); explicitVideoColor=false;
     convertedRGB.Reset(); horizontalRGB.Reset(); scalingFailure.clear();
     colorRGB.Reset(); colorTarget.Reset(); colorRGBView.Reset();
+    if(frozen) repaintFrozenLocked();
 }
 bool Renderer::pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y) {
     std::lock_guard<std::mutex> lock(mutex);
     if(!sourceWidth || !sourceHeight) return false;
     return td::PresentationGeometry(sourceWidth,sourceHeight,width,height,pixelExact).pointer(px,py,dragging,sourceWidth,sourceHeight,x,y);
 }
-void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); resizeLocked(); }
+void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); resizeLocked(); if(frozen) repaintFrozenLocked(); }
 RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(mutex); return destination; }
 std::string Renderer::colorDescription() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -203,16 +204,66 @@ void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UIN
     presentBackBuffer();
 }
 void Renderer::presentBackBuffer() {
+    if(rememberFrames) {
+        ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Handover frame buffer");
+        D3D11_TEXTURE2D_DESC d{},old{}; back->GetDesc(&d); if(retainedRGB) retainedRGB->GetDesc(&old);
+        if(!retainedRGB || d.Width!=old.Width || d.Height!=old.Height || d.Format!=old.Format) {
+            retainedView.Reset(); retainedRGB.Reset();
+            d.BindFlags=D3D11_BIND_SHADER_RESOURCE; d.Usage=D3D11_USAGE_DEFAULT; d.CPUAccessFlags=0; d.MiscFlags=0;
+            check(device_->CreateTexture2D(&d,nullptr,&retainedRGB),"Retain handover frame");
+            check(device_->CreateShaderResourceView(retainedRGB.Get(),nullptr,&retainedView),"Handover frame view");
+        }
+        context->ClearState(); context->CopyResource(retainedRGB.Get(),back.Get());
+    }
     auto result=swap->Present(vsync?1:0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
     if(result!=DXGI_STATUS_OCCLUDED) {
         check(result,"Present");
+        frozen=false;
         presentationTime=micros();
         if(!presented.exchange(true)) PostMessageW(window,FramePresentedMessage,0,0);
     }
 }
-void Renderer::resetFrame() {
+bool Renderer::repaintFrozenLocked() {
+    if(!frozen || !retainedRGB || IsIconic(window)) return false;
+    resizeLocked();
+    if(!frozenVertex) {
+        const char* shader=R"(
+Texture2D<float4> image : register(t0); SamplerState sampleImage : register(s0);
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint id : SV_VertexID) { V v; v.uv=float2((id<<1)&2,id&2); v.p=float4(v.uv*float2(2,-2)+float2(-1,1),0,1); return v; }
+float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
+)";
+        ComPtr<ID3DBlob> vs,ps,error;
+        check(D3DCompile(shader,std::strlen(shader),"ThunderDisplay handover",nullptr,nullptr,"vs","vs_5_0",0,0,&vs,&error),"Handover vertex shader");
+        check(D3DCompile(shader,std::strlen(shader),"ThunderDisplay handover",nullptr,nullptr,"ps","ps_5_0",0,0,&ps,&error),"Handover pixel shader");
+        check(device_->CreateVertexShader(vs->GetBufferPointer(),vs->GetBufferSize(),nullptr,&frozenVertex),"Handover vertex shader");
+        check(device_->CreatePixelShader(ps->GetBufferPointer(),ps->GetBufferSize(),nullptr,&frozenPixel),"Handover pixel shader");
+        D3D11_SAMPLER_DESC s{}; s.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        s.AddressU=s.AddressV=s.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP; s.MaxLOD=D3D11_FLOAT32_MAX;
+        check(device_->CreateSamplerState(&s,&frozenSampler),"Handover sampler");
+    }
+    ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Handover output");
+    ComPtr<ID3D11RenderTargetView> target; check(device_->CreateRenderTargetView(back.Get(),nullptr,&target),"Handover output view");
+    D3D11_TEXTURE2D_DESC d{}; retainedRGB->GetDesc(&d);
+    td::PresentationGeometry geometry(d.Width,d.Height,width,height,false); auto& r=geometry.destination;
+    context->ClearState(); const float black[4]={0,0,0,1}; context->ClearRenderTargetView(target.Get(),black);
+    auto render=target.Get(); auto view=retainedView.Get(); auto sampler=frozenSampler.Get();
+    context->OMSetRenderTargets(1,&render,nullptr); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(frozenVertex.Get(),nullptr,0); context->PSSetShader(frozenPixel.Get(),nullptr,0);
+    context->PSSetShaderResources(0,1,&view); context->PSSetSamplers(0,1,&sampler);
+    D3D11_VIEWPORT viewport{float(r.left),float(r.top),float(r.right-r.left),float(r.bottom-r.top),0,1};
+    context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
+    // A repaint of the saved pixels never advances live-frame freshness.
+    auto result=swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+    if(result!=DXGI_STATUS_OCCLUDED) check(result,"Present handover frame");
+    return true;
+}
+void Renderer::resetFrame(bool preserve) {
     std::lock_guard<std::mutex> lock(mutex);
     presented=false; presentationTime=0;
+    frozen=preserve && retainedRGB;
+    if(frozen) { InvalidateRect(window,nullptr,FALSE); return; }
+    retainedView.Reset(); retainedRGB.Reset();
     // The swap chain owns the visible pixels. A GDI repaint does not retire them.
     if(swap) {
         ComPtr<ID3D11Texture2D> back;

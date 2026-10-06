@@ -83,6 +83,7 @@ struct App {
     unsigned buttons=0;
     WINDOWPLACEMENT placement{};
     HHOOK hook=nullptr;
+    bool renewKeyboardHook=true, keyboardHookFailed=false;
     HCURSOR localCursor=nullptr; UINT cursorDPI=0;
     struct NativeCursor { std::vector<td::PNGImage> images; double width,height,hotX,hotY; };
     std::optional<NativeCursor> nativeCursor;
@@ -135,7 +136,18 @@ struct App {
     void release() {
         if(session) session->send(td::input(5,0,0)); pressed.clear(); buttons=0; ReleaseCapture();
     }
-    bool ready() const { return session && session->connected() && renderer && renderer->hasFrame(); }
+    bool ready() const { return session && !session->handingOver() && session->connected() && renderer && renderer->hasFrame(); }
+    void refreshKeyboardHook() {
+        // Windows can silently remove a low-level hook when its owner stalls
+        // during device initialization. Renew once per stream and on focus.
+        renewKeyboardHook=false;
+        auto replacement=SetWindowsHookExW(WH_KEYBOARD_LL,App::keyboard,GetModuleHandleW(nullptr),0);
+        keyboardHookFailed=!replacement;
+        if(!replacement) return;
+        auto previous=hook; hook=replacement;
+        if(previous) UnhookWindowsHookEx(previous);
+        // Preserve held/suppressed keys so their ups cannot leak to the shell.
+    }
     void clipboardChanged() {
         if(!session || !session->clipboardEnabled()) return;
         auto sequence=GetClipboardSequenceNumber(); if(sequence==clipboardSequence) return;
@@ -205,6 +217,7 @@ struct App {
             else if(session->retryStopped()) state=tr(L"重连已停止，请手动重新连接。",L"Reconnection stopped. Connect again manually.");
             else if(session->interrupted()) state=tr(L"画面已中断，正在恢复…",L"Video interrupted. Recovering…");
             else if(session->connected()) state=tr(L"控制通道已建立，等待首帧…",L"Control channel established. Waiting for the first frame…");
+            else if(detail.find("InputUnavailable:")==0) state=tr(L"Mac 键盘或鼠标发送失败",L"Mac keyboard or mouse input failed");
             else if(detail.find("PreLoginCaptureUnavailable:")==0) state=tr(L"Mac 登录界面捕获或控制未获授权",L"Mac login-screen capture or control is unavailable");
             else if(detail.find("PreLoginStarting:")==0) state=tr(L"正在检查 Mac 登录界面权限…",L"Checking Mac login-screen access…");
             else if(detail.find("HostWaitingForLogin:")==0) state=tr(L"Mac 登录界面组件未就绪…",L"Mac LoginWindow component is not ready…");
@@ -216,7 +229,8 @@ struct App {
         if(setup && session && session->retryStopped()) setup->setActive(false);
         std::wstring description=wide(detail);
         if(session && session->retryStopped()) description=tr(L"已达到 10 分钟或 150 次尝试上限，自动重连已停止。点击“连接 Mac”可重新开始。",L"The 10-minute or 150-attempt limit was reached. Automatic recovery stopped. Click Connect to Mac to try again.");
-        else if(detail.find("PreLoginCaptureUnavailable:")==0) description=tr(L"Mac 登录界面组件已报告捕获或输入失败；系统发现服务仍在运行。可登录 Mac 后查看权限，诊断区保留系统错误。",L"The Mac LoginWindow component reported capture or input failure. Discovery remains active. Log in to check permissions; diagnostics retain the system error.");
+        else if(detail.find("InputUnavailable:")==0) description=tr(L"Mac 系统拒绝了键鼠事件，已断开并释放输入；诊断区显示具体错误。请更新 Mac 的开机组件并检查控制权限。",L"macOS rejected keyboard or mouse input. The session was closed and held input released. Diagnostics retain the exact error. Update Mac startup components and check control access.");
+        else if(detail.find("PreLoginCaptureUnavailable:")==0) description=tr(L"Mac 登录界面组件已报告捕获或输入失败；系统发现服务仍在运行。诊断区保留系统错误。",L"The Mac LoginWindow component reported capture or input failure. Discovery remains active; diagnostics retain the system error.");
         else if(detail.find("PreLoginStarting:")==0) description=tr(L"正在验证登录界面的有效画面与输入授权，成功后自动重连。",L"Verifying a valid login-screen frame and input authorization. Reconnection is automatic.");
         else if(detail.find("HostWaitingForLogin:")==0) description=tr(L"系统发现服务正在运行，但登录界面组件尚未就绪。请检查 Mac 的开机组件安装状态。",L"System discovery is active but the LoginWindow component is not ready. Check startup component installation on the Mac.");
         else if(detail.find("Video stalled:")==0) description=tr(L"视频持续中断，正在重新建立串流；旧画面已清除。",L"Video stalled. Re-establishing the stream; the old image has been cleared.");
@@ -235,6 +249,10 @@ struct App {
             auto pos=description.find(L"target ");
             if(pos!=std::wstring::npos) description.replace(pos,7,tr(L"目标 ",L"target "));
         }
+        if(keyboardHookFailed && ready() && capture) {
+            state=tr(L"键盘捕获失败，请切回此窗口重试",L"Keyboard capture failed. Refocus this window to retry");
+            description+=std::wstring(L"\n")+tr(L"Windows 无法重新安装键盘捕获，鼠标连接仍在运行。",L"Windows could not reinstall keyboard capture. The mouse connection is still active.");
+        }
         const std::pair<const wchar_t*,const wchar_t*> diagnostics[]={
             {L"Video interrupted; requesting a fresh keyframe",L"画面中断，正在请求新的关键帧"},
             {L"Hardware encoder bitrate limit: requested ",L"硬件编码器码率限制：请求 "}, {L" Mbps, accepted ",L" Mbps，实际接受 "},
@@ -246,6 +264,7 @@ struct App {
             {L"Cursor: video (update Mac to 0.7.0 for live system cursors)",L"指针：串流指针（动态系统指针需更新 Mac 至 0.7.0）"},
             {L"HostWaitingForLogin: Mac boot service is running. Log in on the Mac to start desktop capture.",L"Mac 开机服务已运行，正在等待用户登录；登录后将自动重连桌面主机。"},
             {L"PreLoginCaptureUnavailable: ",L"登录界面捕获或输入不可用："},
+            {L"InputUnavailable: ",L"键鼠输入不可用："},
             {L"PreLoginStarting: Checking LoginWindow screen capture and input access.",L"正在检查登录界面的屏幕捕获与输入权限。"},
             {L"HostWaitingForLogin: LoginWindow agent unavailable. Log in or check pre-login component installation.",L"登录界面组件未就绪；请检查开机组件安装。"},
             {L"Cursor: video",L"指针：串流指针"},
@@ -304,6 +323,7 @@ struct App {
         }
     }
     void disconnect(bool showSetup=true) {
+        renewKeyboardHook=true;
         release(); pendingClipboard.reset();pendingImage.reset();pendingImagePixels.reset();nativeCursor.reset();cursorDPI=0; KillTimer(window,7); KillTimer(window,8);
         if(session) session->stop();
         session.reset(); renderer.reset();
@@ -430,7 +450,10 @@ struct App {
             }
             return 0;
         case WM_DESTROY: return 0;
-        case WM_SETFOCUS: remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0; return 0;
+        case WM_SETFOCUS:
+            remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0;
+            if(ready()) refreshKeyboardHook(); else renewKeyboardHook=true;
+            return 0;
         case WM_KILLFOCUS: release(); return 0;
         case WM_CLIPBOARDUPDATE: clipboardChanged(); return 0;
         case WM_TIMER:
@@ -441,15 +464,22 @@ struct App {
             else receiveClipboard(); return 0;
         case WM_CAPTURECHANGED: if(buttons) release(); return 0;
         case StatusMessage: title(); return 0;
-        case DisconnectedMessage: nativeCursor.reset();cursorDPI=0;release(); title(); if(setup && GetForegroundWindow()==window) setup->present(); return 0;
+        case DisconnectedMessage: renewKeyboardHook=true;nativeCursor.reset();cursorDPI=0;release(); title(); if(setup && GetForegroundWindow()==window && !ready() && !(session && session->handingOver())) setup->present(); return 0;
         case FramePresentedMessage:
+            if(ready() && renewKeyboardHook) refreshKeyboardHook();
             if(ready() && openOnFirstFrame) {
                 openOnFirstFrame=false; showDisplay(); if(fullscreenRequested && !fullscreen) toggleFullscreen();
             }
             title(); return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps{}; auto dc=BeginPaint(window,&ps);
-            if(!ready()) {
+            bool frozen=false;
+            if(renderer && session && session->handingOver()) {
+                try { frozen=renderer->repaintFrozen(); } catch(const std::exception& e) { std::cerr<<e.what()<<std::endl; }
+            }
+            // A newly presented desktop frame may precede the worker's input
+            // handover flag update. Do not paint black over those valid pixels.
+            if(!(renderer && renderer->hasFrame()) && !frozen) {
                 RECT r{}; GetClientRect(window,&r); FillRect(dc,&r,reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
                 SetBkMode(dc,TRANSPARENT); SetTextColor(dc,RGB(220,220,220));
                 auto text=std::wstring(tr(L"等待远程画面…\n连接状态与详细信息见设置窗口。",L"Waiting for remote display…\nSee the setup window for connection status and details."));

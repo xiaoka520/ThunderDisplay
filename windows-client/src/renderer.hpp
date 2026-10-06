@@ -46,6 +46,14 @@ class Renderer {
     void scaleToBackBuffer(ID3D11Texture2D* back,const td::PresentationGeometry& geometry,ID3D11ShaderResourceView* nativeRGB=nullptr);
     std::atomic<bool> presented{false};
     std::atomic<uint64_t> presentationTime{0};
+    bool rememberFrames=false;
+    std::atomic<bool> frozen{false};
+    ComPtr<ID3D11Texture2D> retainedRGB;
+    ComPtr<ID3D11ShaderResourceView> retainedView;
+    ComPtr<ID3D11VertexShader> frozenVertex;
+    ComPtr<ID3D11PixelShader> frozenPixel;
+    ComPtr<ID3D11SamplerState> frozenSampler;
+    bool repaintFrozenLocked();
     void resizeLocked();
 public:
     Renderer(HWND hwnd, bool vsync);
@@ -60,5 +68,8 @@ public:
     void setScalingQuality(uint8_t value) { std::lock_guard<std::mutex> lock(mutex); scalingQuality=std::min<uint8_t>(value,1); }
     bool hasFrame() const { return presented && td::VideoHealth::fresh(micros(),presentationTime); }
     std::string colorDescription();
-    void resetFrame();
+    void retainForHandover(bool value) { std::lock_guard<std::mutex> lock(mutex); rememberFrames=value; }
+    bool hasFrozenFrame() const { return frozen; }
+    bool repaintFrozen() { std::lock_guard<std::mutex> lock(mutex); return repaintFrozenLocked(); }
+    void resetFrame(bool preserve=false);
 };

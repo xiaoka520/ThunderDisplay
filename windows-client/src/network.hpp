@@ -25,6 +25,9 @@ class ClientSession {
     td::RetryBudget retryBudget;
     std::atomic<unsigned> attemptNumber{0};
     std::atomic<bool> recoveryStopped{false}, videoInterrupted{false};
+    td::HandoverHold handoverHold;
+    std::atomic<bool> holdingFrame{false};
+    void expireHandover();
     void checkRecoveryDeadline();
     void run();
     void connectAndStream(const std::string& host);
@@ -38,6 +41,7 @@ public:
     bool connected() const { return online; }
     bool retryStopped() const { return recoveryStopped; }
     bool interrupted() const { return videoInterrupted; }
+    bool handingOver() const { return holdingFrame; }
     unsigned attempts() const { return attemptNumber; }
     static constexpr unsigned totalAttempts() { return td::RetryBudget::Total; }
     void send(td::Bytes data);

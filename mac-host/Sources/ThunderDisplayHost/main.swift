@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var code = "", status = "", boundIP: String?, boundPort: UInt16?
     private var statusIsError = false
     private var signals: [DispatchSourceSignal] = []
+    private var handoverRetry: Timer?
     private var recovery = HostRecoveryState()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var lastDisplayRefresh: TimeInterval = 0
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     init(options: Options) { self.options = options }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        log("Desktop app started: uid=\(geteuid()); startup=\(options.background ? "background" : "interactive")")
         let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
         let appMenu = NSMenu(title: "ThunderDisplay"), editMenu = NSMenu(title: ui("编辑", "Edit"))
         appMenu.addItem(withTitle: ui("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: ",").target = self
@@ -116,7 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.stopServer(); self.power.update(enabled: false); self.refresh()
         })
-        workspaceObservers.append(center.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.refresh() })
+        workspaceObservers.append(center.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.recovery.sessionBecameActive(at: ProcessInfo.processInfo.systemUptime)
+            self.permissions.resetCaptureHealth(); self.setup?.refreshDisplays(); self.refresh()
+        })
     }
     private func runRecoveryCheck() {
         Task { @MainActor in
@@ -216,7 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStartup() {
         guard let setup else { return }
         setup.launchAtLogin.state = startup.loginEnabled ? .on : startup.login.status == .requiresApproval ? .mixed : .off
-        setup.launchAtBoot.state = startup.bootState == .running && startup.loginWindowInstalled ? .on : startup.bootConfigured ? .mixed : .off
+        setup.launchAtBoot.state = startup.bootState == .running && startup.loginWindowInstalled && startup.desktopStartupInstalled ? .on : startup.bootConfigured ? .mixed : .off
         if !startupError.isEmpty { setup.startupState.stringValue = startupError; return }
         setup.startupState.stringValue = ui("登录启动：", "Login startup: ") + startup.status(startup.login) + " · " + ui("开机服务：", "Boot service: ") + startup.bootStatus + "\n" + startup.loginWindowStatus + "\n" + ui("当前桌面主机：", "Current desktop host: ") + (server != nil ? ui("运行中", "Running") : ui("未运行（检查权限与网桥）", "Not running (check permissions and bridge)"))
     }
@@ -302,6 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selected.display = display.id
             selected.requirePairing = setup.usePairing.state == .on
             let host = HostServer(ip: ip, options: selected, token: code)
+            host.inputAllowed = { ConsoleSession.ownsDesktop(geteuid()) }
             host.displayCapabilities = display.payload
             host.localCursorAvailable = cursor.available
             host.allowClipboard = setup.allowClipboard.state == .on
@@ -339,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.refresh()
             } }
             try host.start(); server = host; boundIP = ip; boundPort = port; statusIsError = false
+            handoverRetry?.invalidate(); handoverRetry = nil
             recovery.started()
             if !options.recoveryCheck {
                 UserDefaults.standard.set(entered, forKey: "hostIPv4")
@@ -348,14 +356,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setup.update(screen: permissions.screen, access: permissions.access, checking: false, running: true, detectedIP: bridgeAddress(), status: status, detail: permissions.detail)
             updateMenu()
         } catch {
-            recovery.failed(at: ProcessInfo.processInfo.systemUptime)
+            let handingOver = (error as? HostBindError)?.addressInUse == true
+            recovery.failed(at: ProcessInfo.processInfo.systemUptime, handover: handingOver)
             statusIsError = true
-            status = ui("启动失败：", "Unable to start: ") + String(describing: error)
+            status = handingOver ? ui("正在接管监听端口，稍后自动重试…", "Taking over the listening port; retrying shortly…") : ui("启动失败：", "Unable to start: ") + String(describing: error)
+            if handingOver {
+                handoverRetry?.invalidate()
+                handoverRetry = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in self?.refresh() }
+            }
             log(status)
             setup.update(screen: permissions.screen, access: permissions.access, checking: false, running: false, detectedIP: bridgeAddress(), status: status, detail: permissions.detail)
         }
     }
     private func stopServer() {
+        handoverRetry?.invalidate(); handoverRetry = nil
         clipboard.stop(); cursor.stop()
         setup?.clipboardState.stringValue = ui("尚未同步 · 需要两端均开启并建立连接", "Inactive · both platforms must enable sync and connect")
         server?.stop(); server = nil; boundIP = nil; boundPort = nil
@@ -417,7 +431,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 do {
     let options = try Options()
-    if options.loginWindowFrameCheck {
+    // A system-installed Aqua agent starts only for the user who enabled it.
+    // Other login sessions exit before any permissions, capture or UI are used.
+    if let uid = options.startupUser, uid != geteuid() { exit(0) }
+    if options.inputCheck {
+        try checkNativeInput(useQuartz: options.inputCheckQuartz, keyboardOnly: options.inputCheckKeyboardOnly)
+    } else if options.loginWindowFrameCheck {
         try loginWindowFrameCheck()
     } else if options.loginWindowCheck {
         print("LoginWindow diagnostic: uid=\(geteuid()), manager=\(ConsoleSession.managerName), securityGraphics=\(ConsoleSession.graphicsAvailable), consoleLoggedIn=\(ConsoleSession.loggedIn), preLogin=\(ConsoleSession.preLogin), ordinaryScreen=\(CGPreflightScreenCaptureAccess()), eventPost=\(CGPreflightPostEventAccess())")
@@ -452,6 +471,7 @@ do {
         print("Login startup: \(startup.status(startup.login))")
         print("Boot service: \(startup.bootStatus)")
         print("LoginWindow: \(startup.loginWindowStatus)")
+        print("Desktop startup component: \(startup.desktopStartupInstalled ? "installed" : "missing")")
     } else if options.permissionProbe {
         let result = FreshPermissions(screen: CGPreflightScreenCaptureAccess(), access: CGPreflightPostEventAccess(), axTrusted: AXIsProcessTrusted())
         let data = try JSONEncoder().encode(result)

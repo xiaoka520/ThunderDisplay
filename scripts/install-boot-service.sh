@@ -7,6 +7,8 @@ task_plist="/Library/LaunchDaemons/$task_label.plist"
 task_binary="/Library/PrivilegedHelperTools/$task_label"
 task_agent_label=dev.thunderdisplay.loginwindow
 task_agent_plist="/Library/LaunchAgents/$task_agent_label.plist"
+task_desktop_label=dev.thunderdisplay.desktop
+task_desktop_plist="/Library/LaunchAgents/$task_desktop_label.plist"
 task_service_dir="/Library/Application Support/ThunderDisplay"
 task_system_app="$task_service_dir/ThunderDisplayHost.app"
 if [ "$(id -u)" != 0 ]; then
@@ -14,6 +16,11 @@ if [ "$(id -u)" != 0 ]; then
     exit 1
 fi
 if [ "${1:-}" = --uninstall ]; then
+    task_desktop_uid="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$task_desktop_plist" 2>/dev/null || true)"
+    if [[ "$task_desktop_uid" =~ ^[0-9]{3,10}$ ]]; then
+        launchctl bootout "gui/$task_desktop_uid/$task_desktop_label" 2>/dev/null || true
+    fi
+    rm -f "$task_desktop_plist"
     launchctl disable "system/$task_label"
     launchctl bootout "system/$task_label" 2>/dev/null || true
     launchctl disable "system/$task_legacy_label"
@@ -36,6 +43,7 @@ codesign --verify --deep --strict "$task_app"
 codesign --verify --strict "$task_app/Contents/MacOS/ThunderDisplayBoot"
 plutil -lint "$task_app/Contents/Resources/$task_label.plist"
 plutil -lint "$task_app/Contents/Resources/$task_agent_label.plist"
+plutil -lint "$task_app/Contents/Resources/$task_desktop_label.plist"
 task_config_source="${2:-}"
 task_config_temporary=""
 if [ -z "$task_config_source" ]; then
@@ -53,6 +61,10 @@ task_port="$(/usr/libexec/PlistBuddy -c 'Print :port' "$task_config_source")"
 if [[ ! "$task_port" =~ ^[0-9]{1,5}$ ]] || [ "$task_port" -lt 1 ] || [ "$task_port" -gt 65535 ]; then
     printf 'Invalid pre-login port.\n' >&2; exit 1
 fi
+task_desktop_uid="$(/usr/libexec/PlistBuddy -c 'Print :desktopUID' "$task_config_source" 2>/dev/null || /usr/bin/stat -f %u /dev/console)"
+if [[ ! "$task_desktop_uid" =~ ^[0-9]{3,10}$ ]] || [ "$task_desktop_uid" -lt 500 ] || [ "$task_desktop_uid" -ge 4294967295 ]; then
+    printf 'Invalid desktop startup user; install from the intended user desktop.\n' >&2; exit 1
+fi
 task_pairing="$(/usr/libexec/PlistBuddy -c 'Print :requirePairing' "$task_config_source")"
 if [ "$task_pairing" = true ]; then
     task_token="$(/usr/libexec/PlistBuddy -c 'Print :token' "$task_config_source")"
@@ -67,16 +79,25 @@ if [ -L "$task_service_dir" ] || [ -L "$task_system_app" ]; then
     printf 'Refusing a symlink in the system application destination.\n' >&2; exit 1
 fi
 launchctl unload -S LoginWindow "$task_agent_plist" 2>/dev/null || true
+task_old_desktop_uid="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$task_desktop_plist" 2>/dev/null || true)"
+if [[ "$task_old_desktop_uid" =~ ^[0-9]{3,10}$ ]]; then
+    launchctl bootout "gui/$task_old_desktop_uid/$task_desktop_label" 2>/dev/null || true
+fi
 install -d -o root -g wheel -m 755 "$task_service_dir" /Library/LaunchAgents
 rm -rf "$task_system_app.new"
 ditto "$task_app" "$task_system_app.new"
 chown -R root:wheel "$task_system_app.new"
 chmod -R go-w "$task_system_app.new"
+# Older local signing scripts created the public resource seal with mode 0600.
+# Keep the root-owned bundle immutable while allowing normal signature checks.
+chmod 644 "$task_system_app.new/Contents/_CodeSignature/CodeResources"
 codesign --verify --deep --strict "$task_system_app.new"
 rm -rf "$task_system_app"
 mv "$task_system_app.new" "$task_system_app"
 install -o root -g wheel -m 600 "$task_config_source" "$task_service_dir/loginwindow-config.plist"
 install -o root -g wheel -m 644 "$task_app/Contents/Resources/$task_agent_label.plist" "$task_agent_plist"
+install -o root -g wheel -m 644 "$task_app/Contents/Resources/$task_desktop_label.plist" "$task_desktop_plist"
+/usr/libexec/PlistBuddy -c 'Add :ProgramArguments:2 string --startup-user' -c "Add :ProgramArguments:3 string $task_desktop_uid" "$task_desktop_plist"
 rm -f "$task_service_dir/loginwindow-state.json"
 # disable is persisted across boots. bootout alone only fixes the current boot;
 # the retired SM registration previously displaced the absolute-path daemon.
@@ -106,6 +127,10 @@ fi
 # LoginWindow domain is absent while logged in, the installed LaunchAgent will
 # be loaded when that graphical session is next created. Never load it into Aqua.
 launchctl load -S LoginWindow "$task_agent_plist" 2>/dev/null || true
-printf 'Installed system discovery daemon and LoginWindow graphical host on port %s.\n' "$task_port"
+launchctl enable "gui/$task_desktop_uid/$task_desktop_label" 2>/dev/null || true
+if launchctl print "gui/$task_desktop_uid" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$task_desktop_uid" "$task_desktop_plist"
+fi
+printf 'Installed system discovery, LoginWindow host and Aqua startup for user %s on port %s.\n' "$task_desktop_uid" "$task_port"
 printf 'Enable login startup in the Mac app so desktop capture starts after login.\n'
 printf 'LoginWindow capture / input still require real pre-login permission and frame verification. FileVault preboot is unsupported.\n'

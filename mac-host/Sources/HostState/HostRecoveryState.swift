@@ -12,6 +12,7 @@ public struct HostRecoveryState {
     public mutating func willSleep() { sleeping = true }
     public mutating func didWake(at now: TimeInterval) { sleeping = false; retryAt = now + 1 }
     public mutating func displaysChanged(at now: TimeInterval) { retryAt = now + 1 }
-    public mutating func failed(at now: TimeInterval) { retryAt = now + 3 }
+    public mutating func failed(at now: TimeInterval, handover: Bool = false) { retryAt = now + (handover ? 0.2 : 3) }
+    public mutating func sessionBecameActive(at now: TimeInterval) { if requested { retryAt = now } }
     public mutating func started() { retryAt = 0 }
 }

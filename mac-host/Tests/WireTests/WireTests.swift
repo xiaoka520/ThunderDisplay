@@ -2,6 +2,20 @@ import XCTest
 @testable import Wire
 
 final class WireTests: XCTestCase {
+    func testSessionTransitionIsBoundToTheNegotiatedSession() {
+        let id: UInt64 = 0x0102030405060708
+        let notice = SessionTransitionWire.packet(session: id)
+        XCTAssertEqual(notice, Data([17,1,2,3,4,5,6,7,8,1]))
+        XCTAssertTrue(SessionTransitionWire.matches(notice, session: id))
+        XCTAssertFalse(SessionTransitionWire.matches(notice, session: id + 1))
+        XCTAssertFalse(SessionTransitionWire.matches(notice, session: 0))
+        XCTAssertFalse(SessionTransitionWire.matches(notice, session: id, acknowledgment: true))
+        XCTAssertTrue(SessionTransitionWire.matches(SessionTransitionWire.packet(session: id, acknowledgment: true), session: id, acknowledgment: true))
+        XCTAssertFalse(SessionTransitionWire.matches(notice + Data([0]), session: id))
+        XCTAssertFalse(SessionTransitionWire.matches(Data(notice.dropLast()), session: id))
+        var invalid = notice; invalid[9] = 2
+        XCTAssertFalse(SessionTransitionWire.matches(invalid, session: id))
+    }
     func hello() -> Data {
         var w = Writer(); w.put(UInt8(1)); w.put(UInt16(1)); w.put(UInt16(50000))
         w.put(UInt16(2560)); w.put(UInt16(1600)); w.put(UInt16(120)); w.put(UInt32(120_000_000)); w.put(UInt8(3))

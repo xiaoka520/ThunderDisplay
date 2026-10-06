@@ -31,7 +31,19 @@ public struct Reader {
     public var atEnd: Bool { offset == data.count }
 }
 
-public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide }
+public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide, sessionTransition, sessionTransitionAck }
+
+/// A session-scoped notice, accepted only after pairing and stream negotiation.
+public enum SessionTransitionWire {
+    public static func packet(session: UInt64, acknowledgment: Bool = false) -> Data {
+        var w = Writer(); w.put((acknowledgment ? Message.sessionTransitionAck : .sessionTransition).rawValue)
+        w.put(session); w.put(UInt8(1)); return w.data // 1 = LoginWindow -> desktop
+    }
+    public static func matches(_ data: Data, session: UInt64, acknowledgment: Bool = false) -> Bool {
+        guard session != 0 else { return false }
+        return data == packet(session: session, acknowledgment: acknowledgment)
+    }
+}
 public enum Codec: UInt8, Sendable { case h264 = 1, hevc = 2, hevc10 = 4 }
 
 public struct Hello: Sendable {

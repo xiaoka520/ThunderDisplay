@@ -38,36 +38,72 @@ final class CaptureEngine: @unchecked Sendable {
         let data = Data([0,0,0,1]) + Data(repeating: 0x65, count: 179996)
         _ = onFrame?(data, pts, true); pts += 10000
     }
-    func stop() { active = false }
+    func stop() {
+        active = false
+        let root = ProcessInfo.processInfo.environment["TD_TEST_HANDOVER"]!
+        if FileManager.default.fileExists(atPath: root + "/block-stop") {
+            FileManager.default.createFile(atPath: root + "/stop-entered", contents: Data())
+            let deadline = Date().addingTimeInterval(6)
+            while !FileManager.default.fileExists(atPath: root + "/release-stop") {
+                precondition(Date() < deadline, "Test teardown was not released")
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+    }
 }
 final class InputInjector {
     init(display: UInt32, captureSize: CGSize, contentRect: CGRect) {}
-    func apply(_ input: Input) { fatalError("Transport check must never inject input") }
+    func apply(_ input: Input) throws {
+        if input.code == 66 { throw HostError("Synthetic system input failure") }
+        fatalError("Session handover must never inject input")
+    }
     func releaseAll() {}
 }
 let options = try Options()
 let server = HostServer(ip: "127.0.0.1", options: options, token: "")
 server.displayCapabilities = ProtocolWire.capabilities(width: 640, height: 360, hz: 144, maximumWidth: 3840, maximumHeight: 2160, maximumHz: 240, flags: 1, name: "Test Mac", codecMask: 7, streamBits: 10)
+server.handoverOnSessionEnd = true
 server.localCursorAvailable = true
 server.allowClipboard = false
-server.inputAllowed = { false }
+server.inputAllowed = { FileManager.default.fileExists(atPath: ProcessInfo.processInfo.environment["TD_TEST_INPUT_ALLOW"]!) }
+server.onKeyboardPacket = {
+    let path = ProcessInfo.processInfo.environment["TD_TEST_HANDOVER"]! + "/keyboard-received"
+    FileManager.default.createFile(atPath: path, contents: Data())
+}
 server.onClipboardState = { session, enabled in if session != 0 && !enabled { server.updateClipboardPermission(true) } }
 server.onCursorState = { session, enabled, _ in if enabled { server.sendCursor(Data(repeating: 0x7f, count: 4100), session: session) } }
 server.onClipboardImage = { session, image in server.sendImage(image, session: session) }
 server.onClipboardText = { session, text in server.sendClipboard(text, session: session) }
 try server.start()
 print("CHECK_READY"); fflush(stdout)
+var handingOver = false
+let checkTimer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { _ in
+    let root = ProcessInfo.processInfo.environment["TD_TEST_HANDOVER"]!
+    if !handingOver && FileManager.default.fileExists(atPath: root + "/handover") {
+        handingOver = true
+        DispatchQueue.global().async {
+            server.stop(handover: true)
+            FileManager.default.createFile(atPath: root + "/stop-finished", contents: Data())
+        }
+    }
+}
 RunLoop.current.run(until: Date().addingTimeInterval(15))
+checkTimer.invalidate()
 server.stop()
 ''')
     sources = ROOT / 'mac-host/Sources/ThunderDisplayHost'
+    # The transport harness deliberately substitutes its non-injecting stub for
+    # InputSupport; the production input module has separate event-level tests.
+    (folder / 'HostServer.swift').write_text((sources / 'HostServer.swift').read_text().replace('import InputSupport\n', ''))
     subprocess.run(compiler + ['-I', directory, '-L', directory, '-lWire', '-Xlinker', '-rpath', '-Xlinker', directory,
-        str(folder / 'main.swift'), str(sources / 'HostServer.swift'), str(sources / 'Support.swift'),
+        str(folder / 'main.swift'), str(folder / 'HostServer.swift'), str(sources / 'Support.swift'),
         '-framework', 'AppKit', '-framework', 'SystemConfiguration', '-o', str(folder / 'host-check')], env=env, check=True)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     env['TD_TEST_CURSOR_STATE'] = str(folder / 'cursor-visible.txt')
+    env['TD_TEST_INPUT_ALLOW'] = str(folder / 'allow-input')
+    env['TD_TEST_HANDOVER'] = str(folder)
     process = subprocess.Popen([str(folder / 'host-check'), '--port', str(port), '--no-pairing'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     try:
@@ -119,7 +155,7 @@ server.stop()
             control(bytes([9, 4, 1]))
             latest = read_exact(struct.unpack('!I', read_exact(4))[0])
             assert latest[25] == 29, 'Legacy client must keep the video cursor'
-            for version in (6, 7):
+            for version in (6, 7, 8):
                 control(bytes([9, version, 1]))
                 modern = read_exact(struct.unpack('!I', read_exact(4))[0])
                 assert modern[25] == 253, f'Query{version} must preserve rich and sRGB flags'
@@ -151,9 +187,6 @@ server.stop()
                 assert typ == 13 and total == 4100 and offset == len(cursor)
                 cursor += packet[13:]
             assert cursor == bytes([0x7f])*4100
-            # A session handover must reject new input even while the old socket
-            # is still Ready. The stub would crash if this reached injection.
-            control(struct.pack('!BBHHii', 3, 3, 65, 1, 0, 0))
             control(bytes([11, 1]))
             ack = read_exact(struct.unpack('!I', read_exact(4))[0])
             assert ack == bytes([11, 0]), 'Mac clipboard-off preference was not respected'
@@ -233,6 +266,70 @@ server.stop()
                     break
             else:
                 raise AssertionError('No complete keyframe after UDP probe')
+            # Even a Ready peer must be disconnected on session handover before
+            # its input reaches the fatal injection stub.
+            control(struct.pack('!BBHHii', 3, 3, 65, 1, 0, 0))
+            assert tcp.recv(1) == b'', 'Old-session input was not rejected'
+            assert process.poll() is None, 'Denied input reached the injection stub'
+            assert not (folder / 'keyboard-received').exists(), 'Denied input was logged as accepted keyboard input'
+        # When the system input backend fails, the real server must report the
+        # failure and close the peer instead of silently ignoring keyboard input.
+        (folder / 'allow-input').touch()
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as tcp:
+            control(bytes([9, 8, 0]))
+            read_exact(struct.unpack('!I', read_exact(4))[0])
+            control(hello)
+            welcome = read_exact(struct.unpack('!I', read_exact(4))[0])
+            assert welcome[0] == 16
+            control(bytes([8]))
+            control(struct.pack('!BBHHii', 3, 3, 66, 1, 0, 0))
+            failure = read_exact(struct.unpack('!I', read_exact(4))[0])
+            assert failure == bytes([7])+b'InputUnavailable: Synthetic system input failure'
+            assert tcp.recv(1) == b''
+            assert process.poll() is None
+            assert (folder / 'keyboard-received').exists(), 'Accepted keyboard packet did not trigger its diagnostic'
+            (folder / 'keyboard-received').unlink()
+            print('Ready-session handover and system input failure feedback checks passed (no OS input injection)')
+        # A slow encoder shutdown must not prevent the desktop host claiming
+        # both the TCP listener and wildcard UDP discovery port immediately.
+        with socket.create_connection(('127.0.0.1', port), timeout=3) as tcp:
+            control(bytes([9, 8, 0]))
+            read_exact(struct.unpack('!I', read_exact(4))[0])
+            control(hello)
+            welcome = read_exact(struct.unpack('!I', read_exact(4))[0])
+            assert welcome[0] == 16
+            transition_session = struct.unpack('!Q', welcome[3:11])[0]
+            control(bytes([8])); control(bytes([5]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([6])
+            (folder / 'block-stop').touch(); (folder / 'handover').touch()
+            notice = read_exact(struct.unpack('!I', read_exact(4))[0])
+            assert notice == bytes([17]) + struct.pack('!Q', transition_session) + bytes([1]), 'Missing session-scoped handover notice'
+            # Even an in-flight input packet before the receipt must not reach
+            # the old LoginWindow injector after the handover notice.
+            control(struct.pack('!BBHHii', 3, 3, 65, 1, 0, 0))
+            control(bytes([18]) + struct.pack('!Q', transition_session) + bytes([1]))
+            deadline = time.monotonic() + 3
+            while not (folder / 'stop-entered').exists():
+                assert time.monotonic() < deadline, 'Shutdown did not reach capture cleanup'
+                time.sleep(.01)
+            assert not (folder / 'stop-finished').exists(), 'Capture cleanup did not block'
+            assert not (folder / 'keyboard-received').exists(), 'Handover input was logged as accepted keyboard input'
+            for _ in range(5):
+                with socket.socket() as replacement, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as discovery:
+                    replacement.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    discovery.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    replacement.bind(('127.0.0.1', port)); replacement.listen(1)
+                    discovery.bind(('0.0.0.0', port))
+            try:
+                assert tcp.recv(1) == b'', 'Old control channel remained open during teardown'
+            except ConnectionResetError:
+                pass  # Handover deliberately avoids a root-owned TIME_WAIT socket.
+            (folder / 'release-stop').touch()
+            deadline = time.monotonic() + 3
+            while not (folder / 'stop-finished').exists():
+                assert time.monotonic() < deadline, 'Shutdown did not finish after release'
+                time.sleep(.01)
+            print('TCP / UDP ports can be claimed during blocked capture teardown; old connection closes and repeated cleanup succeeds')
     finally:
         process.terminate()
         process.communicate(timeout=5)

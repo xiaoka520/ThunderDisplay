@@ -16,6 +16,7 @@ final class StartupServices {
     private var legacyBootInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/dev.thunderdisplay.boot.plist") }
     var bootConfigured: Bool { administratorBootInstalled || legacyBootInstalled }
     var loginWindowInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchAgents/dev.thunderdisplay.loginwindow.plist") }
+    var desktopStartupInstalled: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchAgents/dev.thunderdisplay.desktop.plist") }
     var loginWindowStatus: String {
         guard loginWindowInstalled else { return ui("登录界面组件未安装；请更新开机组件", "LoginWindow component missing; update startup components") }
         if ConsoleSession.loggedIn {
@@ -109,7 +110,7 @@ final class StartupServices {
             if bootConfigured { try administratorInstall(uninstall: true) }
         }
         checkedAt = .distantPast
-        if enabled, bootState != .running || !loginWindowInstalled { throw HostError(ui("系统或登录界面组件安装未完成；请检查系统后台项目权限。", "System / LoginWindow component installation incomplete; check background item permissions.")) }
+        if enabled, bootState != .running || !loginWindowInstalled || !desktopStartupInstalled { throw HostError(ui("系统、登录界面或桌面启动组件安装未完成；请检查系统后台项目权限。", "System / LoginWindow / desktop component installation incomplete; check background item permissions.")) }
     }
     private func administratorInstall(uninstall: Bool) throws {
         guard let script = Bundle.main.url(forResource: "install-boot-service", withExtension: "sh") else { throw HostError(ui("开机服务安装组件缺失", "Boot installer is missing")) }
@@ -122,7 +123,7 @@ final class StartupServices {
             let port = UserDefaults.standard.object(forKey: "hostPort") as? Int ?? 47990
             guard let selectedPort = UInt16(exactly: port), selectedPort > 0 else { throw HostError("Invalid startup port") }
             let pairing = UserDefaults.standard.bool(forKey: "requirePairing")
-            let config = LoginWindowConfiguration(port: selectedPort, requirePairing: pairing, token: pairing ? try pairingCode(nil) : nil)
+            let config = LoginWindowConfiguration(port: selectedPort, requirePairing: pairing, token: pairing ? try pairingCode(nil) : nil, desktopUID: geteuid())
             try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let file = temporary.appendingPathComponent("config.plist")
             let encoder = PropertyListEncoder(); encoder.outputFormat = .xml

@@ -2,6 +2,7 @@ import AppKit
 import ScreenCaptureKit
 import HostState
 import OSLog
+import InputSupport
 
 /// Runs only in launchd's pre-login graphical session. It never presents settings,
 /// uses a user's pasteboard, or exposes filesystem / process-control commands.
@@ -13,7 +14,8 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
     private var nextCheck: TimeInterval = 0
     private var selectedIP = ""
     private var attemptedWithoutScreenAccess = false
-    private var checkStarted: TimeInterval = 0
+    private var watchdog: PreparationWatchdog?
+    private var input: LoginWindowInput?
     private var captureChecked = false, inputChecked = false
     private var lastFailure: String?
     /// Snapshot taken the first time this agent publishes `stopped`, so the reason
@@ -21,16 +23,6 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
     /// instead of being replaced by a fixed "agent stopped" message.
     private var stoppingPhase: LoginWindowState.Phase?
     private var stoppingDetail: String?
-    /// Apple reports a pre-login denial as a user declining, but there is no user
-    /// session at the login window: the request can never be presented and the
-    /// operator cannot approve it in System Settings either. Record what actually
-    /// has to change rather than a message implying somebody clicked No.
-    static let consentRefusalReason = ui(
-        "登录界面没有屏幕录制授权；第三方进程无法在登录前请求或弹窗授权。请用 PPPC/MDM 描述文件为 dev.thunderdisplay.host 预授权屏幕录制，或改用自动登录。",
-        "Screen Recording is not authorized for the login window, and a third-party process cannot request it before login. Pre-authorize it for dev.thunderdisplay.host with a PPPC/MDM profile, or enable automatic login.")
-    static let inputRefusalReason = ui(
-        "登录界面没有辅助功能（事件注入）授权；需要同一份 PPPC/MDM 描述文件，或改用自动登录。",
-        "Accessibility (event post) is not authorized for the login window; it needs the same PPPC/MDM profile, or automatic login.")
     private var options: Options
     init(options: Options) { self.options = options }
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -47,6 +39,18 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil); return
         }
         logger.notice("LoginWindow graphics agent started; checking real capture and event-post access")
+        let logger = self.logger, port = options.port
+        watchdog = PreparationWatchdog { stage in
+            let reason = "LoginWindow preparation timed out: " + stage + "; restarting agent"
+            logger.error("\(reason, privacy: .public)")
+            let last = LoginWindowState.readLastRecorded()
+            try? LoginWindowState(pid: getpid(), uptime: ProcessInfo.processInfo.systemUptime, phase: .blocked,
+                detail: reason, port: port, captureChecked: last?.captureChecked ?? false,
+                inputChecked: false, lastFailure: reason).write()
+            // This watchdog is armed only before any client input is accepted.
+            // A blocked system call cannot be cancelled on the AppKit run loop.
+            _exit(1)
+        }
         for signalNumber in [SIGINT, SIGTERM] {
             signal(signalNumber, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
@@ -73,29 +77,11 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil); return
         }
         publish(phase, detail)
-        // `isPreLogin` is the exact complement of `isLoggedIn`, so the guard above
-        // already establishes it. Re-deriving it here masked the real blocker: the
-        // old predicate also demanded a positive "loginwindow" console user, so a
-        // host that reports no console user waited forever in this branch and never
-        // probed capture. What still needs confirming is that a graphical login
-        // session exists at all, because capture cannot start before the window
-        // server does.
-        guard CGSessionCopyCurrentDictionary() != nil else {
-            if server != nil { stop() }
-            publish(.blocked, "Waiting for the LoginWindow graphics session")
-            nextCheck = ProcessInfo.processInfo.systemUptime + 3
-            return
-        }
-        if busy && ProcessInfo.processInfo.systemUptime - checkStarted >= 60 {
-            probe?.cancel(); lastFailure = "LoginWindow capture service timed out; restarting agent"
-            publish(.blocked, lastFailure!)
-            // No client / injected input exists during this check. launchd's
-            // unsuccessful-exit policy recreates the hung graphical component.
-            exit(1)
-        }
+        // The bootstrap is validated at entry; the real capture/input checks
+        // below establish readiness without another console-dictionary gate.
         guard !busy else { return }
         if server != nil {
-            if bridgeAddress() != selectedIP || !CGPreflightPostEventAccess() { fail("Display / bridge or input access changed") }
+            if bridgeAddress() != selectedIP || input?.isAuthorized != true { fail("Display / bridge or input access changed") }
             return
         }
         guard ProcessInfo.processInfo.systemUptime >= nextCheck else { return }
@@ -104,7 +90,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         }
         guard let ip = bridgeAddress() else { publish(.blocked, "Thunderbolt Bridge unavailable"); nextCheck = ProcessInfo.processInfo.systemUptime + 3; return }
         busy = true; publish(.checking, "Checking a real ScreenCaptureKit frame")
-        checkStarted = ProcessInfo.processInfo.systemUptime
+        watchdog?.arm("ScreenCaptureKit frame", timeout: 60)
         attemptedWithoutScreenAccess = !CGPreflightScreenCaptureAccess()
         Task { @MainActor [self] in
             let probe = LoginWindowFrameProbe(); self.probe = probe
@@ -113,18 +99,43 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 attemptedWithoutScreenAccess = false // A valid stream overrides a false ordinary preflight.
                 guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
                 captureChecked = true
-                guard CGPreflightPostEventAccess() else { throw HostError(Self.inputRefusalReason) }
+                publish(.checking, "Screen frame verified; checking system HID input")
+                watchdog?.arm("System HID input", timeout: 15)
+                let nativeInput = try LoginWindowInput { [self] step in
+                    publish(.checking, "Screen frame verified; " + step.rawValue)
+                    watchdog?.arm(step.rawValue, timeout: 15)
+                }
+                input = nativeInput
+                logger.notice("LoginWindow input backend: \(nativeInput.backend.rawValue, privacy: .public); authorization checked, delivery awaits real client verification")
+                if let pid = nativeInput.keyboardTarget {
+                    logger.notice("LoginWindow keyboard destination verified: system login process PID \(pid, privacy: .public); authorized application event routing")
+                }
                 inputChecked = true; lastFailure = nil
                 let token = options.requirePairing ? try pairingCode(options.token) : ""
                 options.bind = ip; options.display = display
                 // Tell the nobody discovery daemon to relinquish its port. Its
                 // fallback resumes if this process exits or its heartbeat expires.
-                publish(.claiming, "Valid frame and input authorization verified")
-                try await Task.sleep(nanoseconds: 300_000_000)
+                publish(.claiming, "Valid frame and " + nativeInput.backend.rawValue + " input authorization checked")
                 guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
                 let host = HostServer(ip: ip, options: options, token: token)
                 host.allowClipboard = false; host.restrictToLocalSubnet = true
-                host.inputAllowed = { ConsoleSession.preLogin && CGPreflightPostEventAccess() }
+                host.handoverOnSessionEnd = true
+                host.inputAllowed = { ConsoleSession.preLogin }
+                let inputLogger = self.logger
+                host.onKeyboardPacket = {
+                    inputLogger.notice("First remote keyboard packet received in LoginWindow; no key codes or text recorded")
+                }
+                let watchdog = self.watchdog
+                host.makeInputInjector = { id, size, rect in
+                    let ticket = watchdog?.arm("Keyboard / mouse event preparation", timeout: 15)
+                    defer { if let ticket { watchdog?.disarm(ticket: ticket) } }
+                    return InputInjector(display: id, captureSize: size, contentRect: rect,
+                        authorized: { nativeInput.isAuthorized }, post: nativeInput.post)
+                }
+                host.onInputFailure = { [weak self, weak host] reason in DispatchQueue.main.async {
+                    guard let self, let host, self.server === host else { return }
+                    self.fail("System input: " + reason)
+                } }
                 // The loginwindow session can hold a different display mode than the
                 // user session, and this session's mode is what the client negotiates
                 // its stream size against. Record both so a wrong pre-login aspect can
@@ -142,8 +153,17 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                     // the other half of any aspect mismatch.
                     self.logger.notice("LoginWindow client negotiated: \(value, privacy: .public)")
                 } }
-                try host.start(); server = host; selectedIP = ip
-                publish(.listening, "Capture and input checked; waiting for client")
+                watchdog?.disarm()
+                let claimDeadline = ProcessInfo.processInfo.systemUptime + 2
+                while true {
+                    guard !ConsoleSession.loggedIn else { stop(); busy = false; return }
+                    do { try host.start(); break }
+                    catch let error as HostBindError where error.addressInUse && ProcessInfo.processInfo.systemUptime < claimDeadline {
+                        try await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                }
+                server = host; selectedIP = ip
+                publish(.listening, "Screen ready; " + nativeInput.backend.rawValue + " input authorized; waiting for client")
             } catch {
                 let systemError = error as NSError
                 // Retry transient display / service failures even when ordinary
@@ -151,7 +171,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
                 // another automatic request in the same graphical session.
                 let refused = systemError.domain == SCStreamErrorDomain && systemError.code == SCStreamError.Code.userDeclined.rawValue
                 attemptedWithoutScreenAccess = !CGPreflightScreenCaptureAccess() && refused
-                fail(refused ? Self.consentRefusalReason : error.localizedDescription)
+                fail(error.localizedDescription)
             }
             busy = false; self.probe = nil
         }
@@ -163,7 +183,7 @@ final class LoginWindowHost: NSObject, NSApplicationDelegate {
         // display recovery, with a bounded frequency and no interactive UI.
         nextCheck = ProcessInfo.processInfo.systemUptime + 30
     }
-    private func stop() { probe?.cancel(); server?.stop(); server = nil; selectedIP = "" }
+    private func stop() { probe?.cancel(); server?.stop(handover: ConsoleSession.loggedIn); watchdog?.disarm(); server = nil; input = nil; selectedIP = "" }
     func applicationWillTerminate(_ notification: Notification) {
         // `publish` snapshots the phase and reason it is leaving, so the login
         // handover keeps the evidence of why pre-login capture never started.

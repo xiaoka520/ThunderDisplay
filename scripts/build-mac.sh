@@ -22,6 +22,7 @@ cp "$task_root/mac-host/Services/dev.thunderdisplay.host.agent.plist" "$task_app
 rm -f "$task_app/Contents/Library/LaunchDaemons/dev.thunderdisplay.boot.plist"
 cp "$task_root/mac-host/Services/dev.thunderdisplay.boot.system.plist" "$task_app/Contents/Resources/"
 cp "$task_root/mac-host/Services/dev.thunderdisplay.loginwindow.plist" "$task_app/Contents/Resources/"
+cp "$task_root/mac-host/Services/dev.thunderdisplay.desktop.plist" "$task_app/Contents/Resources/"
 cp "$task_root/scripts/install-boot-service.sh" "$task_app/Contents/Resources/"
 python3 "$task_root/scripts/sign-mac.py" "$task_app"
 printf 'Built %s\n' "$task_app"

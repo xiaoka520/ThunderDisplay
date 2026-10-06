@@ -48,4 +48,15 @@ final class HostRecoveryStateTests: XCTestCase {
         state.start(at: 1000)
         XCTAssertTrue(state.canStart(at: 1000))
     }
+    func testPortHandoverRetriesQuicklyAndActiveSessionClearsOldDelay() {
+        var state = HostRecoveryState()
+        state.failed(at: 10, handover: true)
+        XCTAssertFalse(state.canStart(at: 10.19))
+        XCTAssertTrue(state.canStart(at: 10.2))
+        state.failed(at: 20)
+        state.sessionBecameActive(at: 20.1)
+        XCTAssertTrue(state.canStart(at: 20.1))
+        state.pause(); state.sessionBecameActive(at: 30)
+        XCTAssertFalse(state.canStart(at: 30))
+    }
 }

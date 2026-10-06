@@ -83,6 +83,9 @@ def main():
     finally:
         if keychain is not None:
             run(['/usr/bin/security', 'lock-keychain', str(keychain)])
+    # The private signing store retains 0700/0600. This public resource manifest
+    # must also be readable after the application is copied to a root-owned path.
+    (app / 'Contents/_CodeSignature/CodeResources').chmod(0o644)
     run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
     print('Mac app signed and verified with ' + ('configured identity' if os.environ.get('THUNDERDISPLAY_SIGN_IDENTITY') else 'persistent project-local identity'))
 

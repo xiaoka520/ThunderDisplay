@@ -2,11 +2,13 @@ import Darwin
 import CoreGraphics
 import Foundation
 import Wire
+import InputSupport
 
 // Mutable peer state is confined to HostServer.queue.
 private final class Peer: @unchecked Sendable {
     let fd: Int32, address: sockaddr_in
     var source: DispatchSourceRead?, framer = ControlFramer(), output = Data()
+    var socketClosed = false
     var negotiated = false, ready = false, lastSeen = DispatchTime.now().uptimeNanoseconds
     let accepted = DispatchTime.now().uptimeNanoseconds
     var session: UInt64 = 0, frame: UInt32 = 0, videoAddress: sockaddr_in?
@@ -14,6 +16,8 @@ private final class Peer: @unchecked Sendable {
     var richFeatures = false, extendedFeatures = false, highBitrate = false, localCursor = false, clipboard = false
     var clipboardRequested = false
     var desktopSRGB = false, cursorVariants = false
+    var sessionTransitions = false, transitionSent = false, transitionAcknowledged = false
+    var keyboardSeen = false
     var clipboardInput = TextClipboardAssembler(), clipboardOutput: [Data] = []
     var imageInput = BinaryAssembler(), cursorOutput: [Data] = []
     var cursorID: UInt32 = 0
@@ -29,6 +33,7 @@ final class HostServer: @unchecked Sendable {
     private var acceptSource: DispatchSourceRead?, discoverySource: DispatchSourceRead?, videoSource: DispatchSourceRead?, timer: DispatchSourceTimer?
     private var videoPort: UInt16 = 0
     private var peer: Peer?
+    private var stopping = false
     var onCaptureFailure: ((String) -> Void)?
     var onStatus: ((String) -> Void)?
     var onClipboardState: ((UInt64, Bool) -> Void)?
@@ -39,6 +44,10 @@ final class HostServer: @unchecked Sendable {
     var allowClipboard = true // Initialized before start; later changes go through the queue.
     var restrictToLocalSubnet = false // Always true in the root LoginWindow agent.
     var inputAllowed: (() -> Bool)? // Recheck the session before every injected packet.
+    var handoverOnSessionEnd = false // Only the LoginWindow host may announce desktop handover.
+    var makeInputInjector: ((CGDirectDisplayID, CGSize, CGRect) throws -> InputInjector)?
+    var onInputFailure: ((String) -> Void)?
+    var onKeyboardPacket: (() -> Void)?
     func updateClipboardPermission(_ allowed: Bool) {
         queue.async { [weak self] in
             guard let self else { return }; self.allowClipboard = allowed
@@ -59,6 +68,7 @@ final class HostServer: @unchecked Sendable {
         requirePairing = options.requirePairing
     }
     func start() throws {
+        stopping = false
         do {
             listener = try makeSocket(type: SOCK_STREAM, port: port)
             guard listen(listener, 4) == 0 else { throw HostError("listen: \(errno)") }
@@ -84,7 +94,11 @@ final class HostServer: @unchecked Sendable {
             timer.schedule(deadline: .now() + .milliseconds(10), repeating: .milliseconds(10))
             timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
             log("Listening on \(ip):\(port); waiting for a paired Windows client")
-        } catch { for fd in [listener, udp, discovery] where fd >= 0 { close(fd) }; throw error }
+        } catch {
+            for fd in [listener, udp, discovery] where fd >= 0 { close(fd) }
+            listener = -1; udp = -1; discovery = -1
+            throw error
+        }
     }
     private func makeSocket(type: Int32, port: UInt16, bindIP: String? = nil) throws -> Int32 {
         let fd = socket(AF_INET, type, 0)
@@ -94,11 +108,14 @@ final class HostServer: @unchecked Sendable {
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, 4)
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, 4)
             var a = try address(bindIP ?? ip, port: port)
-            guard withAddress(&a, { Darwin.bind(fd, $0, $1) }) == 0 else { throw HostError("Cannot bind \(ip):\(port): \(String(cString: strerror(errno)))") }
+            guard withAddress(&a, { Darwin.bind(fd, $0, $1) }) == 0 else {
+                throw HostBindError(ip: bindIP ?? ip, port: port, code: errno)
+            }
             return fd
         } catch { close(fd); throw error }
     }
     private func acceptPeer() {
+        guard !stopping else { return }
         var a = sockaddr_in(), size = socklen_t(MemoryLayout<sockaddr_in>.size)
         let fd = withUnsafeMutablePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(listener, $0, &size) } }
         guard fd >= 0 else { return }
@@ -115,6 +132,7 @@ final class HostServer: @unchecked Sendable {
         source.setCancelHandler { close(fd) }; p.source = source; source.resume()
     }
     private func read(_ p: Peer) {
+        guard !stopping, peer === p else { return }
         var buffer = [UInt8](repeating: 0, count: 8192)
         for _ in 0..<8 {
             let n = recv(p.fd, &buffer, buffer.count, 0)
@@ -133,13 +151,14 @@ final class HostServer: @unchecked Sendable {
         guard let kind = data.first.flatMap(Message.init(rawValue:)) else { throw WireError.malformed }
         if !p.negotiated {
             if kind == .capabilityQuery {
-                guard (data.count == 1 || (data.count == 2 && (2...7).contains(data[data.startIndex + 1])) ||
-                    (data.count == 3 && (4...7).contains(data[data.startIndex + 1]) && data[data.startIndex + 2] <= 1)), var capabilities = displayCapabilities else { throw WireError.malformed }
+                guard (data.count == 1 || (data.count == 2 && (2...8).contains(data[data.startIndex + 1])) ||
+                    (data.count == 3 && (4...8).contains(data[data.startIndex + 1]) && data[data.startIndex + 2] <= 1)), var capabilities = displayCapabilities else { throw WireError.malformed }
                 p.extendedFeatures = data.count >= 2 && data[data.startIndex + 1] >= 3
                 p.highBitrate = data.count >= 2 && data[data.startIndex + 1] >= 4
                 p.richFeatures = data.count >= 2 && data[data.startIndex + 1] >= 5
                 p.desktopSRGB = data.count >= 2 && data[data.startIndex + 1] >= 6
                 p.cursorVariants = data.count >= 2 && data[data.startIndex + 1] >= 7
+                p.sessionTransitions = data.count >= 2 && data[data.startIndex + 1] >= 8
                 p.localCursor = p.richFeatures && localCursorAvailable && data.count == 3 && data[data.startIndex + 2] == 1
                 if capabilities.count >= 28 { capabilities[25] = (capabilities[25] & 3) | (p.extendedFeatures ? 12 : 0) | (p.highBitrate ? 16 : 0) | (localCursorAvailable && p.richFeatures ? 32 : 0) | (p.richFeatures ? 64 : 0) | (p.desktopSRGB ? 128 : 0) }
                 // Legacy clients parse only the original 8-bit capability payload.
@@ -175,7 +194,14 @@ final class HostServer: @unchecked Sendable {
                     let id = try await engine.start(displayID: display)
                     queue.async { [weak self, weak p] in
                         guard let self, let p, self.peer === p else { engine.stop(); return }
-                        p.injector = InputInjector(display: id, captureSize: CGSize(width: Int(hello.width), height: Int(hello.height)), contentRect: engine.contentRect)
+                        do {
+                            let size = CGSize(width: Int(hello.width), height: Int(hello.height))
+                            p.injector = try self.makeInputInjector?(id, size, engine.contentRect) ??
+                                InputInjector(display: id, captureSize: size, contentRect: engine.contentRect)
+                        } catch {
+                            self.onInputFailure?(error.localizedDescription)
+                            self.fail(p, "InputUnavailable: " + error.localizedDescription); return
+                        }
                         self.send(ProtocolWire.welcome(session: p.session, codec: engine.codec, hello: hello, acceptedBitrate: engine.effectiveBitrate), p)
                         log("Paired \(ipString(p.address.sin_addr)); \(hello.width)x\(hello.height) target \(hello.fps) fps, \(engine.codec), \(engine.effectiveBitrate / 1_000_000) Mbps")
                         self.onStatus?("Connected: \(hello.width)×\(hello.height) / \(hello.fps) Hz · \(engine.codec == .hevc10 ? "HEVC Main10 / SDR 10-bit" : engine.codec == .hevc ? "HEVC / SDR 8-bit" : "H.264 / SDR 8-bit")")
@@ -194,11 +220,27 @@ final class HostServer: @unchecked Sendable {
         case .input:
             guard p.ready else { throw WireError.malformed }
             let input = try Input(data)
-            if inputAllowed?() ?? true { p.injector?.apply(input) }
+            guard !p.transitionSent else { return }
+            guard inputAllowed?() ?? true else {
+                if handoverOnSessionEnd && p.sessionTransitions { announceTransition(p) }
+                else { disconnect(p, "Input session ended") }
+                return
+            }
+            if input.kind == 3 && !p.keyboardSeen {
+                p.keyboardSeen = true; onKeyboardPacket?()
+            }
+            do { try p.injector?.apply(input) }
+            catch {
+                onInputFailure?(error.localizedDescription)
+                fail(p, "InputUnavailable: " + error.localizedDescription)
+            }
         case .requestIDR:
             guard data.count == 1 else { throw WireError.malformed }; p.engine?.requestIDR()
         case .ping:
             guard data.count == 1 else { throw WireError.malformed }; send(Data([Message.pong.rawValue]), p)
+        case .sessionTransitionAck:
+            guard p.ready, p.transitionSent, SessionTransitionWire.matches(data, session: p.session, acknowledgment: true) else { throw WireError.malformed }
+            p.transitionAcknowledged = true
         case .clipboardControl:
             guard p.ready, p.extendedFeatures, data.count == 2, data[data.startIndex + 1] <= 1 else { throw WireError.malformed }
             p.clipboardRequested = data[data.startIndex + 1] == 1
@@ -253,6 +295,7 @@ final class HostServer: @unchecked Sendable {
         }
     }
     private func sendVideo(_ frame: Data, pts: UInt64, key: Bool, peer p: Peer) -> Bool {
+        guard !stopping, !p.transitionSent, peer === p else { return false }
         let limit = p.richFeatures ? ProtocolWire.maxFrameSize : p.highBitrate ? ProtocolWire.gigabitMaxFrameSize : ProtocolWire.legacyMaxFrameSize
         guard !frame.isEmpty, frame.count <= limit, var target = p.videoAddress, let codec = p.engine?.codec else { return false }
         p.frame &+= 1
@@ -268,6 +311,7 @@ final class HostServer: @unchecked Sendable {
         return true
     }
     private func tick() {
+        guard !stopping else { return }
         guard let p = peer else { return }
         let now = DispatchTime.now().uptimeNanoseconds
         if (!p.ready && now - p.accepted > 15_000_000_000) || now - p.lastSeen > 10_000_000_000 { disconnect(p, "Client timeout"); return }
@@ -291,10 +335,12 @@ final class HostServer: @unchecked Sendable {
         p.injector?.releaseAll(); p.engine?.stop(); p.engine = nil
         onClipboardState?(p.session, false)
         onCursorState?(p.session, false, p.cursorVariants)
-        shutdown(p.fd, SHUT_RDWR); p.source?.cancel(); p.source = nil; peer = nil
+        if !p.socketClosed { shutdown(p.fd, SHUT_RDWR); p.source?.cancel(); p.source = nil }
+        peer = nil
         log(reason); onStatus?("Waiting for client")
     }
     private func discover() {
+        guard !stopping else { return }
         var bytes = [UInt8](repeating: 0, count: 64), sender = sockaddr_in(), length = socklen_t(MemoryLayout<sockaddr_in>.size)
         let n = withUnsafeMutablePointer(to: &sender) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(discovery, &bytes, bytes.count, 0, $0, &length) } }
         guard n > 0 else { return }
@@ -315,6 +361,7 @@ final class HostServer: @unchecked Sendable {
             sender.sin_port == p.videoAddress?.sin_port && data == Data("TDVIDEO1 \(p.session)".utf8)
     }
     private func videoProbe() {
+        guard !stopping else { return }
         for _ in 0..<8 {
             var bytes = [UInt8](repeating: 0, count: 64), sender = sockaddr_in(), length = socklen_t(MemoryLayout<sockaddr_in>.size)
             let n = withUnsafeMutablePointer(to: &sender) { p in
@@ -326,15 +373,56 @@ final class HostServer: @unchecked Sendable {
             p.engine?.requestIDR()
         }
     }
-    func stop() {
-        queue.sync {
-            if let p = peer { disconnect(p, "Host stopped") }
-            timer?.cancel(); timer = nil
-            let l = listener, d = discovery
-            acceptSource?.setCancelHandler { close(l) }; acceptSource?.cancel(); acceptSource = nil
-            discoverySource?.setCancelHandler { close(d) }; discoverySource?.cancel(); discoverySource = nil
-            let u = udp
-            videoSource?.setCancelHandler { close(u) }; videoSource?.cancel(); videoSource = nil; udp = -1
+    private func announceTransition(_ p: Peer) {
+        guard peer === p, p.ready, p.sessionTransitions, !p.transitionSent else { return }
+        p.transitionSent = true; p.engine?.active = false
+        p.clipboardOutput = []; p.cursorOutput = []
+        send(SessionTransitionWire.packet(session: p.session), p)
+    }
+    func stop(handover: Bool = false) {
+        if handover && handoverOnSessionEnd {
+            let announced = queue.sync { () -> Bool in
+                guard let p = peer, p.ready, p.sessionTransitions else { return false }
+                announceTransition(p); return peer === p
+            }
+            // Keep the serial input queue running so the receipt can arrive.
+            // Bound the wait: a missing or old client must not block login.
+            if announced {
+                let deadline = DispatchTime.now().uptimeNanoseconds + 200_000_000
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    if queue.sync(execute: { peer == nil || peer?.transitionAcknowledged == true }) { break }
+                    usleep(5_000)
+                }
+            }
         }
+        let closed = DispatchGroup()
+        queue.sync {
+            stopping = true
+            timer?.cancel(); timer = nil
+            func cancel(_ source: DispatchSourceRead?, fd: Int32) {
+                guard fd >= 0 else { return }
+                if let source {
+                    closed.enter()
+                    source.setCancelHandler { close(fd); closed.leave() }
+                    source.cancel()
+                } else { close(fd) }
+            }
+            // Close only after pending read handlers finish. Encoder teardown
+            // must not hold listening ports needed by the next graphical session.
+            cancel(acceptSource, fd: listener); acceptSource = nil; listener = -1
+            cancel(discoverySource, fd: discovery); discoverySource = nil; discovery = -1
+            cancel(videoSource, fd: udp); videoSource = nil; udp = -1
+            if let p = peer, !p.socketClosed {
+                // A root-owned accepted socket can also keep the control port
+                // unavailable to the incoming user. Close it in the same phase,
+                // without waiting for encoder cleanup or retaining TIME_WAIT.
+                var disconnectLinger = linger(l_onoff: 1, l_linger: 0)
+                setsockopt(p.fd, SOL_SOCKET, SO_LINGER, &disconnectLinger, socklen_t(MemoryLayout<linger>.size))
+                cancel(p.source, fd: p.fd); p.source = nil; p.socketClosed = true
+            }
+        }
+        closed.wait()
+        log("Host listener and discovery ports released before capture teardown")
+        queue.sync { if let p = peer { disconnect(p, "Host stopped") } }
     }
 }

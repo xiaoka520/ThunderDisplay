@@ -79,6 +79,7 @@ while true {
     let fd = withUnsafeMutablePointer(to: &sender) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(listener, $0, &length) } }
     if fd >= 0 {
         if (sender.sin_addr.s_addr & mask) == (local.s_addr & mask) {
+            logger.notice("Pre-login client reached discovery fallback; agent phase: \(agentState?.phase.rawValue ?? "unavailable", privacy: .public)")
             var yes: Int32 = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, 4)
             let reason: String
             if let agentState, agentState.phase == .blocked {

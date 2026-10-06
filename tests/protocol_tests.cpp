@@ -116,4 +116,15 @@ void highBitrateFrames() {
     REQUIRE(!modern.next(60000+300000)); REQUIRE(modern.takeIDRRequest());
     push(modern,packet(Bytes(10,1),3,true),400000); REQUIRE(modern.next(400001));
 }
-int main() { control(); optionalPairing(); validation(); reassembly(); boundedAndWrap(); firstFrameDiagnosticsAndProbe(); highBitrateFrames(); std::cout<<"Protocol tests passed\n"; }
+void sessionHandover() {
+    uint64_t id=0x0102030405060708;
+    auto notice=sessionTransition(id);
+    REQUIRE(notice==Bytes({17,1,2,3,4,5,6,7,8,1}));
+    REQUIRE(validSessionTransition(notice,id)); REQUIRE(!validSessionTransition(notice,id+1));
+    REQUIRE(!validSessionTransition(notice,0)); REQUIRE(!validSessionTransition(notice,id,true));
+    REQUIRE(validSessionTransition(sessionTransition(id,true),id,true));
+    notice.back()=2; REQUIRE(!validSessionTransition(notice,id));
+    notice=sessionTransition(id); notice.push_back(0); REQUIRE(!validSessionTransition(notice,id));
+    notice.pop_back(); notice.pop_back(); REQUIRE(!validSessionTransition(notice,id));
+}
+int main() { control(); optionalPairing(); validation(); reassembly(); boundedAndWrap(); firstFrameDiagnosticsAndProbe(); highBitrateFrames(); sessionHandover(); std::cout<<"Protocol tests passed\n"; }

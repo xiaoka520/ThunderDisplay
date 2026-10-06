@@ -3,16 +3,26 @@ import ApplicationServices
 import AppKit
 import Wire
 
-final class InputInjector {
+public final class InputInjector {
     private let bounds: CGRect
     private let captureSize: CGSize, contentRect: CGRect
     private let source = CGEventSource(stateID: .privateState)
+    private let authorized: () -> Bool
+    private let post: (CGEvent) throws -> Void
     private var keys = Set<CGKeyCode>(), buttons = Set<UInt16>()
+    private var lockedFlags: CGEventFlags = []
     private var point: CGPoint
     private var clickButton: UInt16?, clickPoint = CGPoint.zero, clickTime: UInt64 = 0, clickCount: Int64 = 1
-    init(display: CGDirectDisplayID, captureSize: CGSize, contentRect: CGRect) {
-        bounds = CGDisplayBounds(display); point = CGPoint(x: bounds.midX, y: bounds.midY)
+    public convenience init(display: CGDirectDisplayID, captureSize: CGSize, contentRect: CGRect,
+                            authorized: @escaping () -> Bool = { CGPreflightPostEventAccess() },
+                            post: @escaping (CGEvent) throws -> Void = { $0.post(tap: .cghidEventTap) }) {
+        self.init(bounds: CGDisplayBounds(display), captureSize: captureSize, contentRect: contentRect, authorized: authorized, post: post)
+    }
+    public init(bounds: CGRect, captureSize: CGSize, contentRect: CGRect,
+                authorized: @escaping () -> Bool, post: @escaping (CGEvent) throws -> Void) {
+        self.bounds = bounds; point = CGPoint(x: bounds.midX, y: bounds.midY)
         self.captureSize = captureSize; self.contentRect = contentRect
+        self.authorized = authorized; self.post = post
     }
     private func flags(_ bits: UInt16) -> CGEventFlags {
         var f: CGEventFlags = []
@@ -23,10 +33,12 @@ final class InputInjector {
         if bits & 32 != 0 { f.insert(.maskAlphaShift) }
         return f
     }
-    func apply(_ input: Input) {
-        guard CGPreflightPostEventAccess() else { return }
+    public func apply(_ input: Input) throws {
+        if input.kind == 5 { releaseAll(); return }
+        guard authorized() else { throw InputPostingError.permissionDenied }
         let down = input.flags & 1 != 0
         let f = flags(input.flags)
+        lockedFlags = f.intersection(.maskAlphaShift)
         switch input.kind {
         case 1, 2:
             guard (0...65535).contains(input.x), (0...65535).contains(input.y) else { return }
@@ -56,30 +68,55 @@ final class InputInjector {
             else if buttons.contains(2) { type = .otherMouseDragged; button = .center }
             let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button)
             if input.kind == 2 { e?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
-            e?.flags = f; e?.post(tap: .cghidEventTap)
+            guard let e else { throw InputPostingError.allocation }
+            e.flags = deviceFlags(f); try post(e)
         case 3:
             guard let key = Self.keyMap[input.code] else { return }
             let repeatKey = down && keys.contains(key)
             if down { keys.insert(key) } else { keys.remove(key) }
             let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down)
-            e?.flags = f; e?.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0); e?.post(tap: .cghidEventTap)
+            guard let e else { throw InputPostingError.allocation }
+            // Modifier transitions are flagsChanged, not ordinary character keys.
+            if (54...62).contains(key) { e.type = .flagsChanged }
+            e.flags = deviceFlags(f)
+            e.setIntegerValueField(.keyboardEventAutorepeat, value: repeatKey ? 1 : 0)
+            try post(e)
         case 4:
             let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
                             wheel1: max(-2000, min(2000, input.y)), wheel2: max(-2000, min(2000, input.x)), wheel3: 0)
-            e?.flags = f; e?.post(tap: .cghidEventTap)
-        case 5: releaseAll()
+            guard let e else { throw InputPostingError.allocation }
+            e.flags = deviceFlags(f); try post(e)
         default: break
         }
     }
-    func releaseAll() {
-        for key in keys {
-            let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false); e?.flags = []; e?.post(tap: .cghidEventTap)
+    private func deviceFlags(_ flags: CGEventFlags) -> CGEventFlags {
+        var result = flags
+        let masks: [CGKeyCode: UInt64] = [59:1,56:2,60:4,55:8,54:16,58:32,61:64,62:8192]
+        for (key, mask) in masks where keys.contains(key) { result.insert(CGEventFlags(rawValue: mask)) }
+        return result
+    }
+    public func releaseAll() {
+        // Release character keys before modifiers, and update left/right state
+        // for each event so a disconnect cannot leave Shift/Command held down.
+        for key in keys.sorted(by: { ((54...62).contains($0) ? 1 : 0, $0) < ((54...62).contains($1) ? 1 : 0, $1) }) {
+            keys.remove(key)
+            if let e = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) {
+                if (54...62).contains(key) { e.type = .flagsChanged }
+                var f = lockedFlags
+                if keys.contains(56) || keys.contains(60) { f.insert(.maskShift) }
+                if keys.contains(59) || keys.contains(62) { f.insert(.maskControl) }
+                if keys.contains(58) || keys.contains(61) { f.insert(.maskAlternate) }
+                if keys.contains(54) || keys.contains(55) { f.insert(.maskCommand) }
+                e.flags = deviceFlags(f); try? post(e)
+            }
         }
         keys.removeAll()
         for button in buttons {
             let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
             let b: CGMouseButton = button == 0 ? .left : button == 1 ? .right : .center
-            CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: b)?.post(tap: .cghidEventTap)
+            if let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: b) {
+                event.flags = lockedFlags; try? post(event)
+            }
         }
         buttons.removeAll()
         clickButton = nil

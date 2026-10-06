@@ -28,7 +28,7 @@ GUI 显示模式仅“自动”和“自定义”，不再提供固定 FPS 档�
 
 ## 界面、色深与像素显示（0.7.4）
 
-Windows 设置窗口改为独立文档子窗口：滚动只移动整张页面，控件在页面内的位置不变，再统一合成重绘。Windows 0.6.1 修复焦点保留在下方字段时，向上滚动又被拉回的问题；仅在焦点切换时定位，关闭的下拉框不吞滚轮或改值，诊断文本到边缘后继续滚动整页，并累积高精度滚轮的小增量。Mac 授权状态改为 34 px 高的圆角徽章。Windows 原生滚动效果仍需 ROG 实机验收；最新两端均为 0.8.1。
+Windows 设置窗口改为独立文档子窗口：滚动只移动整张页面，控件在页面内的位置不变，再统一合成重绘。Windows 0.6.1 修复焦点保留在下方字段时，向上滚动又被拉回的问题；仅在焦点切换时定位，关闭的下拉框不吞滚轮或改值，诊断文本到边缘后继续滚动整页，并累积高精度滚轮的小增量。Mac 授权状态改为 34 px 高的圆角徽章。Windows 原生滚动效果仍需 ROG 实机验收；最新两端均为 0.8.6。
 
 “串流色深”提供自动 / 8-bit SDR / 10-bit SDR。自动模式在 Mac Main10 硬件编码、Windows 当前 10-bit 输出及 HEVC 条件满足时尝试 10-bit；捕获、GPU 解码或 GPU 转换不支持时重连回退到 8-bit。强制 10-bit 会明确报错。Mac 捕获 RGB10，以 VideoToolbox 转为 P010 并用 HEVC Main10 编码；Windows 请求 P010 解码并输出 R10G10B10A2，禁止在 10-bit 路径中悄悄输出 NV12 / BGRA8。参见 [Microsoft HEVC 解码器及 Main10 / P010 要求](https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-decoder)。
 
@@ -78,7 +78,7 @@ cd /Users/caoenming/Developer/ThunderDisplay
 open dist/ThunderDisplayHost.app
 ```
 
-最新 Mac 构建为 `dist/ThunderDisplay-Mac-0.8.1-arm64.zip`。首次启动会显示 **权限与连接设置窗口**，应用同时保留菜单栏 **TD** 入口。
+最新 Mac 构建为 `dist/ThunderDisplay-Mac-0.8.6-arm64.zip`。首次启动会显示 **权限与连接设置窗口**，应用同时保留菜单栏 **TD** 入口。
 
 1. 点击 **一键申请权限**，自动打开 **拖拽授权助手**，并在同一次运行中登记 **辅助功能** 与 **屏幕录制** 请求。也可以分别点击每一项的 **打开设置**，自动显示助手。助手显示当前 `.app` 的图标和完整路径；将图标拖到系统设置权限列表，打开对应开关。用助手中的两个按钮切换屏幕录制和辅助功能页面；切到系统设置后助手仍保持显示，两项授权完成后自动关闭；授权已完成但当前进程未生效时，主窗口保留重启提示。
 2. 在系统设置开启两项权限，回到此窗口。应用每 1.5 秒读取当前权限，缺权限时每 5 秒静默启动新进程复查；后台复查保留原状态和提示，只有结果变化才更新界面，也能点击 **检查授权**；拒绝授权或尚未授权不会让应用退出。
@@ -140,7 +140,7 @@ ctest --test-dir build/windows -C Release --output-on-failure
 
 **日常使用不需要命令行。** 双击 `ThunderDisplayClient.exe` 即显示连接窗口：
 
-最新 GUI 下载包为 `dist/ThunderDisplay-Windows-GUI-0.8.1-x64.zip`，解压后双击其中的 `ThunderDisplay-GUI-0.8.1-x64.exe`。窗口标题应显示 **ThunderDisplay 0.8.1 · 连接 Mac**。动态原生指针、图片剪贴板与 20 Gbps 协商需同时更新两端。0.8.1 修复 Windows Caps Lock 状态和键盘指示灯不变化的问题，切回远程窗口或恢复输入时同步本地状态；这项修复兼容 Mac 0.8.0，只需更新 Windows。
+最新 GUI 下载包为 `dist/ThunderDisplay-Windows-GUI-0.8.6-x64.zip`，解压后双击其中的 `ThunderDisplay-GUI-0.8.6-x64.exe`。窗口标题应显示 **ThunderDisplay 0.8.6 · 连接 Mac**。动态原生指针、图片剪贴板与 20 Gbps 协商需同时更新两端。登录前输入和启动修复需要更新 Mac 并在设置中点击“更新开机组件与连接配置”，仅替换桌面 App 不会更新系统副本。Windows 保留 Caps Lock 状态和键盘指示灯同步，并新增系统输入失败提示。
 
 1. 默认无需配对码。仅在 Mac 开启验证时，勾选 **使用配对码** 并粘贴 Mac 配对码。
 2. 填写 Mac 网桥 IPv4，或留空自动发现；端口须与 Mac 一致。
@@ -192,13 +192,21 @@ Mac 的“桌面逻辑尺寸”对应缩放后的桌面布局，例如 2048×128
 
 ## 4. 自启动与无人值守
 
+0.8.4 的开机安装包含发现daemon、LoginWindow主机和Aqua桌面启动任务。桌面任务只为启用功能的用户运行，原生“登录时打开”仍保留，实例锁避免重复主机。旧连接、TCP监听及UDP发现端口在清理采集/编码器前释放；端口接管每250毫秒重试。Windows显示过画面后的下一轮恢复前8次快速重试，总上限仍为10分钟/150次。
+
+0.8.5 修正冷启动的备用输入：HID接口返回`0xe00002c1`且Quartz授权有效时，使用图形会话事件入口，并检查鼠标定位的返回值。该路径没有键盘送达回执，授权或监听不能证明登录字段收到输入；真实冷启动需要复测。Aqua鼠标、Shift和安全输入诊断使用相同事件源和发送路径。
+
+LoginWindow进入桌面时，新协议先发送带会话ID的交接通知，等待回执最多200毫秒再释放端口。Windows保留最后一帧GPU图像，不显示提示、不弹设置、不接受远程输入；新桌面帧真正显示后恢复。调整窗口或切换8/10-bit时仍能重绘保存画面。保留上限30秒且重试不续期，普通断网沿用旧画面清除行为。需要同时更新两端至0.8.5。
+
+串流尺寸仅影响捕获/编码输出，程序不切换Mac桌面显示模式。当前机器2048→2560变化已在WindowServer日志定位到BetterDisplay重建虚拟显示器、无法匹配保存模式时的回退；已在BetterDisplay保护2048×1280 HiDPI。真实捕获前后桌面仍为2048×1280，输出为4096×2560。
+
 当前本地签名版本请求普通屏幕录制和键鼠控制权限。截图中的“远程桌面”持久捕获权限尚未接入；Apple 的 `com.apple.developer.persistent-content-capture` 是需要开发者申请、获批后通过授权签名配置启用的受限资格，不能通过增加一个设置按钮或自行签入此键获得。[Apple Persistent Content Capture](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.persistent-content-capture)。持久捕获资格与登录前图形会话组件是不同环节：0.8.0已实现后者的捕获、输入入口及交接，但仍需验证当前系统实际允许登录前捕获和控制，获批资格也不等于完成验收。
 
 先把应用放到固定位置，完成权限授权，然后启用“登录时打开 ThunderDisplay”。0.7.4 使用 `SMAppService.mainApp` 注册主 App，系统“登录时打开”可见。首次打开新版时，自动迁移旧 ServiceManagement LaunchAgent 登录配置并取消旧注册。主 App 登录项不承诺崩溃后由 launchd 自动拉起。状态区分已注册、待系统批准和当前桌面主机是否运行，不以配置存在证明启动成功。
 
-“随系统启动”包含两个组件：system daemon以nobody运行，提供发现与失败回退；全局LaunchAgent只在LoginWindow图形会话运行，验证有效帧和事件发送授权后接受连接。主机只绑定雷雳网桥并限制同子网；登录前不提供剪贴板或文件操作，登录后立即停止并由桌面主机接管。默认47990端口，安装时复制当前端口及可选配对配置（root专属600配置文件）。0.7.5 改用独立标识 `dev.thunderdisplay.boot.system`，由管理员安装到 `/Library/LaunchDaemons` 和 `/Library/PrivilegedHelperTools`。安装时持久禁用旧 `dev.thunderdisplay.boot` 注册并移除旧系统文件，应用包也不再携带旧 LaunchDaemon，避免重启时旧 ServiceManagement 注册抢占同名任务。不修改用户目录权限。启用时同时注册主 App 登录项。UI 核对新服务的实际运行状态及加载路径，旧配置显示迁移提示。0.8.0还安装 `/Library/LaunchAgents/dev.thunderdisplay.loginwindow.plist`（LimitLoadToSessionType=LoginWindow）及root所有、其他账户不可写的 `/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app`。使用完整应用包保留签名身份与资源；不把用户可写的工作目录程序作为root执行目标。组件间仅共享root所有的只读状态心跳，无任意命令通道；12秒过期恢复发现回退。新增“更新开机组件与连接配置”用于更新程序或端口/配对策略。系统日志 `subsystem == "dev.thunderdisplay.host" AND category == "boot"` 记录进程启动及是否已登录，用于冷启动验收；未经过真实重启不能称为完成验收。
+“随系统启动”包含三个组件：system daemon以nobody运行，提供发现与失败回退；LoginWindow LaunchAgent在登录前图形会话运行，验证有效帧和事件发送授权后接受连接；Aqua LaunchAgent在目标用户登录后运行桌面主机。主机只绑定雷雳网桥并限制同子网；登录前不提供剪贴板或文件操作，登录后立即停止并由桌面主机接管。默认47990端口，安装时复制当前端口及可选配对配置（root专属600配置文件）。0.7.5 改用独立标识 `dev.thunderdisplay.boot.system`，由管理员安装到 `/Library/LaunchDaemons` 和 `/Library/PrivilegedHelperTools`。安装时持久禁用旧 `dev.thunderdisplay.boot` 注册并移除旧系统文件，应用包也不再携带旧 LaunchDaemon，避免重启时旧 ServiceManagement 注册抢占同名任务。不修改用户目录权限。启用时同时注册主 App 登录项。UI 核对新服务的实际运行状态及加载路径，旧配置显示迁移提示。0.8.0还安装 `/Library/LaunchAgents/dev.thunderdisplay.loginwindow.plist`（LimitLoadToSessionType=LoginWindow）及root所有、其他账户不可写的 `/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app`。使用完整应用包保留签名身份与资源；不把用户可写的工作目录程序作为root执行目标。组件间仅共享root所有的只读状态心跳，无任意命令通道；12秒过期恢复发现回退。新增“更新开机组件与连接配置”用于更新程序或端口/配对策略。系统日志 `subsystem == "dev.thunderdisplay.host" AND category == "boot"` 记录进程启动及是否已登录，用于冷启动验收；未经过真实重启不能称为完成验收。
 
-Windows 自动连接与断线恢复每轮最多10分钟、150次尝试，每次尝试起点至少间隔4秒；发现、连接、握手与等待均计入时间预算。UI 显示 `number/150`，时间或次数上限先到即停止，允许点击连接手动开始新一轮。实际显示新会话首帧后才确认画面已恢复；画面3秒无更新使其失效并清空，持续12秒无解码输出重建连接，保持控制心跳不再掩盖视频中断。静止桌面通过现有关键帧请求刷新。
+Windows 自动连接与断线恢复每轮最多10分钟、150次尝试；首次连接与普通重试至少间隔4秒，显示过有效画面后的恢复前8次改为250毫秒。发现、连接、握手与等待均计入时间预算。UI 显示 `number/150`，时间或次数上限先到即停止，允许点击连接手动开始新一轮。实际显示新会话首帧后才确认画面已恢复；画面3秒无更新使其失效并清空，持续12秒无解码输出重建连接，保持控制心跳不再掩盖视频中断。静止桌面通过现有关键帧请求刷新。
 
 旧版本 `scripts/install-agent.sh` 仅用于兼容，勿与新原生登录项同时启用。若曾用旧脚本安装，先以该脚本的 `--uninstall` 移除旧启动项，再在设置中启用新登录项。
 
@@ -231,4 +239,10 @@ Windows 等待首帧时，详细信息每秒显示有效视频包、完整帧、
 
 0.8.0 登录前诊断：主 App 的 `--login-window-check` 只读检查当前运行上下文，并打印最后一次心跳记录的 phase、`lastFailure`、停止时所处的 phase 与原因、以及记录时间。心跳跨重启可读（`uptime` 只在单次开机内单调，重启后重置），所以重启之后仍然能解释上一次登录前为什么没有开始采集。实际登录前过程查看系统日志 `subsystem == "dev.thunderdisplay.host" AND category == "loginwindow"`。agent不记录输入、密码或图像。root身份不绕过TCC，不修改系统安全策略。
 
-登录前采集没有可交互的授权入口：第三方进程无法在登录界面弹窗请求屏幕录制，也无法在登录前打开系统设置授权，因此只有两条路——用 PPPC/MDM 描述文件为 `dev.thunderdisplay.host` 预授权屏幕录制与辅助功能，或启用自动登录跳过登录界面（需要关闭 FileVault）。两条路都尚未在本机验证；组件在无法获得授权时会把这个结论写进心跳和系统日志，而不是让 Windows 只看到笼统的“等待登录”。
+登录前输入使用系统 HID 事件接口，检查实际发送返回值，并向安全输入消费者发送物理键码和修饰键状态。0.8.3 的鼠标位置和点击在同一 HID 连接内发送，按捕获显示器的桌面坐标定位；实际高分辨率桌面测试已验证坐标和点击，保留黑边排除、拖动、双击、滚轮、长按和断连释放。HID位置字段为有符号16位，超出全局坐标范围明确报错。输入失败会关闭会话并把系统错误交给 Windows，避免继续显示连接正常却不能操作。用户桌面继续使用 CGEvent；所有路径均受系统事件发送授权约束。
+
+冷启动日志已确认旧组件在真实 LoginWindow 会话通过捕获和输入授权预检并接受 Windows 连接，因此此前“只能用 MDM 预授权或自动登录”的推断已撤回。授权预检通过不证明事件送达。新增显式 `--input-check` 诊断在已登录 Aqua 桌面打开自己的临时窗口，实际验证鼠标点击、输入框定位、Shift 和安全输入模式下的测试字符；不保存字符或密码，完成自动关闭。此检查已通过，但不能替代真实 LoginWindow 双机操作验收。
+
+0.8.3 修复输入准备阶段卡住后不再监听的问题：HID 检查不再读取 Quartz 全局鼠标状态，登录前权限预检和每包授权统一使用公开 `IOHIDCheckAccess`。捕获、授权、HID 连接和发送检查分别写入状态；独立后台监控对捕获设置60秒、各输入准备步骤设置15秒上限，即使主循环卡住也会记录具体步骤并退出，由启动任务重新拉起。监控仅在接受输入前启用；完成后关闭。发现服务另记录客户端是否真正到达回退端口。请在 Mac 设置更新开机组件后再进行登录界面复测。
+
+0.8.6 针对冷启动登录界面全部按键无效：授权Quartz备用键盘投递给已核对身份的系统loginwindow进程，鼠标继续走原会话入口；目标失效时报告错误。Windows在新会话首帧和窗口重新获得焦点时更新按键捕获。登录主机每会话仅记录一次收到键盘包，不记录键码、文本或密码。真实冷启动送达仍需双机复测，桌面自有窗口测试不能代替登录界面验收。

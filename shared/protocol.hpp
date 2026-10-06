@@ -16,7 +16,7 @@ using Bytes = std::vector<uint8_t>;
 constexpr uint16_t Port = 47990;
 constexpr size_t HeaderSize = 40, FragmentSize = 1160, LegacyMaxFrameSize = 4 * 1024 * 1024, GigabitMaxFrameSize=16*1024*1024, MaxFrameSize = 64 * 1024 * 1024, ControlLimit = 4096;
 constexpr uint64_t LegacyMaxBitrate=1000000000, MaxBitrate = 20000000000ULL;
-enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide };
+enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide, SessionTransition, SessionTransitionAck };
 enum class Codec : uint8_t { H264=1, HEVC=2, HEVC10=4 };
 
 // Optional UDP return-path probe; the existing TCP/UDP video wire format is unchanged.
@@ -59,6 +59,13 @@ struct Reader {
     }
     bool end() const { return pos==size; }
 };
+inline Bytes sessionTransition(uint64_t session,bool acknowledgment=false) {
+    Writer w; w.put(uint8_t(acknowledgment?Message::SessionTransitionAck:Message::SessionTransition));
+    w.put(session); w.put(uint8_t(1)); return w.data;
+}
+inline bool validSessionTransition(const Bytes& data,uint64_t session,bool acknowledgment=false) {
+    return session && data==sessionTransition(session,acknowledgment);
+}
 struct Settings {
     uint16_t width=2560, height=1600, fps=120;
     uint64_t bitrate=120000000;

@@ -26,10 +26,16 @@ void ClientSession::setStatus(std::string value) {
 void ClientSession::checkRecoveryDeadline() {
     if(retryBudget.expired(micros())) throw std::runtime_error("Recovery limit reached: 10 minutes");
 }
+void ClientSession::expireHandover() {
+    if(holdingFrame && !handoverHold.active(micros())) {
+        holdingFrame=false; handoverHold.clear(); renderer.resetFrame();
+        PostMessageW(window,DisconnectedMessage,0,0);
+    }
+}
 void ClientSession::send(td::Bytes data) {
-    if(!online) return;
+    if(!online || holdingFrame) return;
     std::lock_guard<std::mutex> lock(mutex);
-    if(!online) return;
+    if(!online || holdingFrame) return;
     // Mouse moves can replace only the immediately preceding move, preserving button/key ordering.
     if(data.size()==14 && data[0]==uint8_t(td::Message::Input) && data[1]==1 && !outgoing.empty() &&
        outgoing.back().size()==14 && outgoing.back()[0]==uint8_t(td::Message::Input) && outgoing.back()[1]==1) {
@@ -92,8 +98,10 @@ void ClientSession::run() {
     auto com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     if(FAILED(com)) { setStatus("COM initialization failed"); return; }
     while(!stopFlag) {
+        expireHandover();
         retryBudget.begin(micros());
         if(retryBudget.exhausted(micros())) {
+            holdingFrame=false; handoverHold.clear(); renderer.resetFrame();
             recoveryStopped=true; setStatus("Recovery limit reached: stopped after 10 minutes or 150 attempts"); break;
         }
         if(!retryBudget.startAttempt(micros())) {
@@ -105,14 +113,15 @@ void ClientSession::run() {
             auto host=options.host.empty()?discover():options.host;
             checkRecoveryDeadline(); connectAndStream(host);
         } catch(const std::exception& e) { if(!stopFlag) setStatus(e.what()); }
-        online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false; renderer.resetFrame();
+        online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false;
+        expireHandover(); renderer.resetFrame(holdingFrame);
         { std::lock_guard<std::mutex> lock(mutex); outgoing.clear(); clipboardOutgoing.clear(); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
         PostMessageW(window,DisconnectedMessage,0,0);
     }
     CoUninitialize();
 }
 void ClientSession::connectAndStream(const std::string& host) {
-    online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(); overflow=false; wantIDR=false;
+    online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(holdingFrame); overflow=false; wantIDR=false;
     Socket tcp(SOCK_STREAM); tcp.nonblocking();
     BOOL yes=TRUE; setsockopt(tcp.fd,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&yes),sizeof(yes));
     auto remote=endpoint(host,options.port);
@@ -152,6 +161,7 @@ void ClientSession::connectAndStream(const std::string& host) {
     bool awaitingKey=true;
     bool clipboardSupported=false,nativeNegotiated=false,largeFrames=false,cursorSupported=false,richFeatures=false,desktopSRGB=false;
     bool confirmedFrame=false;
+    bool transitionReceived=false;
     uint64_t decodedCount=0,lastDecoded=accepted;
     td::ClipboardAssembler clipboardAssembler;
     td::BlobAssembler imageAssembler,cursorAssembler;
@@ -208,6 +218,7 @@ void ClientSession::connectAndStream(const std::string& host) {
         return "";
     };
     while(!stopFlag) {
+        expireHandover();
         checkRecoveryDeadline();
         if(overflow) throw std::runtime_error("Input queue overflow; reconnecting to release held keys");
         auto now=micros();
@@ -215,12 +226,14 @@ void ClientSession::connectAndStream(const std::string& host) {
             decodedCount=decoder->decodedFrames(); lastDecoded=now; videoInterrupted=false;
         }
         if(!confirmedFrame && renderer.hasFrame()) {
-            confirmedFrame=true; retryBudget.succeeded(); attemptNumber=0;
+            holdingFrame=false; handoverHold.clear();
+            confirmedFrame=true; retryBudget.succeeded(); retryBudget.streamDisplayed(); attemptNumber=0;
+            PostMessageW(window,FramePresentedMessage,0,0);
         }
-        if(confirmedFrame && !td::VideoHealth::fresh(now,lastDecoded) && !videoInterrupted.exchange(true)) {
+        if(!transitionReceived && confirmedFrame && !td::VideoHealth::fresh(now,lastDecoded) && !videoInterrupted.exchange(true)) {
             renderer.resetFrame(); PostMessageW(window,DisconnectedMessage,0,0);
         }
-        if(confirmedFrame && td::VideoHealth::stalled(now,lastDecoded)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
+        if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastDecoded)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
         if(now-lastControl>10000000 || (!decoder && now-accepted>15000000)) throw std::runtime_error("Host timed out");
         if(decoder && now-lastProbe>(haveVideoPort?2000000u:500000u)) {
             auto probe=td::videoProbe(sessionID); auto& target=haveVideoPort?videoEndpoint:remote;
@@ -268,9 +281,23 @@ void ClientSession::connectAndStream(const std::string& host) {
             if(n<0 && !wouldBlock()) throw std::runtime_error("TCP receive failed");
             if(n>0) for(auto& message:framer.push(b,size_t(n))) {
                 lastControl=micros(); auto type=td::Message(message[0]);
+                if(type==td::Message::SessionTransition) {
+                    if(options.capabilityVersion<8 || !decoder || !td::validSessionTransition(message,sessionID))
+                        throw std::runtime_error("Invalid session transition notice");
+                    if(!transitionReceived && confirmedFrame && renderer.hasFrame()) {
+                        handoverHold.begin(micros()); holdingFrame=true; renderer.resetFrame(true);
+                    }
+                    transitionReceived=true; online=false; clipboardOnline=false; localCursorActive=false;
+                    { std::lock_guard<std::mutex> lock(mutex); outgoing.clear(); clipboardOutgoing.clear(); }
+                    // Retire queued input before acknowledging the session notice.
+                    // A partially sent framed message must finish to keep framing intact.
+                    if(outputOffset==0) output.clear();
+                    auto ack=td::framed(td::sessionTransition(sessionID,true)); output.insert(output.end(),ack.begin(),ack.end());
+                    PostMessageW(window,DisconnectedMessage,0,0); continue;
+                }
                 if(type==td::Message::Failure) {
                     auto earlyReason=std::string(message.begin()+1,message.end());
-                    if(earlyReason.rfind("HostWaitingForLogin:",0)==0 || earlyReason.rfind("PreLoginCaptureUnavailable:",0)==0 || earlyReason.rfind("PreLoginStarting:",0)==0)
+                    if(earlyReason.rfind("HostWaitingForLogin:",0)==0 || earlyReason.rfind("PreLoginCaptureUnavailable:",0)==0 || earlyReason.rfind("PreLoginStarting:",0)==0 || earlyReason.rfind("InputUnavailable:",0)==0)
                         throw std::runtime_error(earlyReason);
                     if(querying && options.capabilityVersion>1) { --options.capabilityVersion; throw std::runtime_error("Retrying display detection with older host capabilities"); }
                     auto reason=std::string(message.begin()+1,message.end());
@@ -301,6 +328,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                 }
                 if((type==td::Message::Welcome || type==td::Message::WelcomeWide) && !decoder && !querying) {
                     td::Welcome welcome(message);
+                    renderer.retainForHandover(options.capabilityVersion>=8);
                     sessionID=welcome.session; codec=welcome.codec;
                     if(!(options.settings.codecMask&uint8_t(welcome.codec))) throw std::runtime_error("Host selected an unrequested codec");
                     try { renderer.configureBitDepth(welcome.settings.bitDepth); decoder=std::make_unique<Decoder>(renderer,welcome,desktopSRGB); }
@@ -343,6 +371,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                 } else if(type!=td::Message::Pong || message.size()!=1) throw std::runtime_error("Unexpected control message");
             }
         }
+        if(transitionReceived) continue; // No old-session decode/present after the notice.
         if(FD_ISSET(udp.fd,&read)) {
             for(unsigned i=0;i<512;++i) {
                 uint8_t b[1500]; sockaddr_in sender{}; int length=sizeof(sender);

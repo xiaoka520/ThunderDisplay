@@ -14,6 +14,7 @@ version = info['CFBundleShortVersionString']
 client = re.search(r'#define TD_VERSION_TEXT "([0-9.]+)"', (ROOT / 'windows-client/version.h').read_text()).group(1)
 assert version == client, 'Update both platforms together'
 assert info['CFBundleIdentifier'] == 'dev.thunderdisplay.host'
+assert (app / 'Contents/_CodeSignature/CodeResources').stat().st_mode & 0o444 == 0o444, 'Public signature resource seal must be readable'
 for name in ['ThunderDisplayHost', 'ThunderDisplayBoot']:
     path = app / 'Contents/MacOS' / name
     data = path.read_bytes()
@@ -29,6 +30,10 @@ assert service['ProgramArguments'] == ['/Library/PrivilegedHelperTools/dev.thund
 assert 'BundleProgram' not in service and service['UserName'] == 'nobody'
 assert service['RunAtLoad'] is True and service['KeepAlive'] is True
 assert (app / 'Contents/Resources/install-boot-service.sh').is_file()
+desktop = plistlib.loads((app / 'Contents/Resources/dev.thunderdisplay.desktop.plist').read_bytes())
+assert desktop['Label'] == 'dev.thunderdisplay.desktop' and desktop['RunAtLoad'] is True
+assert desktop['LimitLoadToSessionType'] == 'Aqua' and 'UserName' not in desktop
+assert desktop['ProgramArguments'] == ['/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost', '--background']
 archive = ROOT / 'dist' / f'ThunderDisplay-Mac-{version}-arm64.zip'
 files = [p for p in sorted(app.rglob('*')) if p.is_file()]
 for path in files:
@@ -43,6 +48,10 @@ App 启动即自动运行主机，唤醒或显示器恢复后自动重建，不�
 默认开启“保持 Mac 可连接”，防止系统自动睡眠；屏幕可熄灭，开关可关闭。
 雷雳不支持网络唤醒；手动让 Mac 睡眠后需先唤醒 Mac，随后主机自动恢复。
 随系统启动需系统管理员确认，安装独立发现daemon与LoginWindow图形组件；检查有效帧和输入授权后接受连接，登录后桌面主机接管。
+0.8.2 登录前键鼠改用系统HID输入；安装后点击“更新开机组件与连接配置”更新系统副本。仅替换桌面App不足以更新登录前程序。
+0.8.3 移除登录前输入准备的全局状态查询，增加独立超时恢复与分阶段日志；需要更新开机组件。
+0.8.6 将授权备用键盘定向投递给系统登录进程；鼠标保留原路径。Windows会话恢复时重新建立按键捕获。交接保留最后一帧、不加提示文字。需要更新开机组件，真实冷启动键盘仍需复测。
+0.8.4 先释放交接端口再清理采集，增加限定用户的Aqua桌面启动任务；需更新开机组件。HID拒绝本地用户上下文时，仅在Quartz事件发送授权有效后尝试标准输入路径，冷启动控制仍需实测。
 0.7.5 修复旧开机注册在重启时抢占任务的问题；已有配置需重新启用此项以迁移，不能只替换 .app。
 FileVault 解锁不支持；macOS 登录界面捕获与控制仍待真实未登录会话验收，安装成功不等于已经验证可用。
 两端更新 {version} 后可用动态原生指针、文字 / 图片剪贴板与 20 Gbps 请求上限。
@@ -54,6 +63,7 @@ FileVault 解锁不支持；macOS 登录界面捕获与控制仍待真实未登�
 Login startup and the boot discovery helper are configurable in the Mac app.
 The boot helper does not capture loginwindow or FileVault preboot.
 The separate LoginWindow graphics agent verifies actual frames and input authorization before serving; pre-login remote control still requires real-session validation.
+Version 0.8.2 uses system HID input before login; update startup components in the Mac settings to update the system copy.
 Update both platforms to {version}. Native Windows GPU/cursor/theme behavior requires the ROG.
 ''')
     package.writestr('SHA256SUMS.txt', ''.join(f'{sha256((app / "Contents/MacOS" / name).read_bytes()).hexdigest()}  ThunderDisplayHost.app/Contents/MacOS/{name}\n' for name in ['ThunderDisplayHost','ThunderDisplayBoot']))

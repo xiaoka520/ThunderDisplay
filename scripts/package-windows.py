@@ -26,6 +26,10 @@ def validate_gui(data, version):
         raise ValueError("Missing system cursor build marker")
     if b"Explicit sRGB shader conversion" not in data:
         raise ValueError("Missing desktop color conversion build marker")
+    if b"ThunderDisplay handover" not in data or b"Invalid session transition notice" not in data:
+        raise ValueError("Missing authenticated session handover / retained GPU frame support")
+    if "正在进入桌面".encode("utf-16-le") in data:
+        raise ValueError("Login handover must retain the frame without a text overlay")
     for preset in ("缩放与边缘", "1:1 原始像素显示（窗口较小时裁剪画面）", "60 Hz · 高画质", "120 Hz · 超清", "165 Hz · 超清", "240 Hz · 低延迟"):
         if preset.encode("utf-16-le") in data:
             raise ValueError("Fixed FPS presets must not appear in the GUI")

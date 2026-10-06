@@ -9,12 +9,15 @@ let package = Package(
         .target(name: "Wire"),
         .target(name: "HostState", linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration")]),
         .target(name: "CursorSupport", linkerSettings: [.linkedFramework("AppKit")]),
+        .target(name: "HIDBridge", linkerSettings: [.linkedFramework("IOKit"), .linkedFramework("Carbon"), .linkedFramework("CoreGraphics")]),
+        .target(name: "InputSupport", dependencies: ["Wire", "HIDBridge"], linkerSettings: [.linkedFramework("AppKit")]),
         .executableTarget(name: "ThunderDisplayBoot", dependencies: ["Wire", "HostState"], linkerSettings: [.linkedFramework("SystemConfiguration")]),
-        .executableTarget(name: "ThunderDisplayHost", dependencies: ["Wire", "HostState", "CursorSupport"],
+        .executableTarget(name: "ThunderDisplayHost", dependencies: ["Wire", "HostState", "CursorSupport", "InputSupport"],
                           linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("ScreenCaptureKit"),
                                            .linkedFramework("VideoToolbox"), .linkedFramework("SystemConfiguration"), .linkedFramework("ServiceManagement"), .linkedFramework("IOKit")]),
         .testTarget(name: "WireTests", dependencies: ["Wire"]),
         .testTarget(name: "HostStateTests", dependencies: ["HostState"]),
-        .testTarget(name: "CursorSupportTests", dependencies: ["CursorSupport"])
+        .testTarget(name: "CursorSupportTests", dependencies: ["CursorSupport"]),
+        .testTarget(name: "InputSupportTests", dependencies: ["InputSupport", "HIDBridge"])
     ]
 )

@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import SystemConfiguration
+import OSLog
 import Wire
 
 struct HostError: LocalizedError, CustomStringConvertible {
@@ -8,7 +9,17 @@ struct HostError: LocalizedError, CustomStringConvertible {
     var errorDescription: String? { description }
     init(_ message: String) { description = message }
 }
-func log(_ message: String) { print("[ThunderDisplay] \(message)"); fflush(stdout) }
+private let hostLogger = Logger(subsystem: "dev.thunderdisplay.host", category: "desktop")
+func log(_ message: String) {
+    print("[ThunderDisplay] \(message)"); fflush(stdout)
+    hostLogger.notice("\(message, privacy: .public)")
+}
+
+struct HostBindError: Error, CustomStringConvertible {
+    let ip: String, port: UInt16, code: Int32
+    var addressInUse: Bool { code == EADDRINUSE }
+    var description: String { "Cannot bind \(ip):\(port): \(String(cString: strerror(code)))" }
+}
 func nonblocking(_ fd: Int32) throws {
     guard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0 else { throw HostError("fcntl: \(errno)") }
 }
@@ -46,6 +57,8 @@ struct Options {
     var startupStatus = false, repairStartup = false, cursorCheck = false
     var loginWindow = false, loginWindowCheck = false
     var loginWindowFrameCheck = false
+    var inputCheck = false, inputCheckQuartz = false, inputCheckKeyboardOnly = false
+    var startupUser: UInt32?
     var recoveryCheck = false
     var previewUI = false, background = false, captureCheck10 = false, captureCheckNative = false
     var encoderCheckBitrate: UInt64 = 10_000_000
@@ -60,6 +73,9 @@ struct Options {
             if arg == "--login-window" { loginWindow = true; background = true; continue }
             if arg == "--login-window-check" { loginWindowCheck = true; continue }
             if arg == "--login-window-frame-check" { loginWindowFrameCheck = true; continue }
+            if arg == "--input-check" { inputCheck = true; continue }
+            if arg == "--input-check-quartz" { inputCheck = true; inputCheckQuartz = true; continue }
+            if arg == "--input-check-keyboard" { inputCheck = true; inputCheckQuartz = true; inputCheckKeyboardOnly = true; continue }
             if arg == "--recovery-check" { recoveryCheck = true; background = true; bind = "127.0.0.1"; port = 48079; requirePairing = false; pairingOverride = false; continue }
             if arg == "--diagnose" { diagnose = true; continue }
             if arg == "--startup-status" { startupStatus = true; continue }
@@ -95,6 +111,7 @@ struct Options {
             guard !args.isEmpty else { throw HostError("Missing value for \(arg)") }
             let value = args.removeFirst()
             switch arg {
+            case "--startup-user": guard let n = UInt32(value), n >= 500 else { throw HostError("Invalid startup user") }; startupUser = n
             case "--relaunch-after-pid": guard let n = Int32(value), n > 0 else { throw HostError("Invalid relaunch parent") }; relaunchParent = n
             case "--bind": bind = value
             case "--port": guard let n = UInt16(value), n > 0 else { throw HostError("Invalid port") }; port = n
