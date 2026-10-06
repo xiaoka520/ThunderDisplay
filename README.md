@@ -1,6 +1,6 @@
 # ThunderDisplay
 
-为 **Mac mini → 雷雳网桥 → Windows ROG** 编写的本地远程显示器 MVP。
+为 **Mac mini → 雷雳网桥 → Windows Windows 编写的本地远程显示器 MVP。
 
 Mac 使用 Swift / ScreenCaptureKit / VideoToolbox；Windows 使用 C++17 / Media Foundation / Direct3D 11。
 运行不依赖互联网、云账户、Moonlight、Sunshine 或第三方视频库。
@@ -28,7 +28,7 @@ GUI 显示模式仅“自动”和“自定义”，不再提供固定 FPS 档�
 
 ## 界面、色深与像素显示（0.7.4）
 
-Windows 设置窗口改为独立文档子窗口：滚动只移动整张页面，控件在页面内的位置不变，再统一合成重绘。Windows 0.6.1 修复焦点保留在下方字段时，向上滚动又被拉回的问题；仅在焦点切换时定位，关闭的下拉框不吞滚轮或改值，诊断文本到边缘后继续滚动整页，并累积高精度滚轮的小增量。Mac 授权状态改为 34 px 高的圆角徽章。Windows 原生滚动效果仍需 ROG 实机验收；最新两端均为 0.8.9。
+Windows 设置窗口改为独立文档子窗口：滚动只移动整张页面，控件在页面内的位置不变，再统一合成重绘。Windows 0.6.1 修复焦点保留在下方字段时，向上滚动又被拉回的问题；仅在焦点切换时定位，关闭的下拉框不吞滚轮或改值，诊断文本到边缘后继续滚动整页，并累积高精度滚轮的小增量。Mac 授权状态改为 34 px 高的圆角徽章。Windows 原生滚动效果仍需 Windowsdows 实机验收；最新两端均为 0.8.9。
 
 “串流色深”提供自动 / 8-bit SDR / 10-bit SDR。自动模式在 Mac Main10 硬件编码、Windows 当前 10-bit 输出及 HEVC 条件满足时尝试 10-bit；捕获、GPU 解码或 GPU 转换不支持时重连回退到 8-bit。强制 10-bit 会明确报错。Mac 捕获 RGB10，以 VideoToolbox 转为 P010 并用 HEVC Main10 编码；Windows 请求 P010 解码并输出 R10G10B10A2，禁止在 10-bit 路径中悄悄输出 NV12 / BGRA8。参见 [Microsoft HEVC 解码器及 Main10 / P010 要求](https://learn.microsoft.com/en-us/windows/win32/medfound/h-265---hevc-video-decoder)。
 
@@ -48,12 +48,12 @@ Windows 设置移除“缩放与边缘”和“1:1 原始像素显示”。默�
 
 全屏默认 Ctrl+Alt+Enter，在设置中直接按组合键更改并随连接参数保存。需含 Ctrl 或 Alt，不允许 F11 或保留系统 / 释放输入组合键。远程画面全屏、获得焦点且捕获输入时，Win / Alt+Tab / Alt+F4 等 Windows 快捷键交给 Mac；Ctrl+Shift+Esc 在 UI 线程调用系统 Taskmgr.exe 唤起任务管理器（Ctrl / Shift 仍拦截，避免本机语言切换和粘滞键快捷键泄漏），Ctrl+Alt+Del 由系统处理。失焦、断线或释放输入后停止拦截，已被捕获的按键会继续吞掉对应释放事件，防止 Win key-up 弹出开始菜单。
 
-若黑色也发灰、整个画面对比度下降，还需区分电平范围、Windows HDR 的 SDR 亮度和色彩管理问题。参见 [Microsoft Advanced Color 说明](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range)。实际 ROG 色彩仍需对照验收。
+若黑色也发灰、整个画面对比度下降，还需区分电平范围、Windows HDR 的 SDR 亮度和色彩管理问题。参见 [Microsoft Advanced Color 说明](https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range) Windows 色彩仍需对照验收。
 
 
 自定义码率的默认最大值为 **20000 Mbps（20 Gbps）**，使用 64-bit 协商以避免溢出；自动推荐为 160–1000 Mbps。它是请求目标的上限，不是测得的网桥吞吐，也不要求静止桌面占满链路。VideoToolbox 拒绝超高目标时检测可接受范围，在 Welcome 和 Windows 诊断明确显示实际接受的目标。当前 Mac 合成检查接受 10737 Mbps，HEVC / H.264 / Main10 各三帧通过；这不是持续吞吐或20 Gbps 输出证明。新端支持最高 64 MiB 单帧，旧 query4 仍16 MiB，其他旧端4 MiB。
 
-“本地指针 · macOS 原生”默认关闭。开启后，Mac 读取 WindowServer 当前指针的系统原始像素和热点，包括文本、调整大小、手形、截屏及应用自定义形状；不根据按键猜状态，不手绘。Windows 按本机 DPI 同步缩放形状及点击热点，不再次乘 Mac HiDPI 比例。Mac 物理屏幕指针保留，SCK 视频从第一帧起隐藏指针。读取使用运行时可选的系统私有 getter，不支持时保留视频指针；改变开关需重连。这减少移动指针等待，不改变输入网络往返。当前 Mac 只读实测可取箭头 / 文本光标，系统截屏状态及 ROG 实际点击仍需两机验收。
+“本地指针 · macOS 原生”默认关闭。开启后，Mac 读取 WindowServer 当前指针的系统原始像素和热点，包括文本、调整大小、手形、截屏及应用自定义形状；不根据按键猜状态，不手绘。Windows 按本机 DPI 同步缩放形状及点击热点，不再次乘 Mac HiDPI 比例。Mac 物理屏幕指针保留，SCK 视频从第一帧起隐藏指针。读取使用运行时可选的系统私有 getter，不支持时保留视频指针；改变开关需重连。这减少移动指针等待，不改变输入网络往返。当前 Mac 只读实测可取箭头 / 文本光标，系统截屏Windows ROG 实际点击仍需两机验收。
 
 ## 1. 配置直连网络
 
@@ -154,7 +154,7 @@ ctest --test-dir build/windows -C Release --output-on-failure
 
 高级用法：省略 `--host` 则尝试本地广播发现。`--token-file pairing.token` 可以从本地文件读取配对码；文件内容仅放配对码，并自行限制文件访问权限。
 
-本次也提供了 `dist/windows-x64/ThunderDisplayClient.exe` 交叉编译产物，可以连同 `licenses` 目录拷到 ROG 上先做联调。
+本次也提供了 `dist/windows-x64/ThunderDisplayClient.exe` 交叉编译产物，可以连同 `licenses` 目Windows ROG 上先做联调。
 如需在 Mac 上重建，使用官方 [LLVM MinGW](https://github.com/mstorsjo/llvm-mingw) macOS 工具包解压目录：
 
 ```bash
@@ -224,7 +224,7 @@ LoginWindow主机代码及安装流程已接入，真实未登录会话中的画
 
 Swift 和 C++ 使用同一组固定字节向量检查协议兼容；测试涵盖 TCP 拆包 / 粘包、签名整数、长度校验、UDP 分片、乱序、重复、参考帧丢失、内存上限和序号回绕。`cmake` / `ctest` 也能在 Mac 上单独运行可移植 C++ 协议测试。
 
-本机验证记录见 [docs/validation.md](docs/validation.md)。Windows 原生 GPU、真实雷雳传输、高刷吞吐和端到端延迟需要在 Mac + ROG 上验收，不能从编译和协议测试推断。
+本机验证记录见 [docs/validation.md](docs/validation.md)。Windows 原生 GPU、真实雷雳传输、高刷吞吐和端到端延迟需要在 MaWindows ROG 上验收，不能从编译和协议测试推断。
 
 ## 当前边界
 
@@ -251,4 +251,4 @@ Windows 等待首帧时，详细信息每秒显示有效视频包、完整帧、
 
 0.8.8优化登录交接：收到会话ID匹配的交接通知后，15秒内每250毫秒重试，复用最后一次实际显示画面的主机地址，免去重复发现。Mac每100毫秒检测登录完成，主动请求已安装且用户匹配的桌面启动任务，避免等待RunAtLoad后台排队；桌面启动暂时每100毫秒检查，端口占用后100毫秒重试。总预算10分钟/150次以及无文字的最后一帧保留不变；真实登录至桌面时间仍需双机实测。
 
-0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
+0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组Windows实ROG延迟与画面连续性仍需双机复测。
