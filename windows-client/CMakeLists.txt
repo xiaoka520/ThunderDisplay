@@ -1,4 +1,5 @@
 enable_language(RC)
+set_property(SOURCE client.rc APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplay.ico)
 add_executable(ThunderDisplayClient WIN32 client.rc src/displays.cpp src/setup.cpp src/main.cpp src/network.cpp src/decoder.cpp src/video_worker.cpp src/renderer.cpp)
 target_include_directories(ThunderDisplayClient PRIVATE ../shared src ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(ThunderDisplayClient PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

@@ -14,6 +14,8 @@ version = info['CFBundleShortVersionString']
 client = re.search(r'#define TD_VERSION_TEXT "([0-9.]+)"', (ROOT / 'windows-client/version.h').read_text()).group(1)
 assert version == client, 'Update both platforms together'
 assert info['CFBundleIdentifier'] == 'dev.thunderdisplay.host'
+assert info['CFBundleIconFile'] == 'ThunderDisplay', 'Missing application icon metadata'
+assert (app / 'Contents/Resources/ThunderDisplay.icns').read_bytes() == (ROOT / 'mac-host/Resources/ThunderDisplay.icns').read_bytes(), 'App icon differs from the generated artwork'
 assert (app / 'Contents/_CodeSignature/CodeResources').stat().st_mode & 0o444 == 0o444, 'Public signature resource seal must be readable'
 for name in ['ThunderDisplayHost', 'ThunderDisplayBoot']:
     path = app / 'Contents/MacOS' / name
@@ -72,6 +74,7 @@ App 启动即自动运行主机，唤醒或显示器恢复后自动重建，不�
 雷雳不支持网络唤醒；手动让 Mac 睡眠后需先唤醒 Mac，随后主机自动恢复。
 随系统启动需系统管理员确认，安装独立发现daemon与LoginWindow图形组件；检查有效帧和输入授权后接受连接，登录后桌面主机接管。
 0.8.11：视频发送与大帧复制移出键鼠队列，Windows收包与解码显示分开；积压有界，参考帧丢失后请求关键帧恢复。新增转色、编解码、发送和显示分段耗时日志。需要同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。
+0.8.15：Mac与Windows应用统一使用根目录ThunderDisplay.png生成的多尺寸图标。
 0.8.14：首次视频通道探测补发关键帧，后续保活不再每两秒触发重编码；显式缺帧恢复保持有效。该修复位于Mac，Windows 0.8.13仍兼容。
 0.8.13：Mac验证速度优先后允许两帧有界硬件准入，仅保留最新捕获画面，并修正丢帧统计。桌面任务声明Interactive；串流活动期间声明低延迟活动，停止后释放。Windows大帧重组最短期限由25改为50毫秒，完整帧立即解码，缺包仍按有界期限恢复。请更新两端与开机组件。HiDPI、色深、色彩、码率与目标帧率不变，实际帧率须按运行统计确认。
 0.8.12：Mac只允许一帧进入硬件编码，完成后立即处理最新捕获帧。Windows收包、解码、显示分开；等待显示刷新时只保留最新已解码画面，不拖住解码。连接检查包含实际显示进度，每五秒向Mac回传各阶段耗时数值，不含画面或输入内容。需同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。

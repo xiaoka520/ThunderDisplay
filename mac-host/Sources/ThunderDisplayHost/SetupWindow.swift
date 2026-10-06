@@ -101,8 +101,10 @@ final class SetupWindow: NSWindowController, NSWindowDelegate {
             root.trailingAnchor.constraint(equalTo: contentDocument.trailingAnchor, constant: -24),
             root.topAnchor.constraint(equalTo: contentDocument.topAnchor, constant: 24)
         ])
-        let icon = NSImageView(image: NSImage(systemSymbolName: "display.2", accessibilityDescription: "ThunderDisplay") ?? NSImage())
-        icon.contentTintColor = accent; icon.imageScaling = .scaleProportionallyUpOrDown
+        let appIcon = Bundle.main.url(forResource: "ThunderDisplay", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
+        let icon = NSImageView(image: appIcon ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "ThunderDisplay") ?? NSImage())
+        if appIcon == nil { icon.contentTintColor = accent }
+        icon.imageScaling = .scaleProportionallyUpOrDown
         icon.widthAnchor.constraint(equalToConstant: 42).isActive = true; icon.heightAnchor.constraint(equalToConstant: 42).isActive = true
         let titles = vertical([label("ThunderDisplay", size: 28, weight: .bold), label(ui("MAC 主机 · 雷雳直连", "MAC HOST · THUNDERBOLT"), size: 11, weight: .medium)])
         let header = row([icon, titles, spacer(), label(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.6.0", size: 12, weight: .semibold)])

@@ -73,6 +73,7 @@ ClientOptions parse() {
 }
 struct App {
     HWND window=nullptr;
+    WindowIcons icons;
     std::unique_ptr<SetupWindow> setup;
     bool openOnFirstFrame=false, fullscreenRequested=false;
     std::unique_ptr<Renderer> renderer;
@@ -493,6 +494,7 @@ struct App {
         case WM_SIZE:
             if(renderer) try { renderer->resize(); } catch(const std::exception& e) { diagnosticLog("display.resize.error",e.what()); }
             return 0;
+        case WM_DPICHANGED: icons.apply(window); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_SETCURSOR:
             if(LOWORD(l)==HTCLIENT && capture && ready()) { SetCursor(session->localCursorEnabled()?macCursor():nullptr); return TRUE; }
@@ -545,9 +547,11 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             App app; App::instance=&app;
             WNDCLASSW wc{}; wc.lpfnWndProc=App::wndproc; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"ThunderDisplay";
             wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            wc.hIcon=LoadIconW(wc.hInstance,MAKEINTRESOURCEW(IDI_THUNDERDISPLAY));
             if(!RegisterClassW(&wc)) throw std::runtime_error("Window class registration failed");
             HWND h=CreateWindowExW(0,wc.lpszClassName,L"ThunderDisplay",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1280,800,nullptr,nullptr,wc.hInstance,&app);
             if(!h) throw std::runtime_error("Window creation failed");
+            app.icons.apply(h);
             td::UITheme::system().apply(h);
             app.clipboardListening=AddClipboardFormatListener(h)!=FALSE;
             app.setup=std::make_unique<SetupWindow>(options); app.fullscreenHotkey=app.setup->fullscreenShortcut();

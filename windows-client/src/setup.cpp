@@ -52,11 +52,13 @@ SetupWindow::SetupWindow(ClientOptions initial): saved(std::move(initial)) {
     loadPreferences();
     WNDCLASSW wc{}; wc.lpfnWndProc=procedure; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"ThunderDisplaySetup";
     wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=nullptr;
+    wc.hIcon=LoadIconW(wc.hInstance,MAKEINTRESOURCEW(IDI_THUNDERDISPLAY));
     background=CreateSolidBrush(theme.background); cardBackground=CreateSolidBrush(theme.card); fieldBackground=CreateSolidBrush(theme.field);
     if(!RegisterClassW(&wc) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) throw std::runtime_error("Cannot register setup window");
     window=CreateWindowExW(WS_EX_CONTROLPARENT,wc.lpszClassName,L"ThunderDisplay",WS_OVERLAPPEDWINDOW|WS_VSCROLL|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,840,960,nullptr,nullptr,wc.hInstance,this);
     if(!window) throw std::runtime_error("Cannot create setup window");
+    icons.apply(window);
     wc.lpszClassName=L"ThunderDisplaySetupContent"; wc.lpfnWndProc=contentProcedure;
     if(!RegisterClassW(&wc) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) throw std::runtime_error("Cannot register setup content");
     content=CreateWindowExW(WS_EX_CONTROLPARENT|WS_EX_COMPOSITED,wc.lpszClassName,L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN,
@@ -408,6 +410,7 @@ LRESULT SetupWindow::message(UINT m,WPARAM w,LPARAM l) {
         auto* info=reinterpret_cast<MINMAXINFO*>(l); info->ptMinTrackSize.x=MulDiv(680,int(dpi),96); info->ptMinTrackSize.y=MulDiv(400,int(dpi),96); return 0;
     }
     case WM_DPICHANGED: {
+        icons.apply(window);
         dpi=HIWORD(w); layoutWidth=-1; auto* r=reinterpret_cast<RECT*>(l); SetWindowPos(window,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER); layout(); return 0;
     }
     case WM_VSCROLL: {

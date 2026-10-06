@@ -7,6 +7,7 @@ fi
 mkdir -p "$task_root/mac-host/.build/module-cache" "$task_root/mac-host/.build/spm-cache"
 export CLANG_MODULE_CACHE_PATH="$task_root/mac-host/.build/module-cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
+xcrun swift -module-cache-path "$CLANG_MODULE_CACHE_PATH" "$task_root/scripts/generate-app-icons.swift"
 cd "$task_root/mac-host"
 swift build -c release --cache-path "$task_root/mac-host/.build/spm-cache" "$@"
 task_binary="$(swift build -c release --show-bin-path --cache-path "$task_root/mac-host/.build/spm-cache" "$@")"
@@ -17,6 +18,7 @@ mv "$task_app/Contents/MacOS/ThunderDisplayHost.new" "$task_app/Contents/MacOS/T
 cp "$task_root/mac-host/Info.plist" "$task_app/Contents/Info.plist"
 cp "$task_binary/ThunderDisplayBoot" "$task_app/Contents/MacOS/ThunderDisplayBoot"
 mkdir -p "$task_app/Contents/Library/LaunchAgents" "$task_app/Contents/Library/LaunchDaemons" "$task_app/Contents/Resources"
+cp "$task_root/mac-host/Resources/ThunderDisplay.icns" "$task_app/Contents/Resources/"
 cp "$task_root/mac-host/Services/dev.thunderdisplay.host.agent.plist" "$task_app/Contents/Library/LaunchAgents/"
 # Retire the old bundle daemon resource as well as its system registration.
 rm -f "$task_app/Contents/Library/LaunchDaemons/dev.thunderdisplay.boot.plist"

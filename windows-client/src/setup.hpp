@@ -3,6 +3,7 @@
 #include "displays.hpp"
 #include "setup_scroll.hpp"
 #include "ui_theme.hpp"
+#include "window_icons.hpp"
 #include <functional>
 #include <map>
 
@@ -13,6 +14,7 @@ std::wstring wide(const std::string& value);
 std::string utf8(const std::wstring& value);
 
 class SetupWindow {
+    WindowIcons icons;
     struct Control { HWND hwnd; int x,y,w,h; HFONT appliedFont=nullptr; int regionWidth=0,regionHeight=0; bool rounded=false; };
     std::vector<Control> controls;
     std::map<int,HWND> fields;

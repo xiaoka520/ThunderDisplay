@@ -1,6 +1,6 @@
-ThunderDisplay 0.8.14 · Windows 图形客户端 / Windows GUI client
+ThunderDisplay 0.8.15 · Windows 图形客户端 / Windows GUI client
 
-1. 最新构建为 0.8.14。双击 ThunderDisplay-GUI-0.8.14-x64.exe；中文 / English / 跟随系统。
+1. 最新构建为 0.8.15。双击 ThunderDisplay-GUI-0.8.15-x64.exe；中文 / English / 跟随系统。
    登录前键鼠修复需更新 Mac，并点击“更新开机组件与连接配置”以更新系统副本。
 2. 填写 Mac 网桥 IPv4 或留空自动发现；配对码默认关闭。
 3. 显示模式为“自动 / 自定义”；帧率由两端屏幕协商，上限240，目标不等于实测。
@@ -31,7 +31,7 @@ ThunderDisplay 0.8.14 · Windows 图形客户端 / Windows GUI client
 Windows 10 1703+ / Windows 11 x64；需Media Foundation / D3D11，Windows N需媒体组件。
 保留licenses目录。构建与协议/原生Mac测试通过，ROG原生主题、动态指针、GPU和两机图片粘贴待实机验收。
 
-Latest build: 0.8.14. Run the GUI EXE; pairing is optional on the bridge.
+Latest build: 0.8.15. Run the GUI EXE; pairing is optional on the bridge.
 Pre-login input requires the Mac update and Update startup components and connection settings, which updates the system copy.
 Caps Lock now also updates the Windows toggle state/keyboard LED; refocusing the display or recapturing input resynchronizes local state.
 Auto preserves Mac HiDPI source pixels. Custom changes resolution/bitrate; FPS follows detected displays.
@@ -86,3 +86,6 @@ Version 0.8.13: verified Mac speed priority permits at most two hardware admissi
 
 0.8.14：Mac 仅在首次验证视频通道时请求额外关键帧；重复 UDP 保活不再触发重编码。显式缺帧恢复仍有效。Windows 视频逻辑与 0.8.13 相同，兼容已更新的 Mac。
 Version 0.8.14: Mac requests an extra keyframe only on the first validated video-path probe, not on recurring keepalives. Explicit loss recovery remains available. Windows video behavior is unchanged from 0.8.13 and remains compatible with the updated Mac.
+
+0.8.15：Mac 与 Windows 共用根目录 ThunderDisplay.png 作为应用图标。Windows 程序文件、任务栏、设置与远程显示窗口均使用多尺寸图标，窗口图标支持系统缩放变化。
+Version 0.8.15: both applications use the shared ThunderDisplay.png artwork. Windows embeds a multi-resolution icon for Explorer, the taskbar and both windows, with DPI-aware window icons.

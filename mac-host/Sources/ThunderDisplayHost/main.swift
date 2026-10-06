@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     init(options: Options) { self.options = options }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let url = Bundle.main.url(forResource: "ThunderDisplay", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = icon
+        }
         log("Desktop app started: uid=\(geteuid()); startup=\(options.background ? "background" : "interactive")")
         let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
         let appMenu = NSMenu(title: "ThunderDisplay"), editMenu = NSMenu(title: ui("编辑", "Edit"))
