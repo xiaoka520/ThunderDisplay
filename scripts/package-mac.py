@@ -55,6 +55,7 @@ assert loginwindow['ProgramArguments'][0] == '/Library/Application Support/Thund
 desktop = plistlib.loads((app / 'Contents/Resources/dev.thunderdisplay.desktop.plist').read_bytes())
 assert desktop['Label'] == 'dev.thunderdisplay.desktop' and desktop['RunAtLoad'] is True
 assert desktop['LimitLoadToSessionType'] == 'Aqua' and 'UserName' not in desktop
+assert desktop['ProcessType'] == 'Interactive', 'Desktop streaming must not use background resource limits'
 assert desktop['ProgramArguments'] == ['/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost', '--background']
 archive = ROOT / 'dist' / f'ThunderDisplay-Mac-{version}-arm64.zip'
 files = [p for p in sorted(app.rglob('*')) if p.is_file()]
@@ -70,6 +71,10 @@ App 启动即自动运行主机，唤醒或显示器恢复后自动重建，不�
 默认开启“保持 Mac 可连接”，防止系统自动睡眠；屏幕可熄灭，开关可关闭。
 雷雳不支持网络唤醒；手动让 Mac 睡眠后需先唤醒 Mac，随后主机自动恢复。
 随系统启动需系统管理员确认，安装独立发现daemon与LoginWindow图形组件；检查有效帧和输入授权后接受连接，登录后桌面主机接管。
+0.8.11：视频发送与大帧复制移出键鼠队列，Windows收包与解码显示分开；积压有界，参考帧丢失后请求关键帧恢复。新增转色、编解码、发送和显示分段耗时日志。需要同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。
+0.8.14：首次视频通道探测补发关键帧，后续保活不再每两秒触发重编码；显式缺帧恢复保持有效。该修复位于Mac，Windows 0.8.13仍兼容。
+0.8.13：Mac验证速度优先后允许两帧有界硬件准入，仅保留最新捕获画面，并修正丢帧统计。桌面任务声明Interactive；串流活动期间声明低延迟活动，停止后释放。Windows大帧重组最短期限由25改为50毫秒，完整帧立即解码，缺包仍按有界期限恢复。请更新两端与开机组件。HiDPI、色深、色彩、码率与目标帧率不变，实际帧率须按运行统计确认。
+0.8.12：Mac只允许一帧进入硬件编码，完成后立即处理最新捕获帧。Windows收包、解码、显示分开；等待显示刷新时只保留最新已解码画面，不拖住解码。连接检查包含实际显示进度，每五秒向Mac回传各阶段耗时数值，不含画面或输入内容。需同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。
 0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
 0.8.8登录交接提速：每100毫秒检查登录完成，主动请求已安装且用户匹配的桌面任务，避免RunAtLoad等待；Windows收到有效交接通知后15秒内每250毫秒重试，优先复用Mac地址。保留最后一帧，无文字覆盖；需要更新两端与Mac开机组件，真实登录耗时仍需实测。
 0.8.2 登录前键鼠改用系统HID输入；安装后点击“更新开机组件与连接配置”更新系统副本。仅替换桌面App不足以更新登录前程序。

@@ -30,6 +30,10 @@ def validate_gui(data, version):
         raise ValueError("Missing authenticated session handover / retained GPU frame support")
     if b"brief video interruption" not in data or b"display.frame.gap" not in data or b"display.resize" not in data:
         raise ValueError("Missing retained live-frame repaint / local display diagnostics")
+    if b"video.latency" not in data or b"Initialize decoder apartment" not in data:
+        raise ValueError("Missing isolated media worker / stage latency diagnostics")
+    if b"Initialize presentation apartment" not in data or b"arrival_to_present_us_avg/max" not in data:
+        raise ValueError("Missing latest-picture presenter / real frame-age measurements")
     if "正在进入桌面".encode("utf-16-le") in data:
         raise ValueError("Login handover must retain the frame without a text overlay")
     for preset in ("缩放与边缘", "1:1 原始像素显示（窗口较小时裁剪画面）", "60 Hz · 高画质", "120 Hz · 超清", "165 Hz · 超清", "240 Hz · 低延迟"):

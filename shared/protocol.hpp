@@ -16,7 +16,7 @@ using Bytes = std::vector<uint8_t>;
 constexpr uint16_t Port = 47990;
 constexpr size_t HeaderSize = 40, FragmentSize = 1160, LegacyMaxFrameSize = 4 * 1024 * 1024, GigabitMaxFrameSize=16*1024*1024, MaxFrameSize = 64 * 1024 * 1024, ControlLimit = 4096;
 constexpr uint64_t LegacyMaxBitrate=1000000000, MaxBitrate = 20000000000ULL;
-enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide, SessionTransition, SessionTransitionAck };
+enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide, SessionTransition, SessionTransitionAck, VideoStatistics };
 enum class Codec : uint8_t { H264=1, HEVC=2, HEVC10=4 };
 
 // Optional UDP return-path probe; the existing TCP/UDP video wire format is unchanged.
@@ -142,7 +142,7 @@ class Reassembler {
     struct Pending { Frame frame; std::vector<bool> seen; size_t received=0; uint64_t since,deadline; };
     std::map<uint32_t,Pending> pending;
     uint64_t session; Codec codec; uint32_t last=0; bool haveLast=false, waitingKey=true, request=true;
-    static constexpr uint64_t DeadlineUS=25000;
+    static constexpr uint64_t DeadlineUS=25000, LargeFrameDeadlineUS=50000;
     size_t frameLimit; uint64_t bitrate;
     void lose() { pending.clear(); waitingKey=true; request=true; }
 public:
@@ -154,10 +154,13 @@ public:
         auto it=pending.find(h->id);
         if(it==pending.end()) {
             if(pending.size()>=3) { lose(); if(!h->key) return; }
-            // A large IDR cannot arrive in 25 ms at its requested bitrate.
-            // Keep delta-frame expiry short and bound IDR recovery to 300 ms.
+            // Requested encoder bitrate is not the observed network rate.
+            // Large desktop bursts and receiver scheduling can exceed 25 ms.
+            // Allow 50 ms for modern frames; complete frames never wait here.
+            // Missing references remain bounded by this expiry and three slots.
+            const auto minimum=frameLimit>LegacyMaxFrameSize?LargeFrameDeadlineUS:DeadlineUS;
             auto deadline=h->key && frameLimit>LegacyMaxFrameSize?
-                std::clamp<uint64_t>(uint64_t(h->size)*16000000/bitrate+10000,DeadlineUS,300000):DeadlineUS;
+                std::clamp<uint64_t>(uint64_t(h->size)*16000000/bitrate+10000,minimum,300000):minimum;
             it=pending.emplace(h->id, Pending{Frame{Bytes(h->size),h->id,h->pts,h->key},std::vector<bool>(h->count),0,now,deadline}).first;
         }
         auto& v=it->second;

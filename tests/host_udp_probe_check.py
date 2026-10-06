@@ -18,10 +18,40 @@ with tempfile.TemporaryDirectory(prefix='td-udp-check-') as directory:
         '-module-cache-path', str(folder / 'module-cache')]
     subprocess.run(compiler + ['-emit-library', '-emit-module', '-module-name', 'Wire',
         '-emit-module-path', str(folder / 'Wire.swiftmodule'),
-        str(ROOT / 'mac-host/Sources/Wire/Wire.swift'), str(ROOT / 'mac-host/Sources/Wire/Clipboard.swift'), str(ROOT / 'mac-host/Sources/Wire/Blob.swift'), '-o', str(folder / 'libWire.dylib')], env=env, check=True)
+        str(ROOT / 'mac-host/Sources/Wire/Wire.swift'), str(ROOT / 'mac-host/Sources/Wire/Clipboard.swift'), str(ROOT / 'mac-host/Sources/Wire/Blob.swift'), str(ROOT / 'mac-host/Sources/Wire/VideoMailbox.swift'), str(ROOT / 'mac-host/Sources/Wire/VideoStatistics.swift'), '-o', str(folder / 'libWire.dylib')], env=env, check=True)
     (folder / 'main.swift').write_text('''
 import AppKit
 import Wire
+// Exercise the production sender with a stalled transport: control stays free
+// and cancellation releases the duplicated UDP port before the send completes.
+func checkSenderIsolation() throws {
+    let fd=socket(AF_INET,SOCK_DGRAM,0); precondition(fd>=0)
+    try nonblocking(fd)
+    var endpoint=try address("127.0.0.1",port:0)
+    precondition(withAddress(&endpoint) { bind(fd,$0,$1) } == 0)
+    var length=socklen_t(MemoryLayout<sockaddr_in>.size)
+    precondition(withUnsafeMutablePointer(to:&endpoint) { p in p.withMemoryRebound(to:sockaddr.self,capacity:1) { getsockname(fd,$0,&length) } } == 0)
+    let entered=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0), finished=DispatchSemaphore(value:0)
+    let sender=try VideoSender(socket:fd,session:1,codec:.hevc,target:endpoint,fps:60,emit:{ _,cancelled in
+        entered.signal(); release.wait(); precondition(cancelled()); finished.signal(); return false
+    },onFailure:{ fatalError("Cancelled sends must not request old-session IDRs") })
+    precondition(sender.enqueue(OutgoingVideoFrame(data:Data([1]),pts:0,id:1,key:true)))
+    precondition(entered.wait(timeout:.now()+1) == .success)
+    let control=DispatchQueue(label:"sender-test-control"), responsive=DispatchSemaphore(value:0)
+    control.async {
+        precondition(sender.enqueue(OutgoingVideoFrame(data:Data([2]),pts:1,id:2,key:false)))
+        sender.stop(); responsive.signal()
+    }
+    let result=responsive.wait(timeout:.now()+1)
+    if result != .success { release.signal(); fatalError("Video work blocked control cancellation") }
+    close(fd)
+    let replacement=socket(AF_INET,SOCK_DGRAM,0); precondition(replacement>=0)
+    precondition(withAddress(&endpoint) { bind(replacement,$0,$1) } == 0, "Old sender retained the handover port")
+    close(replacement); release.signal()
+    precondition(finished.wait(timeout:.now()+1) == .success)
+    print("Production video sender isolation and immediate port release check passed")
+}
+try checkSenderIsolation()
 final class CaptureEngine: @unchecked Sendable {
     let codec: Codec
     let effectiveBitrate: UInt64
@@ -100,7 +130,7 @@ server.stop()
     # InputSupport; the production input module has separate event-level tests.
     (folder / 'HostServer.swift').write_text((sources / 'HostServer.swift').read_text().replace('import InputSupport\n', ''))
     subprocess.run(compiler + ['-I', directory, '-L', directory, '-lWire', '-Xlinker', '-rpath', '-Xlinker', directory,
-        str(folder / 'main.swift'), str(folder / 'HostServer.swift'), str(sources / 'Support.swift'),
+        str(folder / 'main.swift'), str(folder / 'HostServer.swift'), str(sources / 'Support.swift'), str(sources / 'VideoSender.swift'),
         '-framework', 'AppKit', '-framework', 'SystemConfiguration', '-o', str(folder / 'host-check')], env=env, check=True)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
@@ -160,13 +190,15 @@ server.stop()
             control(bytes([9, 4, 1]))
             latest = read_exact(struct.unpack('!I', read_exact(4))[0])
             assert latest[25] == 29, 'Legacy client must keep the video cursor'
-            for version in (6, 7, 8):
+            for version in (6, 7, 8, 9):
                 control(bytes([9, version, 1]))
                 modern = read_exact(struct.unpack('!I', read_exact(4))[0])
                 assert modern[25] == 253, f'Query{version} must preserve rich and sRGB flags'
             control(bytes([9, 5, 1]))
             rich = read_exact(struct.unpack('!I', read_exact(4))[0])
             assert rich[25] == 125, 'Rich cursor/image/20 Gbps feature bits missing'
+            control(bytes([9, 9, 1]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0])[25] == 253
             hello = struct.pack('!BHHHHHQB32s', 15, 2, udp.getsockname()[1], 4096, 2560, 144, 20000000000, 4, bytes(32))
             control(hello)
             welcome = read_exact(struct.unpack('!I', read_exact(4))[0])
@@ -192,6 +224,10 @@ server.stop()
                 assert typ == 13 and total == 4100 and offset == len(cursor)
                 cursor += packet[13:]
             assert cursor == bytes([0x7f])*4100
+            control(struct.pack('!BBQ9I', 19, 1, session, 100, 200, 300, 400, 500, 600, 700, 800, 2))
+            control(bytes([5]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([6]), 'v9 latency report broke the control channel'
+            print('Session-bound v9 Windows latency report accepted; control channel remains responsive')
             control(bytes([11, 1]))
             ack = read_exact(struct.unpack('!I', read_exact(4))[0])
             assert ack == bytes([11, 0]), 'Mac clipboard-off preference was not respected'
@@ -271,11 +307,42 @@ server.stop()
                     break
             else:
                 raise AssertionError('No complete keyframe after UDP probe')
-            # Even a Ready peer must be disconnected on session handover before
-            # its input reaches the fatal injection stub.
+            # Routine path keepalives must not trigger expensive keyframes.
+            # The same live session must still honor explicit recovery requests.
+            for _ in range(3):
+                udp.sendto(probe, ('127.0.0.1', video_port))
+                try:
+                    udp.recvfrom(1500)
+                    raise AssertionError('Repeated keepalive forced an unnecessary keyframe')
+                except socket.timeout:
+                    pass
+            recovery_request = bytes([4])  # Message.requestIDR
+            tcp.sendall(struct.pack('!I', len(recovery_request)) + recovery_request)
+            recovered = {}; recovery_id = None; deadline = time.monotonic()+3
+            while time.monotonic() < deadline:
+                data, sender = udp.recvfrom(1500)
+                h = struct.unpack('!IBBHQIQIHHHH', data[:40])
+                _, _, _, flags, sid, fid, _, size, index, count, length, _ = h
+                assert sender == ('127.0.0.1', video_port) and sid == session and flags == 1
+                assert fid > frame_id and size == 180000 and len(data) == 40+length
+                if recovery_id is None: recovery_id = fid
+                assert fid == recovery_id
+                recovered[index] = data[40:]
+                if len(recovered) == count:
+                    assert b''.join(recovered[i] for i in range(count)) == payload
+                    print('Repeated video keepalives do not re-encode; explicit IDR recovery remains functional')
+                    break
+            else:
+                raise AssertionError('Explicit recovery request did not produce a complete keyframe')
+            # A v9 Ready peer is notified of handover before its input can reach
+            # the fatal injection stub; diagnostic reports must not block it.
             (folder / 'allow-input').unlink()
             control(struct.pack('!BBHHii', 3, 3, 65, 1, 0, 0))
-            assert tcp.recv(1) == b'', 'Old-session input was not rejected'
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([17]) + struct.pack('!Q', session) + bytes([1]), 'Old-session input did not trigger handover'
+            control(struct.pack('!BBQ9I', 19, 1, session, 100, 200, 300, 400, 500, 600, 700, 800, 2))
+            control(bytes([18]) + struct.pack('!Q', session) + bytes([1]))
+            control(bytes([5]))
+            assert read_exact(struct.unpack('!I', read_exact(4))[0]) == bytes([6]), 'Late statistics blocked handover control'
             assert process.poll() is None, 'Denied input reached the injection stub'
             assert not (folder / 'keyboard-received').exists(), 'Denied input was logged as accepted keyboard input'
         # When the system input backend fails, the real server must report the

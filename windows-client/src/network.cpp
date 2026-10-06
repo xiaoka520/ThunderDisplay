@@ -1,6 +1,7 @@
 #include "network.hpp"
 #include <iphlpapi.h>
 #include "control_outbox.hpp"
+#include "video_worker.hpp"
 
 namespace {
 struct Socket {
@@ -207,14 +208,13 @@ void ClientSession::connectAndStream(const std::string& host) {
         sender->stop();
     }};
     sender->send(querying?capabilityQuery:td::hello(options.settings,ntohs(local.sin_port),options.token));
-    td::ControlFramer framer; std::unique_ptr<Decoder> decoder; std::unique_ptr<td::Reassembler> assembler;
+    td::ControlFramer framer; std::unique_ptr<VideoWorker> decoder; std::unique_ptr<td::Reassembler> assembler;
     uint64_t accepted=micros(),lastControl=accepted,lastPing=accepted,lastIDR=0,lastFrame=accepted;
     uint64_t sessionID=0,videoPackets=0,completeFrames=0,readyAt=0,lastStatus=0,lastProbe=0,lastDiagnostic=0;
     td::Codec codec=td::Codec::H264;
     sockaddr_in videoEndpoint=remote; bool haveVideoPort=false;
     std::string streamDescription;
     std::string sourceDescription;
-    bool awaitingKey=true;
     bool clipboardSupported=false,nativeNegotiated=false,largeFrames=false,cursorSupported=false,richFeatures=false,desktopSRGB=false;
     bool confirmedFrame=false;
     bool transitionReceived=false;
@@ -250,14 +250,7 @@ void ClientSession::connectAndStream(const std::string& host) {
     auto drainFrames=[&] {
         while(auto frame=assembler->next(micros())) {
             ++completeFrames;
-            if(awaitingKey && !frame->key) continue;
-            if(frame->key && awaitingKey) {
-                // A fresh decoder already waits for its first IDR. Flushing here
-                // used to discard the async decoder's initial input-ready events.
-                if(decoder->submittedFrames()) decodeOperation([&] { decoder->flush(); });
-                awaitingKey=false;
-            }
-            if(!decodeOperation([&] { return decoder->submit(std::move(*frame)); })) { awaitingKey=true; wantIDR=true; }
+            if(!decoder->submit(std::move(*frame))) wantIDR=true;
             else lastFrame=micros();
         }
     };
@@ -277,12 +270,18 @@ void ClientSession::connectAndStream(const std::string& host) {
         expireHandover();
         checkRecoveryDeadline();
         sender->checkFailure();
+        if(decoder) {
+            decodeOperation([&] { decoder->checkFailure(); });
+            if(decoder->takeIDRRequest()) wantIDR=true;
+        }
         if(overflow) throw std::runtime_error("Input queue overflow; reconnecting to release held keys");
         auto now=micros();
         if(decoder && decoder->decodedFrames()!=decodedCount) {
-            decodedCount=decoder->decodedFrames(); lastDecoded=now;
-            if(videoInterrupted.exchange(false)) diagnosticLog("video.resumed","decoded="+std::to_string(decodedCount));
+            decodedCount=decoder->decodedFrames(); lastDecoded=decoder->lastDecodedAt();
         }
+        if(videoInterrupted && renderer.hasFrame() && td::VideoHealth::fresh(now,lastDecoded) && videoInterrupted.exchange(false))
+            diagnosticLog("video.resumed","decoded="+std::to_string(decodedCount));
+        const auto lastLive=confirmedFrame?std::min(lastDecoded,renderer.lastPresentation()):lastDecoded;
         if(!transitionReceived && !confirmedFrame && renderer.hasFrame()) {
             holdingFrame=false; handoverHold.clear();
             lastStreamHost=host;
@@ -290,7 +289,7 @@ void ClientSession::connectAndStream(const std::string& host) {
             PostMessageW(window,FramePresentedMessage,0,0);
         }
         sender->allowInput(online && !transitionReceived && !holdingFrame && renderer.hasFrame());
-        if(!transitionReceived && confirmedFrame && !td::VideoHealth::fresh(now,lastDecoded) && !videoInterrupted.exchange(true)) {
+        if(!transitionReceived && confirmedFrame && !td::VideoHealth::fresh(now,lastLive) && !videoInterrupted.exchange(true)) {
             sender->allowInput(false);
             // This is still the same control session. Hold pixels without
             // refreshing frame health or opening the setup window. The 12s
@@ -299,7 +298,7 @@ void ClientSession::connectAndStream(const std::string& host) {
             renderer.resetFrame(true,true,"brief video interruption"); wantIDR=true;
             PostMessageW(window,ReleaseInputMessage,0,0);
         }
-        if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastDecoded)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
+        if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastLive)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
         if(now-lastControl>10000000 || (!decoder && now-accepted>15000000)) throw std::runtime_error("Host timed out");
         if(decoder && now-lastProbe>(haveVideoPort?2000000u:500000u)) {
             auto probe=td::videoProbe(sessionID); auto& target=haveVideoPort?videoEndpoint:remote;
@@ -315,9 +314,17 @@ void ClientSession::connectAndStream(const std::string& host) {
                 " submitted="+std::to_string(decoder->submittedFrames())+" decoded="+std::to_string(decoder->decodedFrames())+
                 " decode_gap_us="+std::to_string(now-lastDecoded)+" live="+std::to_string(renderer.hasFrame()));
             lastDiagnostic=now;
+            if(online && options.capabilityVersion>=9) {
+                auto decode=decoder->decodeLatency(); auto display=renderer.presentationLatency();
+                td::Writer report; report.put(uint8_t(td::Message::VideoStatistics)); report.put(uint8_t(1)); report.put(sessionID);
+                const uint32_t values[]={decode.queueAverage,decode.queueMaximum,decode.decodeAverage,decode.decodeMaximum,
+                    display.renderAverage,display.renderMaximum,display.ageAverage,display.ageMaximum};
+                for(auto value:values) report.put(std::min<uint32_t>(value,60000000));
+                report.put(uint32_t(std::min<uint64_t>(display.replaced,UINT32_MAX))); send(std::move(report.data));
+            }
         }
-        if(decoder && !renderer.hasFrame() && decoder->decodedFrames()==0 && now-readyAt>12000000) {
-            if(completeFrames && (nativeNegotiated || td::fallbackCodecMask(codec,options.settings.codecMask,options.colorDepth)))
+        if(decoder && !confirmedFrame && !renderer.hasFrame() && now-readyAt>12000000) {
+            if(!decoder->decodedFrames() && completeFrames && (nativeNegotiated || td::fallbackCodecMask(codec,options.settings.codecMask,options.colorDepth)))
                 throw std::runtime_error(failureWithFallback(codec,"first frame decode timed out"));
             throw std::runtime_error(std::string("First frame timed out: ")+stageText()+" | Video packets: "+std::to_string(videoPackets)+
                 " | Complete frames: "+std::to_string(completeFrames)+" | Submitted: "+std::to_string(decoder->submittedFrames()));
@@ -341,16 +348,19 @@ void ClientSession::connectAndStream(const std::string& host) {
                 if(type==td::Message::SessionTransition) {
                     if(options.capabilityVersion<8 || !decoder || !td::validSessionTransition(message,sessionID))
                         throw std::runtime_error("Invalid session transition notice");
+                    // Gate and retire input immediately, before any media join.
+                    online=false; clipboardOnline=false; localCursorActive=false;
+                    sender->transition(sessionID);
                     if(!transitionReceived) {
+                        // Retire all media work before freezing the snapshot;
+                        // no late old-session Present may overwrite it.
+                        decoder->stop();
                         retryBudget.sessionTransition(micros());
                         if(confirmedFrame && renderer.resetFrame(true,false,"authenticated session handover")) {
                             handoverHold.begin(micros()); holdingFrame=true;
                         }
                     }
-                    transitionReceived=true; online=false; clipboardOnline=false; localCursorActive=false;
-                    // Retire queued input before acknowledging the session notice.
-                    // A partially sent framed message must finish to keep framing intact.
-                    sender->transition(sessionID);
+                    transitionReceived=true;
                     PostMessageW(window,DisconnectedMessage,0,0); continue;
                 }
                 if(type==td::Message::Failure) {
@@ -388,7 +398,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                     td::Welcome welcome(message);
                     sessionID=welcome.session; codec=welcome.codec;
                     if(!(options.settings.codecMask&uint8_t(welcome.codec))) throw std::runtime_error("Host selected an unrequested codec");
-                    try { renderer.configureBitDepth(welcome.settings.bitDepth); decoder=std::make_unique<Decoder>(renderer,welcome,desktopSRGB); }
+                    try { renderer.configureBitDepth(welcome.settings.bitDepth); decoder=std::make_unique<VideoWorker>(renderer,welcome,desktopSRGB); }
                     catch(const std::exception& e) {
                         throw std::runtime_error(failureWithFallback(welcome.codec,e.what()));
                     }
@@ -454,9 +464,8 @@ void ClientSession::connectAndStream(const std::string& host) {
         }
         if(assembler) {
             drainFrames();
-            if(assembler->takeIDRRequest()) { wantIDR=true; awaitingKey=true; }
+            if(assembler->takeIDRRequest()) { wantIDR=true; decoder->requestKey(); }
         }
-        if(decoder) decodeOperation([&] { decoder->pump(); });
     }
     // Closing TCP releases all pressed keys/buttons on the host, including on exit.
 }

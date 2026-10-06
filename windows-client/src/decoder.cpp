@@ -69,7 +69,7 @@ void Decoder::outputType() {
     }
     throw std::runtime_error(welcome.codec==td::Codec::HEVC10?"Decoder exposes no 10-bit P010 output":"Decoder exposes no NV12 output");
 }
-void Decoder::input(const td::Frame& frame) {
+void Decoder::input(const td::Frame& frame,uint64_t arrivedAt) {
     ComPtr<IMFSample> sample; check(MFCreateSample(&sample),"Create compressed sample");
     ComPtr<IMFMediaBuffer> buffer; check(MFCreateMemoryBuffer(DWORD(frame.data.size()),&buffer),"Create compressed buffer");
     BYTE* data; check(buffer->Lock(&data,nullptr,nullptr),"Lock compressed buffer");
@@ -83,6 +83,8 @@ void Decoder::input(const td::Frame& frame) {
     if(hr==MF_E_NOTACCEPTING && !async) { while(output()) {} hr=transform->ProcessInput(inputID,sample.Get(),0); }
     check(hr,"Submit compressed frame");
     ++inputs;
+    arrivals.emplace_back(frame.pts,arrivedAt);
+    if(arrivals.size()>128) arrivals.pop_front();
     discontinuity=false;
 }
 bool Decoder::output() {
@@ -102,6 +104,12 @@ bool Decoder::output() {
     check(hr,"Decode output");
     if(sample) {
         ++outputs; latestOutput=std::move(sample); latestWidth=outputWidth; latestHeight=outputHeight;
+        LONGLONG timestamp=0; latestArrivedAt=0;
+        if(SUCCEEDED(latestOutput->GetSampleTime(&timestamp)) && timestamp>=0) {
+            const auto pts=uint64_t(timestamp)/10;
+            while(!arrivals.empty() && arrivals.front().first<pts) arrivals.pop_front();
+            if(!arrivals.empty() && arrivals.front().first==pts) { latestArrivedAt=arrivals.front().second; arrivals.pop_front(); }
+        }
     }
     return true;
     }
@@ -112,16 +120,20 @@ void Decoder::presentLatest() {
     // Consume every codec output to preserve reference dependencies, but do not
     // wait for Present once per obsolete output during a decoder event burst.
     auto sample=std::move(latestOutput);
-    renderer.present(sample.Get(),latestWidth,latestHeight,welcome.settings.fps);
+    const auto began=micros();
+    renderer.present(sample.Get(),latestWidth,latestHeight,welcome.settings.fps,latestArrivedAt);
+    presentationTime+=micros()-began;
 }
-bool Decoder::submit(td::Frame frame) {
-    if(!async) { input(frame); while(output()) {} presentLatest(); return true; }
+bool Decoder::submit(td::Frame frame,uint64_t arrivedAt) {
+    renderer.checkFailure();
+    if(!async) { input(frame,arrivedAt); while(output()) {} presentLatest(); return true; }
     // Consume newly available input credits before judging the queue as stalled.
     pump();
     if(pending.size()>=2) { flush(); return false; }
-    pending.push_back(std::move(frame)); return pump();
+    pending.push_back({std::move(frame),arrivedAt}); return pump();
 }
 bool Decoder::pump() {
+    renderer.checkFailure();
     if(!async) return true;
     for(unsigned i=0;i<64;++i) {
         ComPtr<IMFMediaEvent> event; auto hr=events->GetEvent(MF_EVENT_FLAG_NO_WAIT,&event);
@@ -132,12 +144,12 @@ bool Decoder::pump() {
         if(type==METransformNeedInput) ++credits;
         if(type==METransformHaveOutput) output();
     }
-    while(credits && !pending.empty()) { input(pending.front()); pending.pop_front(); --credits; }
+    while(credits && !pending.empty()) { input(pending.front().frame,pending.front().arrivedAt); pending.pop_front(); --credits; }
     presentLatest();
     return true;
 }
 void Decoder::flush() {
-    pending.clear(); latestOutput.Reset(); credits=0; discontinuity=true;
+    pending.clear(); arrivals.clear(); latestOutput.Reset(); credits=0; discontinuity=true;
     check(transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH,0),"Flush decoder");
     if(async) {
         ComPtr<IMFMediaEvent> event;

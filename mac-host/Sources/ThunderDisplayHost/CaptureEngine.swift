@@ -8,11 +8,13 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     let codec: Codec
     private(set) var effectiveBitrate: UInt64
     private(set) var maximumFrameQP: Int?
+    private(set) var encodingSpeedPrioritized = false
     let desktopSRGB: Bool
     private let cursorVisible: Bool
     private let hello: Hello, queue: DispatchQueue
     // RGB transfer and VT submission can block. Keep socket/input delivery on
-    // the original queue; admit at most one frame to this worker.
+    // the original queue. At most two hardware admissions overlap transfer and
+    // encoding; capture keeps only the newest image instead of a frame FIFO.
     private let encoderWork = DispatchQueue(label: "ThunderDisplay.encoder", qos: .userInteractive)
     private var compression: VTCompressionSession?, stream: SCStream?
     private var transfer: VTPixelTransferSession?, tenBitPool: CVPixelBufferPool?
@@ -24,17 +26,42 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         guard let hello = try? Hello(w.data), let engine = try? CaptureEngine(hello: hello, codec: .hevc10, queue: queue) else { return false }
         queue.sync { engine.stop() }; return true
     }()
-    private var busy = false, forceKey = true, stopped = false
-    var active = false
+    private var forceKey = true, stopped = false
+    private final class Admission {
+        let id: UInt64, began = DispatchTime.now().uptimeNanoseconds
+        init(_ id: UInt64) { self.id=id }
+    }
+    private var admissions: [UInt64: Admission] = [:], nextAdmission: UInt64 = 0
+    private(set) var hardwareAdmissionLimit = 1
+    private var streamingActivity: NSObjectProtocol?
+    var active = false {
+        didSet {
+            guard oldValue != active else { return }
+            if active, !stopped {
+                streamingActivity = ProcessInfo.processInfo.beginActivity(
+                    options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                    reason: "ThunderDisplay interactive desktop streaming")
+            } else if let streamingActivity {
+                ProcessInfo.processInfo.endActivity(streamingActivity); self.streamingActivity = nil
+            }
+        }
+    }
     private(set) var contentRect = CGRect.zero
     var onFrame: ((Data, UInt64, Bool) -> Bool)?
     var onFailure: ((String) -> Void)?
     var onFormat: ((CMFormatDescription) -> Void)?
     private var origin: CMTime?
     private var latestImage: CVPixelBuffer?, latestTime = CMTime.zero, lastPresentation: CMTime?
-    private var submitted = 0, dropped = 0, encoded = 0
+    private var latestImagePending = false
+    private var submitted = 0, dropped = 0, encoded = 0, captured = 0
+    private var keyFrames = 0, keyRequests = 0, encodedBytes = 0
     private var consecutiveEncoderDrops = 0
     private var lastStats = DispatchTime.now().uptimeNanoseconds
+    // Each stage has its own count because VT submission and completion are
+    // asynchronous. All aggregates are updated on the control queue.
+    private var latencyTotals = [UInt64](repeating: 0, count: 7)
+    private var latencyMaxima = [UInt64](repeating: 0, count: 7)
+    private var latencyCounts = [UInt64](repeating: 0, count: 7)
     private static let background = CGColor(gray: 0, alpha: 1)
 
     init(hello: Hello, codec: Codec, queue: DispatchQueue, cursorVisible: Bool = true, desktopSRGB: Bool = false) throws {
@@ -45,17 +72,18 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         var status: OSStatus = -1
         // Low-latency rate control can accept tall frames / very high bitrates
         // but drop every frame. Use normal hardware rate control for these
-        // sessions; no B frames and one-frame admission still bound latency.
+        // sessions; no B frames and bounded admission still bound latency.
         for lowLatency in (hello.height > 2304 || hello.bitrate > 300_000_000 ? [false] : [true, false]) {
             var spec: [CFString: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true]
             if lowLatency { spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true }
             status = VTCompressionSessionCreate(allocator: nil, width: Int32(hello.width), height: Int32(hello.height),
             codecType: codec == .h264 ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC,
             encoderSpecification: spec as CFDictionary, imageBufferAttributes: [kCVPixelBufferPixelFormatTypeKey: codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] as CFDictionary, compressedDataAllocator: nil,
-            outputCallback: { context, _, status, info, sample in
-                guard let context else { return }
+            outputCallback: { context, source, status, info, sample in
+                guard let context, let source else { return }
                 let engine = Unmanaged<CaptureEngine>.fromOpaque(context).takeUnretainedValue()
-                engine.queue.async { engine.output(status: status, info: info, sample: sample) }
+                let admission = Unmanaged<Admission>.fromOpaque(source).takeUnretainedValue()
+                engine.receiveOutput(status: status, info: info, sample: sample, admission: admission)
             }, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &compression)
             if status == noErr { break }
             if let compression { VTCompressionSessionInvalidate(compression) }; compression = nil
@@ -64,14 +92,25 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         do {
             try set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-            // Desktop edges benefit from quality-first encoding; preserve one-frame admission.
-            let qualityStatus = VTSessionSetProperty(compression, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanFalse)
-            if qualityStatus != noErr { log("Encoder does not expose quality priority (\(qualityStatus))") }
             try configureBitrate()
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: hello.fps))
             try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: max(1, Int(hello.fps) / 2)))
             try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 0.5))
             try set(kVTCompressionPropertyKey_ProfileLevel, codec == .hevc10 ? kVTProfileLevel_HEVC_Main10_AutoLevel : codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
+            // Resolve the actual codec/profile before configuring its speed
+            // property. A high-rate desktop needs bounded work per frame;
+            // retain the bitrate and QP ceiling rather than deep codec search.
+            let speedStatus = VTSessionSetProperty(compression, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+            if speedStatus == noErr {
+                var value: Unmanaged<CFTypeRef>?
+                let copied = VTSessionCopyProperty(compression, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, allocator: nil, valueOut: &value)
+                let property = value?.takeRetainedValue()
+                encodingSpeedPrioritized = copied == noErr && (property as? NSNumber)?.boolValue == true
+                // Slow quality-first encoders retain the single-frame bound.
+                // Enable the second pipeline slot only with verified speed mode.
+                if encodingSpeedPrioritized { hardwareAdmissionLimit = 2 }
+                log(encodingSpeedPrioritized ? "Encoder speed priority enabled and verified" : "Encoder accepted speed priority; readback unavailable")
+            } else { log("Encoder does not expose speed priority (\(speedStatus)); bounded admission remains active") }
             configureDetailPreservation()
             try set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
             try set(kVTCompressionPropertyKey_TransferFunction, desktopSRGB ? kCVImageBufferTransferFunction_sRGB : kCVImageBufferTransferFunction_ITU_R_709_2)
@@ -92,7 +131,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                 guard poolStatus == kCVReturnSuccess else { throw HostError("10-bit pixel pool unavailable: \(poolStatus)") }
             }
             let delay = VTSessionSetProperty(compression, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 1))
-            if delay != noErr { log("Encoder does not expose MaxFrameDelayCount (\(delay)); one frame admission limit remains active") }
+            if delay != noErr { log("Encoder does not expose MaxFrameDelayCount (\(delay)); bounded hardware admission remains active") }
             let prepared = VTCompressionSessionPrepareToEncodeFrames(compression)
             guard prepared == noErr else { throw HostError("Prepare encoder: \(prepared)") }
         } catch { VTCompressionSessionInvalidate(compression); self.compression = nil; throw error }
@@ -203,18 +242,24 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         return display.displayID
     }
     func stop() {
-        stopped = true; active = false; onFrame = nil; onFailure = nil; onFormat = nil; onInputFormat = nil; latestImage = nil
-        // Drain the admitted frame before disposing its transfer/session. The
+        stopped = true; active = false; onFrame = nil; onFailure = nil; onFormat = nil; onInputFormat = nil; latestImage = nil; latestImagePending = false
+        // Drain admitted frames before disposing their transfer/session. The
         // worker posts results asynchronously and never waits on the socket queue.
         encoderWork.sync {}
         if let transfer { VTPixelTransferSessionInvalidate(transfer) }; transfer = nil; tenBitPool = nil
-        if let compression { VTCompressionSessionInvalidate(compression) }; compression = nil
+        if let compression {
+            VTCompressionSessionCompleteFrames(compression, untilPresentationTimeStamp: .invalid)
+            VTCompressionSessionInvalidate(compression)
+        }; compression = nil
+        // Invalidation prevents later callbacks from dereferencing the refcon.
+        admissions.removeAll()
         if let stream { Task { try? await stream.stopCapture() } }; stream = nil
     }
     func requestIDR() {
+        keyRequests += 1
         forceKey = true
         // Ready and packet loss can occur while the desktop is idle.
-        if active, !stopped, !busy, let latestImage {
+        if active, !stopped, admissions.count < hardwareAdmissionLimit, let latestImage {
             encodeImage(latestImage, time: origin == nil ? latestTime : CMClockGetTime(CMClockGetHostTimeClock()))
         }
     }
@@ -226,14 +271,19 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int, status == SCFrameStatus.complete.rawValue,
               let image = CMSampleBufferGetImageBuffer(sample) else { return }
-        latestImage = image; latestTime = CMSampleBufferGetPresentationTimeStamp(sample)
+        // An initially busy capture may still be encoded on completion. Count
+        // it as discarded only when a newer capture actually replaces it.
+        if active, latestImagePending { dropped += 1 }
+        latestImage = image; latestTime = CMSampleBufferGetPresentationTimeStamp(sample); latestImagePending = true
         guard active else { return }
-        guard !busy else { dropped += 1; return }
+        captured += 1
+        guard admissions.count < hardwareAdmissionLimit else { return }
         encodeImage(image, time: CMSampleBufferGetPresentationTimeStamp(sample))
     }
     // Also used by the permission-free synthetic hardware encoder diagnostic.
     func encodeImage(_ image: CVPixelBuffer, time: CMTime) {
-        guard active, !stopped, let compression, !busy else { return }
+        guard active, !stopped, let compression, admissions.count < hardwareAdmissionLimit else { return }
+        if latestImage === image { latestImagePending = false }
         onInputFormat?(CVPixelBufferGetPixelFormatType(image))
         if origin == nil { origin = time }
         var presentation = CMTimeSubtract(time, origin!)
@@ -241,24 +291,35 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             presentation = CMTimeAdd(lastPresentation, CMTime(value: 1, timescale: 1_000_000))
         }
         lastPresentation = presentation
-        busy = true; submitted += 1
+        submitted += 1; nextAdmission &+= 1
+        let admission = Admission(nextAdmission); admissions[admission.id] = admission
+        let sourceAge = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()),time))
+        if sourceAge.isFinite, sourceAge >= 0, sourceAge < 10 { recordLatency(6,UInt64(sourceAge*1_000_000_000)) }
         let props = forceKey ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         forceKey = false
         let timestamp = presentation
         encoderWork.async { [self] in
-            do { try encodeAdmittedImage(image, compression: compression, time: timestamp, properties: props) }
+            let began = DispatchTime.now().uptimeNanoseconds
+            do {
+                let timing = try encodeAdmittedImage(image, compression: compression, time: timestamp, properties: props, admission: admission)
+                queue.async { [self] in
+                    guard !stopped else { return }
+                    recordLatency(0, began-admission.began); recordLatency(1, timing.transfer); recordLatency(2, timing.submit)
+                }
+            }
             catch {
                 let reason = error.localizedDescription
                 queue.async { [self] in
                     guard !stopped else { return }
-                    busy = false; forceKey = true; onFailure?(reason)
+                    admissions.removeValue(forKey: admission.id); forceKey = true; onFailure?(reason)
                 }
             }
         }
     }
     private func encodeAdmittedImage(_ image: CVPixelBuffer, compression: VTCompressionSession,
-                                     time: CMTime, properties: CFDictionary?) throws {
+                                     time: CMTime, properties: CFDictionary?, admission: Admission) throws -> (transfer: UInt64, submit: UInt64) {
         var input = image
+        var transferTime: UInt64 = 0
         let format = CVPixelBufferGetPixelFormatType(image)
         let expectedYUV = codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         if (codec == .hevc10 || desktopSRGB) && format != expectedYUV {
@@ -276,41 +337,87 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             var converted: CVPixelBuffer?
             let allocated = CVPixelBufferPoolCreatePixelBuffer(nil, tenBitPool, &converted)
             guard allocated == kCVReturnSuccess, let converted else { throw HostError("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): YUV buffer allocation failed (\(allocated))") }
+            let began = DispatchTime.now().uptimeNanoseconds
             let result = VTPixelTransferSessionTransferImage(transfer, from: image, to: converted)
+            transferTime = DispatchTime.now().uptimeNanoseconds-began
             guard result == noErr else { throw HostError("\(desktopSRGB ? "DesktopColorUnavailable" : "Main10Unavailable"): RGB to YUV conversion failed (\(result))") }
             input = converted
         }
+        let began = DispatchTime.now().uptimeNanoseconds
         let result = VTCompressionSessionEncodeFrame(compression, imageBuffer: input, presentationTimeStamp: time,
-            duration: CMTime(value: 1, timescale: CMTimeScale(hello.fps)), frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: nil)
+            duration: CMTime(value: 1, timescale: CMTimeScale(hello.fps)), frameProperties: properties,
+            sourceFrameRefcon: Unmanaged.passUnretained(admission).toOpaque(), infoFlagsOut: nil)
         guard result == noErr else { throw HostError("Encode frame: \(result)") }
+        return (transferTime, DispatchTime.now().uptimeNanoseconds-began)
     }
-    private func output(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?) {
-        defer { busy = false }
+    private struct PackedOutput {
+        var frame: Data?, format: CMFormatDescription?, failure: String?
+        var key = false, pts: UInt64 = 0
+    }
+    private func receiveOutput(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?, admission: Admission) {
+        let received = DispatchTime.now().uptimeNanoseconds
+        // Large Annex B copies belong on the encoder worker too. The control
+        // queue only receives the immutable result and enqueues it for sending.
+        encoderWork.async { [self] in
+            let began = DispatchTime.now().uptimeNanoseconds
+            var packed = PackedOutput()
+            if status == noErr, !info.contains(.frameDropped), let sample, CMSampleBufferDataIsReady(sample) {
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+                packed.key = !((attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
+                packed.format = CMSampleBufferGetFormatDescription(sample)
+                do { packed.frame = try annexB(sample, key: packed.key) }
+                catch { packed.failure = String(describing: error) }
+                packed.pts = UInt64(max(0, CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))) * 1_000_000)
+            }
+            let finished = DispatchTime.now().uptimeNanoseconds, result = packed
+            queue.async { [self] in
+                output(status: status, info: info, packed: result, received: received, packing: finished-began, finished: finished, admission: admission)
+            }
+        }
+    }
+    private func recordLatency(_ index: Int, _ value: UInt64) {
+        latencyTotals[index] &+= value; latencyCounts[index] += 1
+        latencyMaxima[index] = max(latencyMaxima[index], value)
+    }
+    private func output(status: OSStatus, info: VTEncodeInfoFlags, packed: PackedOutput, received: UInt64, packing: UInt64, finished: UInt64, admission: Admission) {
+        defer {
+            admissions.removeValue(forKey: admission.id)
+            // A frame that changed during encoding need not wait for the next
+            // ScreenCaptureKit tick. Take the freshest image, never replay a FIFO.
+            if active, !stopped, admissions.count < hardwareAdmissionLimit,
+               latestImagePending, let latestImage {
+                encodeImage(latestImage,time:latestTime)
+            }
+        }
         guard !stopped, active else { return }
+        recordLatency(3, received-admission.began)
+        recordLatency(4, packing); recordLatency(5, DispatchTime.now().uptimeNanoseconds-finished)
         guard status == noErr else { forceKey = true; onFailure?("Hardware encoder callback failed (\(status)); \(hello.width)×\(hello.height)"); return }
-        guard !info.contains(.frameDropped), let sample, CMSampleBufferDataIsReady(sample) else {
+        if let failure = packed.failure { forceKey = true; onFailure?("Bitstream conversion: \(failure)"); return }
+        guard !info.contains(.frameDropped), let frame = packed.frame else {
             forceKey = true; consecutiveEncoderDrops += 1
             log("Hardware encoder dropped frame \(consecutiveEncoderDrops); \(hello.width)×\(hello.height), flags \(info.rawValue)")
             if consecutiveEncoderDrops >= 6 { onFailure?("Hardware encoder repeatedly dropped frames at \(hello.width)×\(hello.height)") }
             return
         }
         consecutiveEncoderDrops = 0
-        do {
-            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
-            let key = !((attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
-            if let format = CMSampleBufferGetFormatDescription(sample) { onFormat?(format) }
-            let frame = try annexB(sample, key: key)
-            let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
-            let pts = UInt64(max(0, seconds) * 1_000_000)
-            if frame.count > ProtocolWire.maxFrameSize || onFrame?(frame, pts, key) != true { forceKey = true; dropped += 1 }
-            else { encoded += 1 }
-            let now = DispatchTime.now().uptimeNanoseconds
-            if now - lastStats >= 5_000_000_000 {
-                let elapsed = Double(now - lastStats) / 1_000_000_000
-                log(String(format: "Encoded %.1f fps, admitted %d, dropped %d, %@", Double(encoded)/elapsed, submitted, dropped, String(describing: codec)))
-                lastStats = now; submitted = 0; dropped = 0; encoded = 0
-            }
-        } catch { forceKey = true; onFailure?("Bitstream conversion: \(error)") }
+        if let format = packed.format { onFormat?(format) }
+        if frame.count > ProtocolWire.maxFrameSize || onFrame?(frame, packed.pts, packed.key) != true { forceKey = true; dropped += 1 }
+        else { encoded += 1; encodedBytes += frame.count; if packed.key { keyFrames += 1 } }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now - lastStats >= 5_000_000_000 {
+            let elapsed = Double(now - lastStats) / 1_000_000_000
+            log(String(format: "Encoded %.1f fps, admitted %d, dropped %d, %@; captured %.1f fps", Double(encoded)/elapsed, submitted, dropped, String(describing: codec), Double(captured)/elapsed))
+            log("Video recovery: keyframes \(keyFrames), key requests \(keyRequests), bytes per frame \(encodedBytes/max(1,encoded))")
+            let names = ["worker queue", "RGB transfer", "VT submit", "admission to callback", "bitstream copy", "control return", "capture age"]
+            let stages = names.indices.map { index in
+                "\(names[index]) \(latencyTotals[index]/max(1,latencyCounts[index])/1000)/\(latencyMaxima[index]/1000)"
+            }.joined(separator: "; ")
+            log("Encoder latency us avg/max: \(stages)")
+            latencyTotals = [UInt64](repeating: 0, count: 7); latencyMaxima = latencyTotals; latencyCounts = latencyTotals
+            lastStats = now; submitted = 0; dropped = 0; encoded = 0; captured = 0
+            keyFrames = 0; keyRequests = 0; encodedBytes = 0
+        }
     }
     private func annexB(_ sample: CMSampleBuffer, key: Bool) throws -> Data {
         guard let format = CMSampleBufferGetFormatDescription(sample), let block = CMSampleBufferGetDataBuffer(sample) else { throw HostError("Missing encoded data") }
@@ -346,5 +453,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         return result
     }
-    deinit { if let compression { VTCompressionSessionInvalidate(compression) } }
+    deinit {
+        if let streamingActivity { ProcessInfo.processInfo.endActivity(streamingActivity) }
+        if let compression { VTCompressionSessionInvalidate(compression) }
+    }
 }

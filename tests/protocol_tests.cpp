@@ -116,6 +116,29 @@ void highBitrateFrames() {
     REQUIRE(!modern.next(60000+300000)); REQUIRE(modern.takeIDRRequest());
     push(modern,packet(Bytes(10,1),3,true),400000); REQUIRE(modern.next(400001));
 }
+void receiverSchedulingJitter() {
+    // A short receiver pause must not destroy an otherwise complete reference
+    // chain. Completion is delivered immediately, without waiting for expiry.
+    Reassembler modern(0x0102030405060708,Codec::HEVC,MaxFrameSize,2000000000);
+    modern.takeIDRRequest();
+    Bytes frame(1200,0x42);
+    push(modern,packet(frame,1,true,0),0);
+    REQUIRE(!modern.next(26000)); REQUIRE(!modern.takeIDRRequest());
+    push(modern,packet(frame,1,true,1),28000);
+    auto complete=modern.next(28001); REQUIRE(complete && complete->id==1);
+    push(modern,packet(frame,2,false,0),30000);
+    REQUIRE(!modern.next(56000)); REQUIRE(!modern.takeIDRRequest());
+    push(modern,packet(frame,2,false,1),58000);
+    complete=modern.next(58001); REQUIRE(complete && complete->id==2);
+    // Real loss still expires; dependent future frames cannot bypass it.
+    push(modern,packet(frame,3,false,0),60000);
+    push(modern,packet(Bytes(4,4),4,false),70000);
+    REQUIRE(!modern.next(109999)); REQUIRE(!modern.takeIDRRequest());
+    REQUIRE(!modern.next(110000)); REQUIRE(modern.takeIDRRequest());
+    push(modern,packet(Bytes(4,5),5,false),110001); REQUIRE(!modern.next(110002));
+    push(modern,packet(Bytes(4,6),6,true),110003);
+    complete=modern.next(110004); REQUIRE(complete && complete->id==6);
+}
 void sessionHandover() {
     uint64_t id=0x0102030405060708;
     auto notice=sessionTransition(id);
@@ -127,4 +150,4 @@ void sessionHandover() {
     notice=sessionTransition(id); notice.push_back(0); REQUIRE(!validSessionTransition(notice,id));
     notice.pop_back(); notice.pop_back(); REQUIRE(!validSessionTransition(notice,id));
 }
-int main() { control(); optionalPairing(); validation(); reassembly(); boundedAndWrap(); firstFrameDiagnosticsAndProbe(); highBitrateFrames(); sessionHandover(); std::cout<<"Protocol tests passed\n"; }
+int main() { control(); optionalPairing(); validation(); reassembly(); boundedAndWrap(); firstFrameDiagnosticsAndProbe(); highBitrateFrames(); receiverSchedulingJitter(); sessionHandover(); std::cout<<"Protocol tests passed\n"; }

@@ -31,7 +31,7 @@ public struct Reader {
     public var atEnd: Bool { offset == data.count }
 }
 
-public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide, sessionTransition, sessionTransitionAck }
+public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide, sessionTransition, sessionTransitionAck, videoStatistics }
 
 /// A session-scoped notice, accepted only after pairing and stream negotiation.
 public enum SessionTransitionWire {

@@ -15,7 +15,7 @@ mkdir -p "$task_root/dist/windows-x64/licenses"
     -I "$task_root/shared" -I "$task_root/windows-client/src" \
     "$task_root/windows-client/src/displays.cpp" "$task_root/windows-client/src/setup.cpp" "$task_root/dist/windows-x64/client-resource.o" \
     "$task_root/windows-client/src/main.cpp" "$task_root/windows-client/src/network.cpp" \
-    "$task_root/windows-client/src/decoder.cpp" "$task_root/windows-client/src/renderer.cpp" \
+    "$task_root/windows-client/src/decoder.cpp" "$task_root/windows-client/src/video_worker.cpp" "$task_root/windows-client/src/renderer.cpp" \
     -o "$task_root/dist/windows-x64/ThunderDisplayClient.exe" \
     -lws2_32 -liphlpapi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -ld3d11 -ld3dcompiler -ldxgi -ldxguid \
     -lole32 -loleaut32 -luser32 -lshell32 -lgdi32 -ladvapi32 -lcrypt32 -lcomctl32 -ldwmapi -luxtheme -lwindowscodecs

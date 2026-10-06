@@ -4,10 +4,26 @@
 #include "presentation.hpp"
 #include "recovery.hpp"
 #include "diagnostics.hpp"
+#include "latest_picture.hpp"
 
 class Renderer {
+public:
+    struct Latency { uint32_t renderAverage=0,renderMaximum=0,ageAverage=0,ageMaximum=0; uint64_t replaced=0; };
+private:
+    struct Picture { ComPtr<IMFSample> sample; UINT width,height,fps; uint64_t arrivedAt; };
+    td::LatestPicture<Picture> pictures;
+    HANDLE frameReady=nullptr,stopPresentation=nullptr;
+    std::atomic<bool> presenterStopped{false};
+    std::mutex presentationState;
+    Latency latency;
+    std::string presentationFailure;
+    std::thread presenter;
+    void presentationLoop();
+    bool presentPicture(const td::LatestPicture<Picture>::Item& item);
     HWND window;
     std::mutex mutex;
+    std::mutex descriptionMutex;
+    std::string cachedDescription="Color pipeline: waiting for presentation";
     // Pointer hit testing must never wait for GPU conversion or Present.
     std::mutex pointerMutex;
     std::optional<td::PresentationGeometry> pointerGeometry;
@@ -63,8 +79,11 @@ class Renderer {
     void checkPresent(HRESULT result,const char* operation);
 public:
     Renderer(HWND hwnd, bool vsync);
+    ~Renderer();
     ID3D11Device* device() const { return device_.Get(); }
-    void present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UINT fps);
+    void present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UINT fps,uint64_t arrivedAt);
+    void checkFailure();
+    Latency presentationLatency();
     RECT viewport();
     void resize();
     void configureBitDepth(uint8_t depth);
@@ -74,6 +93,7 @@ public:
     void setScalingQuality(uint8_t value) { std::lock_guard<std::mutex> lock(mutex); scalingQuality=std::min<uint8_t>(value,1); }
     bool hasFrame() const { return frameState.fresh(micros()); }
     bool hasImage() const { return frameState.hasImage(); }
+    uint64_t lastPresentation() const { return frameState.lastPresentation(); }
     std::string colorDescription();
     bool repaintImage() { std::lock_guard<std::mutex> lock(mutex); return repaintImageLocked(); }
     bool resetFrame(bool preserve=false,bool keepSnapshot=false,const char* reason="session reset");

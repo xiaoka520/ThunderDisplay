@@ -30,17 +30,21 @@ func encoderCheck(bitrate: UInt64 = 10_000_000, desktopSRGB: Bool = false) throw
         let queue = DispatchQueue(label: "ThunderDisplay.encoder-check")
         let engine = try CaptureEngine(hello: hello, codec: codec, queue: queue, desktopSRGB: desktopSRGB)
         log("Encoder check requested \(bitrate / 1_000_000) Mbps, accepted \(engine.effectiveBitrate / 1_000_000) Mbps for \(codec)")
+        log("Encoder check \(codec): verified speed priority \(engine.encodingSpeedPrioritized)")
         if let qp = engine.maximumFrameQP { log("Encoder check verified maximum frame QP \(qp) for \(codec)") }
         let completed = DispatchSemaphore(value: 0)
-        var failure: String?, outputCount = 0, colorChecked = false
+        var failure: String?, outputCount = 0, colorChecked = false, inputCount = 0
+        var previousPTS: UInt64?
         queue.sync {
             engine.active = true
+            engine.onInputFormat = { _ in inputCount += 1 }
             engine.onFailure = { failure = $0; completed.signal() }
             engine.onFormat = { format in
                 colorChecked = hasBT709Metadata(format, desktopSRGB: desktopSRGB) && (codec != .hevc10 || hasMain10Metadata(format))
                 if !colorChecked { failure = "Hardware encoder returned missing or incorrect BT.709 color metadata" }
             }
             engine.onFrame = { data, pts, key in
+                if let previousPTS, pts<=previousPTS { failure = "Encoder returned out-of-order timestamps" }; previousPTS=pts
                 if data.count < 5 || Array(data.prefix(4)) != [0,0,0,1] { failure = "Invalid Annex B output" }
                 if outputCount == 0 && !key { failure = "First encoded frame is not an IDR" }
                 if outputCount == 2 && !key { failure = "Requested IDR was not produced" }
@@ -79,6 +83,26 @@ func encoderCheck(bitrate: UInt64 = 10_000_000, desktopSRGB: Bool = false) throw
         }
         guard queue.sync(execute: { outputCount }) == 3 else { throw HostError("Incomplete hardware encoder output") }
         guard queue.sync(execute: { colorChecked }) else { throw HostError("Color metadata was not validated") }
+        // A burst must respect the announced one/two-frame hardware bound.
+        // Excess submissions are refused instead of creating a codec FIFO.
+        var burst: CVPixelBuffer?
+        let format=codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        guard CVPixelBufferCreate(nil,640,360,format,[kCVPixelBufferIOSurfacePropertiesKey:[:]] as CFDictionary,&burst)==kCVReturnSuccess,
+              let burst else { throw HostError("Synthetic pipeline allocation failed") }
+        CVPixelBufferLockBaseAddress(burst,[])
+        for plane in 0..<2 {
+            let size=CVPixelBufferGetBytesPerRowOfPlane(burst,plane)*CVPixelBufferGetHeightOfPlane(burst,plane)
+            if let base=CVPixelBufferGetBaseAddressOfPlane(burst,plane) { memset(base,plane == 0 ? 64:128,size) }
+        }
+        CVPixelBufferUnlockBaseAddress(burst,[])
+        let limit = engine.hardwareAdmissionLimit
+        queue.async { for i in 3..<(3+limit+2) { engine.encodeImage(burst,time:CMTime(value:Int64(i),timescale:60)) } }
+        for _ in 0..<limit {
+            guard completed.wait(timeout:.now()+5) == .success else { throw HostError("Bounded pipeline callback timed out") }
+        }
+        guard queue.sync(execute:{outputCount==3+limit && inputCount==3+limit}) else { throw HostError("Hardware admission bound was not respected") }
+        if let failure=queue.sync(execute:{failure}) { throw HostError(failure) }
+        log("Encoder bounded pipeline check \(codec): \(limit) ordered outputs, extra admissions refused")
     }
     print("Hardware HEVC / H.264 / HEVC Main10 encoder + \(desktopSRGB ? "sRGB desktop / BT.709 matrix" : "BT.709") color metadata checks passed at requested \(bitrate / 1_000_000) Mbps (synthetic frames; no screen capture or input injection; not a throughput benchmark).")
 }

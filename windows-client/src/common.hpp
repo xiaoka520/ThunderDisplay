@@ -41,7 +41,7 @@ struct ClientOptions {
     uint16_t fullscreenHotkey=td::DefaultFullscreenHotkey;
     unsigned displayBits=0;
     uint8_t colorDepth=0;
-    uint8_t capabilityVersion=8;
+    uint8_t capabilityVersion=9;
     td::DisplayLimits display;
     RECT displayBounds{};
 };

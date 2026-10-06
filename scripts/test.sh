@@ -5,6 +5,10 @@ if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app/Contents/Develope
     export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 fi
 mkdir -p "$task_root/build/tests" "$task_root/mac-host/.build/module-cache" "$task_root/mac-host/.build/spm-cache"
+"${CXX:-c++}" -std=c++17 -pthread -Wall -Wextra -Werror -I "$task_root/shared" "$task_root/tests/latest_picture_tests.cpp" -o "$task_root/build/tests/latest-picture-tests"
+"$task_root/build/tests/latest-picture-tests"
+"${CXX:-c++}" -std=c++17 -pthread -Wall -Wextra -Werror -I "$task_root/shared" "$task_root/tests/video_inbox_tests.cpp" -o "$task_root/build/tests/video-inbox-tests"
+"$task_root/build/tests/video-inbox-tests"
 "${CXX:-c++}" -std=c++17 -pthread -Wall -Wextra -Werror -I "$task_root/shared" "$task_root/tests/control_outbox_tests.cpp" -o "$task_root/build/tests/control-outbox-tests"
 "$task_root/build/tests/control-outbox-tests"
 "${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror -I "$task_root/shared" "$task_root/tests/recovery_tests.cpp" -o "$task_root/build/tests/recovery-tests"

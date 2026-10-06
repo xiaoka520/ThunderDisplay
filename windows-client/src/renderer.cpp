@@ -90,6 +90,72 @@ Renderer::Renderer(HWND hwnd, bool sync): window(hwnd), vsync(sync) {
     factory->MakeWindowAssociation(hwnd,DXGI_MWA_NO_ALT_ENTER);
     destination={0,0,LONG(width),LONG(height)};
     updatePointerGeometryLocked();
+    frameReady=swap->GetFrameLatencyWaitableObject();
+    if(!frameReady) throw std::runtime_error("Presentation latency waitable object unavailable");
+    stopPresentation=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    if(!stopPresentation) { CloseHandle(frameReady); throw std::runtime_error("Create presentation stop event failed"); }
+    try { presenter=std::thread([this]{presentationLoop();}); }
+    catch(...) { CloseHandle(stopPresentation); CloseHandle(frameReady); throw; }
+}
+Renderer::~Renderer() {
+    presenterStopped=true; pictures.retire(true); SetEvent(stopPresentation);
+    if(presenter.joinable()) presenter.join();
+    if(stopPresentation) CloseHandle(stopPresentation);
+    if(frameReady) CloseHandle(frameReady);
+}
+void Renderer::checkFailure() {
+    std::lock_guard<std::mutex> lock(presentationState);
+    if(!presentationFailure.empty()) throw std::runtime_error(presentationFailure);
+}
+Renderer::Latency Renderer::presentationLatency() {
+    std::lock_guard<std::mutex> lock(presentationState); return latency;
+}
+void Renderer::presentationLoop() {
+    const auto com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+    try {
+        check(com,"Initialize presentation apartment"); SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        uint64_t statsAt=micros(),count=0,renderTotal=0,renderMax=0,ageTotal=0,ageMax=0,ageCount=0,statsGeneration=UINT64_MAX;
+        bool havePermit=false;
+        while(!presenterStopped) {
+            if(!pictures.wait()) continue;
+            if(!havePermit) {
+                const HANDLE waits[]={stopPresentation,frameReady};
+                const auto result=WaitForMultipleObjects(2,waits,FALSE,100);
+                if(result==WAIT_OBJECT_0) break;
+                if(result==WAIT_TIMEOUT) continue;
+                if(result!=WAIT_OBJECT_0+1) throw std::runtime_error("Wait for presentation frame failed");
+                havePermit=true;
+            }
+            // Fetch AFTER display readiness, so newly decoded pictures replace
+            // pending samples while waiting instead of becoming a stale FIFO.
+            auto item=pictures.take(); if(!item || !pictures.current(*item)) continue;
+            if(statsGeneration!=item->generation) {
+                statsGeneration=item->generation; statsAt=micros(); count=renderTotal=renderMax=ageTotal=ageMax=ageCount=0;
+            }
+            const auto began=micros();
+            if(!presentPicture(*item)) continue; // Keep readiness if no Present occurred.
+            havePermit=false; const auto now=micros();
+            const auto render=now-began,age=now>=item->picture.arrivedAt?now-item->picture.arrivedAt:0;
+            ++count; renderTotal+=render; renderMax=std::max(renderMax,render);
+            if(item->picture.arrivedAt) { ++ageCount; ageTotal+=age; ageMax=std::max(ageMax,age); }
+            if(now-statsAt>=5000000) {
+                Latency snapshot{uint32_t(renderTotal/std::max<uint64_t>(1,count)),uint32_t(renderMax),
+                    uint32_t(ageTotal/std::max<uint64_t>(1,ageCount)),uint32_t(ageMax),pictures.discardedPictures()};
+                { std::lock_guard<std::mutex> lock(presentationState); latency=snapshot; }
+                diagnosticLog("display.latency","render_us_avg/max="+std::to_string(snapshot.renderAverage)+"/"+std::to_string(snapshot.renderMaximum)+
+                    " arrival_to_present_us_avg/max="+std::to_string(snapshot.ageAverage)+"/"+std::to_string(snapshot.ageMaximum)+
+                    " measured="+std::to_string(ageCount)+" replaced="+std::to_string(snapshot.replaced));
+                statsAt=now; count=renderTotal=renderMax=ageTotal=ageMax=ageCount=0;
+            }
+        }
+    } catch(const std::exception& e) {
+        { std::lock_guard<std::mutex> lock(presentationState); presentationFailure=e.what(); }
+        diagnosticLog("display.worker.error",e.what()); pictures.retire(true);
+    }
+    if(SUCCEEDED(com)) CoUninitialize();
+}
+void Renderer::present(IMFSample* sample,UINT frameWidth,UINT frameHeight,UINT fps,uint64_t arrivedAt) {
+    checkFailure(); Picture picture{sample,frameWidth,frameHeight,fps,arrivedAt}; pictures.push(std::move(picture));
 }
 void Renderer::updatePointerGeometryLocked() {
     std::lock_guard<std::mutex> lock(pointerMutex);
@@ -135,18 +201,24 @@ bool Renderer::pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y
 void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); if(resizeLocked()) repaintImageLocked(); }
 RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(pointerMutex); return pointerViewport; }
 std::string Renderer::colorDescription() {
-    std::lock_guard<std::mutex> lock(mutex);
-    return std::string(desktopSRGB?"Color pipeline: sRGB SDR / BT.709 matrix | ":"Color pipeline: BT.709 SDR | ")+(bitDepth==10?"P010 64-940 -> RGB10 0-1023 | ":"NV12 16-235 -> RGB8 0-255 | ")+
+    // Periodic status on the socket thread must not wait for a busy Present.
+    std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
+    if(!lock.owns_lock()) { std::lock_guard<std::mutex> cached(descriptionMutex); return cachedDescription; }
+    auto description=std::string(desktopSRGB?"Color pipeline: sRGB SDR / BT.709 matrix | ":"Color pipeline: BT.709 SDR | ")+(bitDepth==10?"P010 64-940 -> RGB10 0-1023 | ":"NV12 16-235 -> RGB8 0-255 | ")+
         (desktopSRGB?(colorRGB?"Explicit sRGB shader conversion":"Waiting for conversion"):!processor?"Waiting for conversion":explicitVideoColor?"Explicit DXGI conversion":"Legacy conversion")+
         "\nScaling: "+(scalingActive?std::string("Lanczos-2 (no sharpening)"):std::string(desktopSRGB?"Bilinear compatibility":"Video processor compatibility"))+
         (scalingFailure.empty()?"":" (fallback: "+scalingFailure+")")+
         (sourceWidth?"\nStream pixels: "+std::to_string(sourceWidth)+"x"+std::to_string(sourceHeight)+
         " | Viewport: "+std::to_string(destination.right-destination.left)+"x"+std::to_string(destination.bottom-destination.top)+
         " | Display scale: "+std::to_string(pixelExact?100:((destination.right-destination.left)*100/sourceWidth))+"%"+(pixelExact?" (1:1)":""):"");
+    { std::lock_guard<std::mutex> cached(descriptionMutex); cachedDescription=description; }
+    return description;
 }
-void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UINT fps) {
+bool Renderer::presentPicture(const td::LatestPicture<Picture>::Item& item) {
     std::lock_guard<std::mutex> lock(mutex);
-    if(IsIconic(window)) return;
+    if(!pictures.current(item)) return false;
+    auto* sample=item.picture.sample.Get(); const auto frameWidth=item.picture.width,frameHeight=item.picture.height,fps=item.picture.fps;
+    if(IsIconic(window)) return false;
     resizeLocked();
     ComPtr<IMFMediaBuffer> buffer; check(sample->GetBufferByIndex(0,&buffer),"Decoded media buffer");
     ComPtr<IMFDXGIBuffer> gpu;
@@ -160,7 +232,7 @@ void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UIN
     if(desktopSRGB) {
         try { presentDesktopColor(texture.Get(),slice,frameWidth,frameHeight,geometry); }
         catch(const std::exception& e) { throw std::runtime_error(std::string("DesktopColorUnavailable: ")+e.what()); }
-        return;
+        return true;
     }
     // The shader supports anti-aliasing footprints up to a 4:1 shrink per axis.
     bool scaleSupported=double(crop.right-crop.left)/(dest.right-dest.left)<=4 && double(crop.bottom-crop.top)/(dest.bottom-dest.top)<=4;
@@ -215,6 +287,7 @@ void Renderer::present(IMFSample* sample, UINT frameWidth, UINT frameHeight, UIN
     check(videoContext->VideoProcessorBlt(processor.Get(),target.Get(),0,1,&stream),"GPU YUV to RGB conversion");
     if(highQuality) scaleToBackBuffer(back.Get(),geometry);
     presentBackBuffer();
+    return true;
 }
 void Renderer::presentBackBuffer() {
     {
@@ -296,6 +369,10 @@ float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
     return true;
 }
 bool Renderer::resetFrame(bool preserve,bool keepSnapshot,const char* reason) {
+    // Drop old-session samples before the graphics lock. In-flight Present
+    // completes before the retained snapshot is made under that same lock.
+    pictures.retire();
+    { std::lock_guard<std::mutex> lock(presentationState); latency={}; }
     std::lock_guard<std::mutex> lock(mutex);
     const bool hold=preserve && retainedRGB;
     diagnosticLog(hold?"display.hold":"display.clear",reason);
