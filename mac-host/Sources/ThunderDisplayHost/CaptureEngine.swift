@@ -166,7 +166,19 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         config.destinationRect = rect
         config.backgroundColor = Self.background
         if #available(macOS 14, *) { config.preservesAspectRatio = true }
-        let stream = SCStream(filter: SCContentFilter(display: display, excludingApplications: [], exceptingWindows: []), configuration: config, delegate: self)
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        // Ask for the display's real backing resolution. Left unset, SCK resolves
+        // `captureResolution` on its own, and a `.nominal` outcome composites the
+        // desktop at 1x and scales it up into this buffer: the stream would then carry
+        // no more detail than the logical size, and no client-side scaling could bring
+        // it back. `.best` is the documented request for native pixels.
+        if #available(macOS 14, *) {
+            config.captureResolution = .best
+            // pointPixelScale is the scale SCK will actually composite at, so this one
+            // line is the difference between "we asked for 4096x2560" and "we got 2x".
+            log("Capture: display \(display.width)x\(display.height) pt, buffer \(config.width)x\(config.height) px, pointPixelScale \(filter.pointPixelScale)")
+        }
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try queue.sync {
             guard !stopped else { throw HostError("Capture cancelled") }
