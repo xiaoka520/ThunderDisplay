@@ -18,15 +18,12 @@ func put32(_ value: UInt32, into data: inout Data) {
 }
 
 let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
-let source = root.appendingPathComponent("ThunderDisplay.png")
-guard let decoder = CGImageSourceCreateWithURL(source as CFURL, nil),
-      let image = CGImageSourceCreateImageAtIndex(decoder, 0, nil),
-      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
     throw NSError(domain: "ThunderDisplay.Icons", code: 1,
-                  userInfo: [NSLocalizedDescriptionKey: "Cannot load ThunderDisplay.png"])
+                  userInfo: [NSLocalizedDescriptionKey: "Cannot create icon color space"])
 }
 
-func raster(_ size: Int) throws -> (png: Data, pixels: Data) {
+func raster(_ size: Int, _ image: CGImage) throws -> (png: Data, pixels: Data) {
     guard let context = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8,
                                   bytesPerRow: size * 4, space: colorSpace,
                                   bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue |
@@ -76,16 +73,50 @@ func windowsBitmap(_ size: Int, _ pixels: Data) -> Data {
     return result
 }
 
+func writeWindowsIcon(_ image: CGImage, _ filename: String, silhouette: Bool = false) throws {
+    let sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+    let entries = try sizes.map { size -> Data in
+        let rendered = try raster(size, image)
+        if silhouette {
+            var pixels = rendered.pixels
+            for index in stride(from: 0, to: pixels.count, by: 4) {
+                pixels[index] = 0; pixels[index + 1] = 0; pixels[index + 2] = 0
+            }
+            return windowsBitmap(size, pixels)
+        }
+        return size == 256 ? rendered.png : windowsBitmap(size, rendered.pixels)
+    }
+    var ico = Data()
+    put16(0, into: &ico); put16(1, into: &ico); put16(UInt16(sizes.count), into: &ico)
+    var offset = 6 + sizes.count * 16
+    for (size, entry) in zip(sizes, entries) {
+        ico.append(contentsOf: [size == 256 ? 0 : UInt8(size), size == 256 ? 0 : UInt8(size), 0, 0])
+        put16(1, into: &ico); put16(32, into: &ico)
+        put32(UInt32(entry.count), into: &ico); put32(UInt32(offset), into: &ico)
+        offset += entry.count
+    }
+    for entry in entries { ico.append(entry) }
+    try ico.write(to: root.appendingPathComponent("windows-client/assets/\(filename).ico"), options: .atomic)
+}
+
 let files = FileManager.default
-let iconset = root.appendingPathComponent("build/app-icons/ThunderDisplay.iconset")
+for (variant, filename) in [("ThunderDisplay", "Icon-iOS-Default-1024@1x.png"),
+                            ("ThunderDisplayDark", "Icon-iOS-Dark-1024@1x.png")] {
+let source = root.appendingPathComponent("Icon/" + filename)
+guard let decoder = CGImageSourceCreateWithURL(source as CFURL, nil),
+      let image = CGImageSourceCreateImageAtIndex(decoder, 0, nil) else {
+    throw NSError(domain: "ThunderDisplay.Icons", code: 1,
+                  userInfo: [NSLocalizedDescriptionKey: "Cannot load " + source.path])
+}
+let iconset = root.appendingPathComponent("build/app-icons/\(variant).iconset")
 try files.createDirectory(at: iconset, withIntermediateDirectories: true)
 for logicalSize in [16, 32, 128, 256, 512] {
     for scale in [1, 2] {
         let name = "icon_\(logicalSize)x\(logicalSize)\(scale == 2 ? "@2x" : "").png"
-        try raster(logicalSize * scale).png.write(to: iconset.appendingPathComponent(name), options: .atomic)
+        try raster(logicalSize * scale, image).png.write(to: iconset.appendingPathComponent(name), options: .atomic)
     }
 }
-let macIcon = root.appendingPathComponent("mac-host/Resources/ThunderDisplay.icns")
+let macIcon = root.appendingPathComponent("mac-host/Resources/\(variant).icns")
 try files.createDirectory(at: macIcon.deletingLastPathComponent(), withIntermediateDirectories: true)
 let converter = Process()
 converter.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
@@ -93,20 +124,24 @@ converter.arguments = ["-c", "icns", iconset.path, "-o", macIcon.path]
 try converter.run(); converter.waitUntilExit()
 try require(converter.terminationStatus == 0, "iconutil failed")
 
-let sizes = [16, 20, 24, 32, 40, 48, 64, 128, 256]
-let entries = try sizes.map { size -> Data in
-    let rendered = try raster(size)
-    return size == 256 ? rendered.png : windowsBitmap(size, rendered.pixels)
+try writeWindowsIcon(image, variant)
+print("Generated Mac ICNS and Windows ICO from Icon/\(filename) (alpha preserved)")
 }
-var ico = Data()
-put16(0, into: &ico); put16(1, into: &ico); put16(UInt16(sizes.count), into: &ico)
-var offset = 6 + sizes.count * 16
-for (size, entry) in zip(sizes, entries) {
-    ico.append(contentsOf: [size == 256 ? 0 : UInt8(size), size == 256 ? 0 : UInt8(size), 0, 0])
-    put16(1, into: &ico); put16(32, into: &ico)
-    put32(UInt32(entry.count), into: &ico); put32(UInt32(offset), into: &ico)
-    offset += entry.count
+
+// Status icons use the supplied monochrome artwork, independently of app icons.
+// macOS renders its template in the menu bar's native color; Windows selects
+// white or black while keeping the same shape and alpha at each taskbar DPI.
+let statusSource = root.appendingPathComponent("Icon/Icon.png")
+guard let decoder = CGImageSourceCreateWithURL(statusSource as CFURL, nil),
+      let statusImage = CGImageSourceCreateImageAtIndex(decoder, 0, nil) else {
+    throw NSError(domain: "ThunderDisplay.Icons", code: 1,
+                  userInfo: [NSLocalizedDescriptionKey: "Cannot load " + statusSource.path])
 }
-for entry in entries { ico.append(entry) }
-try ico.write(to: root.appendingPathComponent("windows-client/assets/ThunderDisplay.ico"), options: .atomic)
-print("Generated Mac ICNS and Windows ICO from ThunderDisplay.png (alpha preserved)")
+for scale in [1, 2, 3] {
+    let suffix = scale == 1 ? "" : "@\(scale)x"
+    try raster(22 * scale, statusImage).png.write(
+        to: root.appendingPathComponent("mac-host/Resources/ThunderDisplayStatus\(suffix).png"), options: .atomic)
+}
+try writeWindowsIcon(statusImage, "ThunderDisplayStatus")
+try writeWindowsIcon(statusImage, "ThunderDisplayStatusLight", silhouette: true)
+print("Generated native status icons from Icon/Icon.png (shape and alpha preserved)")

@@ -48,6 +48,8 @@ final class SetupWindow: NSWindowController, NSWindowDelegate {
     }
     private var lastPresentation: Presentation?
     private let contentDocument = DocumentView(), scroll = NSScrollView(), root = NSStackView()
+    private let applicationIcon = NSImageView()
+    func setApplicationIcon(_ image: NSImage) { applicationIcon.image = image }
     private var wrapFields: [NSTextField] = []
     private var displays: [HostDisplay] = [], currentDisplay: CGDirectDisplayID?
     private var preferredDisplay: CGDirectDisplayID?
@@ -102,7 +104,8 @@ final class SetupWindow: NSWindowController, NSWindowDelegate {
             root.topAnchor.constraint(equalTo: contentDocument.topAnchor, constant: 24)
         ])
         let appIcon = Bundle.main.url(forResource: "ThunderDisplay", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
-        let icon = NSImageView(image: appIcon ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "ThunderDisplay") ?? NSImage())
+        let icon = applicationIcon
+        icon.image = appIcon ?? NSImage(systemSymbolName: "display.2", accessibilityDescription: "ThunderDisplay") ?? NSImage()
         if appIcon == nil { icon.contentTintColor = accent }
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.widthAnchor.constraint(equalToConstant: 42).isActive = true; icon.heightAnchor.constraint(equalToConstant: 42).isActive = true

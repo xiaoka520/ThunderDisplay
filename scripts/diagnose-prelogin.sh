@@ -66,8 +66,8 @@ echo ""
 
 # 4. 运行 Boot 组件自检
 echo "4. Boot 组件自检："
-if [ -f "dist/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayBoot" ]; then
-    ./dist/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayBoot --check
+if [ -f "/Applications/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayBoot" ]; then
+    /Applications/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayBoot --check
 else
     echo "   找不到 ThunderDisplayBoot，请先编译"
 fi
@@ -113,7 +113,7 @@ if [ ! -f "/Library/LaunchDaemons/dev.thunderdisplay.boot.system.plist" ] || \
     echo ""
     echo "⚠️  开机组件未安装"
     echo "   解决方法："
-    echo "   1. 运行桌面主机: ./dist/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost"
+    echo "   1. 运行桌面主机: /Applications/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost"
     echo "   2. 勾选'随系统启动'"
     echo "   3. 点击'更新开机组件与连接配置'"
     echo "   4. 输入管理员密码"

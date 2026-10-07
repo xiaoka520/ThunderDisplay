@@ -1,91 +1,23 @@
-ThunderDisplay 0.8.15 · Windows 图形客户端 / Windows GUI client
+ThunderDisplay 0.8.17 · Windows 安装版 / Windows installer
 
-1. 最新构建为 0.8.15。双击 ThunderDisplay-GUI-0.8.15-x64.exe；中文 / English / 跟随系统。
-   登录前键鼠修复需更新 Mac，并点击“更新开机组件与连接配置”以更新系统副本。
-2. 填写 Mac 网桥 IPv4 或留空自动发现；配对码默认关闭。
-3. 显示模式为“自动 / 自定义”；帧率由两端屏幕协商，上限240，目标不等于实测。
-   自动模式默认保留 Mac HiDPI 捕获源像素。2048×1280逻辑桌面可对应4096×2560渲染像素。
-4. 自定义码率默认上限20000 Mbps（20 Gbps），以64位协商，避免溢出；需要新Mac。
-   自动采用较低压缩，推荐160–1000 Mbps；4096×2560@60 Hz HEVC约850 Mbps。目标不是恒定输出，网桥上限不等于硬件编码器输出能力。
-   编码器拒绝超高目标时检测其接受范围，诊断明确显示请求 / 实际接受目标，避免连接失败。
-5. “本地指针 · macOS 原生”默认关闭，连接前开启。Mac 视频从首帧起隐藏指针，Windows 本地显示。
-   动态同步Mac系统原始指针形状 / 隐藏状态 / 热点，按Windows DPI缩放，不能再乘Mac HiDPI比例。
-   不手绘、不靠快捷键猜截屏状态；Mac系统不提供读取接口时保留视频指针。修改开关需重连。
-6. 两端跟随系统深浅色实时变化。Windows 使用原生标题栏 / 控件主题，并保留系统高对比度。
-7. 删除“缩放与边缘”和“1:1 原始像素显示”控件。保持完整桌面比例及不锐化的高质量GPU缩放。
-   保留HiDPI源像素选项；删除控件不改变编码质量。不同面板尺寸仍需要缩放，4:2:0仍损失彩色细字。
-8. 剪贴板支持文字（64 KiB UTF-8）与图片（PNG 32 MiB、最多1600万像素、单边8192）。
-   两端开启后只同步新复制的内容，抑制回传。兼容Mac TIFF与Windows PNG / DIB / Bitmap，不传文件。
-9. Ctrl+Alt+Enter 全屏；可自定义，不使用F11。Ctrl+Alt+Shift+Esc释放/恢复输入。
-   全屏捕获时Windows快捷键交给Mac，Ctrl+Shift+Esc仍打开任务管理器，Ctrl+Alt+Del由系统处理。
-   Caps Lock 同时更新 Windows 大小写状态与键盘指示灯，并传给 Mac；切回远程窗口或恢复输入时重新读取本地状态。
-10. 色深为自动 / 8-bit SDR / 10-bit SDR；新版两端为sRGB SDR / BT.709矩阵 / 4:2:0，未实现HDR/P3/4:4:4/音频。
-11. Mac设置可启用“随系统启动”，安装独立系统守护进程与LoginWindow图形会话组件，需管理员批准。
-    登录前组件先检查真实画面、登录前图形标记和事件发送授权，再接受连接，用户登录后桌面主机接管。
-    鼠标按显示器逻辑坐标定位；键盘传递物理键码与修饰键。发送失败会断开并显示系统错误。
-    0.8.7 键鼠统一在主线程发送到当前图形会话，移除失败回退和 PID 定向键盘投递；Windows新会话首帧与返回窗口时更新键盘捕获。实际登录页面仍需复测。
-    登录成功交接时保留最后一帧，不显示文字、不弹出设置；桌面新帧到达后替换。期间停止远程输入，最多保留30秒；普通断网仍清除旧画面。需要同时更新两端。
-    0.8.3 修复输入准备读取全局状态引发卡住；捕获检查60秒、输入准备各步骤15秒超时后重建组件。需更新Mac开机组件。
-    若系统拒绝权限，客户端显示登录界面捕获/输入不可用；仅安装成功不代表已验证登录前远控。FileVault开机解锁不支持。
+运行 ThunderDisplay-Windows-Setup-0.8.17-x64.exe，按安装向导完成安装。
+可选择 Windows 登录后在托盘启动，以及桌面快捷方式。
+默认安装位置：%LOCALAPPDATA%\Programs\ThunderDisplay。
 
-Windows 10 1703+ / Windows 11 x64；需Media Foundation / D3D11，Windows N需媒体组件。
-保留licenses目录。构建与协议/原生Mac测试通过，ROG原生主题、动态指针、GPU和两机图片粘贴待实机验收。
+启动后在 ThunderDisplay 系统托盘后台运行。双击闪电图标打开设置，右键可打开远程画面、断开或退出。
+桌面和开始菜单快捷方式直接打开设置。关闭设置窗口保留后台连接；关闭远程窗口会断开并返回设置。
+断连连续 3 秒会返回设置；自动重连保持原来的总计 10 分钟 / 150 次上限，收到新画面后恢复窗口。
+健康连接的静止桌面不算断连。输入仅在前台远程画面有效且已呈现新帧时发送。
 
-Latest build: 0.8.15. Run the GUI EXE; pairing is optional on the bridge.
-Pre-login input requires the Mac update and Update startup components and connection settings, which updates the system copy.
-Caps Lock now also updates the Windows toggle state/keyboard LED; refocusing the display or recapturing input resynchronizes local state.
-Auto preserves Mac HiDPI source pixels. Custom changes resolution/bitrate; FPS follows detected displays.
-The bitrate ceiling is 20000 Mbps (20 Gbps), using 64-bit negotiation. Auto uses lighter compression at 160–1000 Mbps (4096×2560@60 Hz HEVC: 850 Mbps).
-Hardware rejection of an ultra-high target triggers range detection; diagnostics report the actual accepted target.
-This is not a measured Thunderbolt throughput or a promise of constant 20 Gbps video output.
-Optional local cursor mode streams the Mac system's real cursor pixels, visibility and hotspot, scaled once to Windows DPI.
-Both UIs follow system dark/light mode. Windows uses native control/title themes and system high contrast.
-Scaling/edge and pixel-exact GUI controls were removed; full desktop aspect-fit and high-quality unsharpened scaling remain.
-Clipboard sync now supports new copied text (64 KiB) and PNG images (32 MiB / 16M pixels / 8192 side), with native TIFF/DIB conversion.
-No existing clipboard content is exported on connect. File transfer is not implemented.
-Mac settings install a system discovery daemon and a separate LoginWindow graphics agent with administrator authentication.
-Before login, the agent checks an actual frame, its graphical executable marker and event-post authorization before serving; the desktop host takes over after login.
-Mouse positions use Quartz display coordinates; keyboard input carries physical keys and modifier state. Posting failures close the session and report the system error.
-Version 0.8.3 removes the global input-state query during pre-login preparation and adds independent recovery deadlines. Update Mac startup components.
-0.8.4：登录交接时优先快速重连，总上限仍为10分钟/150次。Mac新增限定用户的桌面启动任务，需更新开机组件。
-Version 0.8.4 uses fast reconnect attempts after a previously displayed stream. The total limit remains 10 minutes / 150 attempts. Update Mac startup components for automatic desktop handover.
-Installation alone does not establish working pre-login control. Permission failures are reported explicitly. FileVault preboot is unsupported.
-Ctrl+Alt+Enter toggles fullscreen; customize it in settings. Task Manager shortcuts remain available.
-Updated platforms use sRGB SDR with a BT.709 YCbCr matrix and 8/10-bit 4:2:0. Older hosts retain the legacy BT.709 path. HDR/P3/4:4:4/audio remain unimplemented.
-Crosscompiled and checked; native Windows themes, cursor behavior, GPU and dual-platform image paste still require the ROG.
+填写 Mac 的雷雳网桥 IPv4 或留空自动发现。配对码默认关闭。
+自动模式保留 Mac HiDPI 源像素；自定义可修改尺寸与码率。帧率仍按两端显示器协商。
+8 / 10-bit HEVC 为 SDR 4:2:0，未新增 HDR 或 4:4:4。
+全屏快捷键默认 Ctrl+Alt+Enter，可在设置中自定义；Ctrl+Alt+Shift+Esc 释放输入。
+连接偏好保存在当前用户注册表，配对码只有主动勾选记住时才加密保存。
 
-0.7.6：两端更新并重连后，连接诊断应显示sRGB SDR / BT.709矩阵、显式sRGB转换。自动启用，无需调整饱和度或Gamma。旧端或GPU不支持时诊断明确提示兼容色彩；P3/HDR色域仍未实现。
+升级安装会关闭旧客户端，保留连接偏好。卸载使用 Windows 已安装的应用或开始菜单卸载入口。
 
-自动连接 / 断线恢复每轮最多10分钟、150次尝试，显示当前次数/150。超限后点击连接手动重试。
-Mac 端默认“保持 Mac 可连接”，防止系统自动睡眠。雷雳不支持网络唤醒；手动睡眠后需先唤醒 Mac，主机会自动恢复。
-控制通道建立不代表画面恢复；首帧成功显示后才显示已连接。视频持续中断会清除旧画面并重连。
-
-0.7.6：动态本地指针优先使用 Mac 系统提供的高密度原图；Windows 按显示器 DPI 只缩放一次，保留原生尺寸和点击热点。两端需同时更新。
-
-0.8.0：本地指针按 Windows 当前显示缩放自动选择 macOS 原生倍率图；存在对应倍率时直接显示原像素，移动到不同缩放的显示器会自动切换。两端需同时更新。
-
-0.8.7: Mac登录前输入已重写为带图形标记的Quartz会话输入，键鼠在主线程处理；需要更新Mac开机组件。真实冷启动登录字段仍需复测。
-
-0.8.8：密码通过后，确认会话交接的快速重试持续15秒，每250毫秒一次，优先复用刚显示画面的Mac地址；Mac会话切换和桌面启动每100毫秒检查；登录后主动请求配置用户的既有桌面任务。仍最多10分钟/150次，交接保留最后一帧且不显示文字。实际速度取决于macOS桌面和捕获服务就绪时间。需要更新两端与Mac开机组件。
-Version 0.8.8: authenticated session transitions use 15 seconds of 250 ms retries to the last displayed host, with a 500 ms connect deadline. Mac polls session handover/startup every 100 ms. The overall 10-minute / 150-attempt limits and silent retained frame remain. Actual desktop/capture readiness still depends on macOS. Update both platforms and Mac startup components.
-
-0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
-Version 0.8.9: frozen handovers allow Ready/Ping/IDR; only input is paused. Independent TCP writing prioritizes input, pointer geometry no longer waits on GPU presentation, and decoder bursts present only the newest output. Mac RGB transfer/VT submission use a one-frame worker. Update both platforms and Mac startup components; native ROG latency and visual continuity still need verification.
-
-Windows 0.8.10：修复短暂停顿与显示缓冲区重建时的主动清屏。普通视频停顿保留最后一帧并请求关键帧，暂停输入；12秒持续停顿、真实断连仍清除画面并恢复连接。窗口重绘、尺寸和色深改变时立即重画，重画不刷新串流健康时间、不显示交接文字。新增异步本地诊断，位置为 %LOCALAPPDATA%\ThunderDisplay\Logs\client.log，设置窗口诊断区可查看路径；仅记录帧间隔、计数、重建与错误，不记录键盘内容、剪贴板或配对码。每个日志约2 MiB，最多保留当前与前一份。本次只需更新 Windows，Mac 继续使用0.8.9。
-Version 0.8.10 (Windows only): retain pixels during brief stalls and repaint after swap-chain changes. Repaint never refreshes stream/input health. True disconnects and the 12-second video stall deadline still clear the image. Asynchronous rotating logs: %LOCALAPPDATA%\ThunderDisplay\Logs\client.log. Mac 0.8.9 is compatible.
-
-0.8.11：Mac 视频发包与大帧复制移出键鼠队列，Windows 收包与解码显示分开。积压有界；丢失参考帧后请求关键帧恢复，不继续解码损坏的依赖链。连接诊断不等待显卡锁，登录交接先停止旧会话视频再保留最后一帧。两端增加队列、转色、编解码和显示耗时日志。请同时更新两端和 Mac 开机组件；保留现有分辨率、色深、色彩与码率，实际 ROG 延迟需双机复测。
-Version 0.8.11: separate Mac video sending/bitstream copies from input, and Windows socket receive from decoding/presentation. Bounded backlogs recover with IDRs after lost references. Status never waits for Present; handovers retire old video before freezing the image. Stage latency diagnostics added. Update both platforms and Mac startup components; image settings are preserved. Native ROG performance still needs verification.
-
-0.8.12：Mac 只允许一帧进入硬件编码，并立即补上最新捕获帧。Windows 收包、解码、显示分为三个独立环节；等待显示刷新时仅保留最新已解码画面，不拖住解码。连接健康检查包含实际显示进度。每五秒向 Mac 回传各阶段耗时数值，包含收齐帧到提交显示的等待；不含画面或输入内容。需同时更新两端和 Mac 开机组件，现有画质参数不变；实际 ROG 延迟仍需双机复测。
-Version 0.8.12: single-frame hardware admission on Mac immediately takes the newest capture after completion. Windows separates socket receive, decoding and presentation; while waiting for display readiness only the newest decoded picture is retained. Health checks include real presentation progress. Numerical queue/decode/render and arrival-to-Present timings return to Mac every five seconds, without image or input content. Update both platforms and Mac startup components. Image settings are preserved; actual ROG latency requires verification.
-
-0.8.13：Mac 在速度优先验证成功时允许两帧有界硬件准入，保留最新捕获画面；修正实际丢帧统计。桌面任务声明 Interactive，串流期间持有低延迟活动。Windows 大帧重组最短期限由 25 改为 50 毫秒，完整帧仍立即解码，缺包恢复保持有界。请更新两端与 Mac 开机组件。HiDPI、色深、色彩、码率与目标帧率不变；实际帧率以运行统计为准，Windows 0.8.13 实机回传显示解码与显示通常约 1 毫秒；Mac 系统启动路径仍未稳定达到 60 FPS。
-Version 0.8.13: verified Mac speed priority permits at most two hardware admissions; only the newest capture is retained, and discard statistics count actual replacements. The desktop task is Interactive and streaming holds a latency-critical activity. Windows allows at least 50 ms instead of 25 ms to reassemble modern large frames; completed frames decode immediately, and loss recovery remains bounded. Update both platforms and Mac startup components. HiDPI, precision, colors, bitrate and target FPS are preserved; ROG telemetry now shows approximately 1 ms from frame arrival to Present; native Mac startup throughput is still below 60 FPS.
-
-0.8.14：Mac 仅在首次验证视频通道时请求额外关键帧；重复 UDP 保活不再触发重编码。显式缺帧恢复仍有效。Windows 视频逻辑与 0.8.13 相同，兼容已更新的 Mac。
-Version 0.8.14: Mac requests an extra keyframe only on the first validated video-path probe, not on recurring keepalives. Explicit loss recovery remains available. Windows video behavior is unchanged from 0.8.13 and remains compatible with the updated Mac.
-
-0.8.15：Mac 与 Windows 共用根目录 ThunderDisplay.png 作为应用图标。Windows 程序文件、任务栏、设置与远程显示窗口均使用多尺寸图标，窗口图标支持系统缩放变化。
-Version 0.8.15: both applications use the shared ThunderDisplay.png artwork. Windows embeds a multi-resolution icon for Explorer, the taskbar and both windows, with DPI-aware window icons.
+Run the Setup EXE. Optional sign-in startup runs in the ThunderDisplay tray; shortcuts open settings.
+Closing settings keeps the application running. Use the tray menu to quit.
+A continuous 3-second outage returns to settings; bounded automatic recovery continues and new video restores the remote window.
+Upgrade and uninstall through the installer / Windows Installed apps. Connection preferences are retained.

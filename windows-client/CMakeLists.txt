@@ -1,10 +1,11 @@
 enable_language(RC)
-set_property(SOURCE client.rc APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplay.ico)
+set_property(SOURCE client.rc APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplay.ico ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplayDark.ico ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplayStatus.ico ${CMAKE_CURRENT_SOURCE_DIR}/assets/ThunderDisplayStatusLight.ico)
 add_executable(ThunderDisplayClient WIN32 client.rc src/displays.cpp src/setup.cpp src/main.cpp src/network.cpp src/decoder.cpp src/video_worker.cpp src/renderer.cpp)
 target_include_directories(ThunderDisplayClient PRIVATE ../shared src ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(ThunderDisplayClient PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 target_link_libraries(ThunderDisplayClient PRIVATE ws2_32 iphlpapi mfplat mf mfuuid wmcodecdspuuid d3d11 d3dcompiler dxgi dxguid ole32 oleaut32 user32 shell32 gdi32 advapi32 crypt32 comctl32 dwmapi uxtheme windowscodecs)
 if(MSVC)
+    set_property(TARGET ThunderDisplayClient PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(ThunderDisplayClient PRIVATE /W4 /permissive- /EHsc /utf-8)
 endif()
 

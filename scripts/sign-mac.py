@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import secrets
 import subprocess
@@ -66,7 +67,8 @@ def main():
     app = Path(sys.argv[1]).resolve()
     identity = os.environ.get('THUNDERDISPLAY_SIGN_IDENTITY')
     keychain = None
-    command = ['/usr/bin/codesign', '--force', '--identifier', 'dev.thunderdisplay.host']
+    bundle_id = plistlib.loads((app / 'Contents/Info.plist').read_bytes())['CFBundleIdentifier']
+    command = ['/usr/bin/codesign', '--force', '--identifier', bundle_id]
     if identity:
         command += ['--sign', identity]
     else:

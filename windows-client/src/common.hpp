@@ -34,6 +34,7 @@ struct ClientOptions {
     uint16_t port=td::Port;
     td::Settings settings;
     bool fullscreen=false, vsync=false, explicitSettings=false, pairing=false, autoConnect=false;
+    bool background=false, showSettings=false, exitExisting=false;
     bool autoQuality=true, customBitrate=false, pixelExact=false, nativePixels=true, clipboard=true;
     bool autoFrameRate=true;
     bool localCursor=false;

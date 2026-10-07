@@ -2,6 +2,7 @@
 #include "cursor_wire.hpp"
 #include "setup.hpp"
 #include "image_clipboard.hpp"
+#include "tray.hpp"
 #include "../version.h"
 #include <shellapi.h>
 #include <commctrl.h>
@@ -15,7 +16,9 @@ ClientOptions parse() {
     int argc; auto argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     if(!argv) throw std::runtime_error("Cannot parse command line");
     std::vector<std::wstring> args(argv+1,argv+argc); LocalFree(argv);
-    ClientOptions o; o.explicitSettings=!args.empty();
+    ClientOptions o; o.explicitSettings=std::any_of(args.begin(),args.end(),[](const auto& arg) {
+        return arg!=L"--background" && arg!=L"--show-settings" && arg!=L"--quit";
+    });
     for(size_t i=0;i<args.size();++i) {
         auto arg=utf8(args[i]);
         if(arg=="--help" || arg=="-h") {
@@ -26,6 +29,9 @@ ClientOptions parse() {
                 <<"Ctrl+Alt+Enter: fullscreen (configurable in setup). Ctrl+Alt+Shift+Esc: release/capture input. Close window: disconnect.\n";
             MessageBoxW(nullptr,wide(help.str()).c_str(),L"ThunderDisplay",MB_OK); std::exit(0);
         }
+        if(arg=="--background") { o.background=true; continue; }
+        if(arg=="--show-settings") { o.showSettings=true; continue; }
+        if(arg=="--quit") { o.exitExisting=true; continue; }
         if(arg=="--fullscreen") { o.fullscreen=true; continue; }
         if(arg=="--vsync") { o.vsync=true; continue; }
         if(arg=="--display-pixels") { o.nativePixels=false; continue; }
@@ -74,6 +80,9 @@ ClientOptions parse() {
 struct App {
     HWND window=nullptr;
     WindowIcons icons;
+    TrayIcon tray;
+    td::RemoteWindowRecovery remoteRecovery;
+    UINT taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
     std::unique_ptr<SetupWindow> setup;
     bool openOnFirstFrame=false, fullscreenRequested=false;
     std::unique_ptr<Renderer> renderer;
@@ -300,6 +309,7 @@ struct App {
         auto caption=std::wstring(L"ThunderDisplay " TD_VERSION_WIDE L" | ")+state+L" | "+shortcutName()+tr(L" 全屏 · Ctrl+Alt+Shift+Esc 释放输入",L" fullscreen · Ctrl+Alt+Shift+Esc release input");
         if(!capture) caption+=tr(L" | 输入已释放",L" | Input released");
         SetWindowTextW(window,caption.c_str());
+        tray.status(state);
         if(!ready()) InvalidateRect(window,nullptr,FALSE);
     }
     void connect(ClientOptions options) {
@@ -318,6 +328,7 @@ struct App {
             }
             renderer=std::make_unique<Renderer>(window,options.vsync); renderer->setPixelExact(options.pixelExact); renderer->setScalingQuality(options.scalingQuality);
             session=std::make_unique<ClientSession>(options,*renderer,window);
+            remoteRecovery.begin(micros());
             setup->setActive(true); title(); showDisplay(); session->start();
         } catch(const std::exception& e) {
             disconnect(false);
@@ -333,13 +344,44 @@ struct App {
         // Remove notifications from the old worker before a new session can start.
         MSG queued{}; while(PeekMessageW(&queued,window,StatusMessage,CursorMessage,PM_REMOVE)) {}
         if(fullscreen) toggleFullscreen();
-        ShowWindow(window,SW_HIDE); openOnFirstFrame=false;
+        ShowWindow(window,SW_HIDE); openOnFirstFrame=false; remoteRecovery.clear();
         if(setup) { setup->setActive(false); title(); if(showSetup) setup->present(); }
     }
     void showDisplay() {
         if(!session) return;
+        if(remoteRecovery.returned && (!session->connected() || !td::VideoHealth::fresh(micros(),session->lastVideoDecodedAt()))) {
+            setup->present(); return;
+        }
         ShowWindow(window,SW_RESTORE); SetForegroundWindow(window);
         remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0; title();
+    }
+    void connectionWindowTick() {
+        if(!session) return;
+        auto action=remoteRecovery.update(micros(),session->lastVideoDecodedAt(),session->connected(),session->lastPeerActivityAt());
+        if(action==td::RemoteWindowRecovery::Action::ReturnToSetup) {
+            release(); renewKeyboardHook=true;
+            ShowWindow(window,SW_HIDE); openOnFirstFrame=false;
+            diagnosticLog("window.return_to_setup","video unavailable for 3 seconds");
+            title(); setup->present();
+        } else if(action==td::RemoteWindowRecovery::Action::RestoreRemote) {
+            diagnosticLog("window.restore_remote","new live video received");
+            openOnFirstFrame=true; showDisplay();
+        }
+    }
+    void trayMenu() {
+        auto menu=CreatePopupMenu(); if(!menu) return;
+        AppendMenuW(menu,MF_STRING,1,tr(L"打开设置",L"Open settings"));
+        AppendMenuW(menu,MF_STRING|(session?0:MF_GRAYED),2,tr(L"打开远程画面",L"Open remote display"));
+        AppendMenuW(menu,MF_STRING|(session?0:MF_GRAYED),3,tr(L"断开连接",L"Disconnect"));
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        AppendMenuW(menu,MF_STRING,4,tr(L"退出 ThunderDisplay",L"Quit ThunderDisplay"));
+        POINT point{}; GetCursorPos(&point); SetForegroundWindow(window);
+        auto command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,window,nullptr);
+        DestroyMenu(menu); PostMessageW(window,WM_NULL,0,0);
+        if(command==1) setup->present();
+        if(command==2) showDisplay();
+        if(command==3) disconnect();
+        if(command==4) PostQuitMessage(0);
     }
     void toggleFullscreen() {
         if(!fullscreen) {
@@ -413,7 +455,14 @@ struct App {
         return renderer->pointerPosition(short(LOWORD(l)),short(HIWORD(l)),buttons!=0,x,y);
     }
     LRESULT message(UINT m,WPARAM w,LPARAM l) {
+        if(m==taskbarCreated) { tray.refresh(true); title(); return 0; }
+        if(m==showSettingsMessage()) { if(setup) setup->present(); return 0; }
+        if(m==exitForInstallerMessage()) { PostQuitMessage(0); return 0; }
         switch(m) {
+        case TrayMessage:
+            if(LOWORD(l)==WM_LBUTTONDBLCLK || LOWORD(l)==NIN_SELECT || LOWORD(l)==NIN_KEYSELECT) setup->present();
+            if(LOWORD(l)==WM_CONTEXTMENU || LOWORD(l)==WM_RBUTTONUP) trayMenu();
+            return 0;
         case KeyboardMessage:
             if(capture && ready() && GetForegroundWindow()==window) {
                 auto key=uint16_t(w),inputFlags=uint16_t(l);
@@ -439,7 +488,7 @@ struct App {
             }
             title(); return 0;
         case WM_CLOSE: disconnect(); return 0;
-        case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE: td::UITheme::system().apply(window); return 0;
+        case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE: td::UITheme::system().apply(window); icons.apply(window); tray.refresh(); title(); return 0;
         case CursorMessage:
             if(session) if(auto payload=session->takeCursor()) {
                 try {
@@ -460,6 +509,7 @@ struct App {
         case WM_KILLFOCUS: release(); return 0;
         case WM_CLIPBOARDUPDATE: clipboardChanged(); return 0;
         case WM_TIMER:
+            if(w==9) { tray.retry(); connectionWindowTick(); return 0; }
             if(w==7) { KillTimer(window,7); clipboardChanged(); return 0; }
             if(w==8) { KillTimer(window,8); receiveClipboard(); return 0; } break;
         case ClipboardMessage:
@@ -467,7 +517,7 @@ struct App {
             else receiveClipboard(); return 0;
         case WM_CAPTURECHANGED: if(buttons) release(); return 0;
         case StatusMessage: title(); return 0;
-        case DisconnectedMessage: renewKeyboardHook=true;nativeCursor.reset();cursorDPI=0;release(); title(); if(setup && GetForegroundWindow()==window && !ready() && !(session && session->handingOver())) setup->present(); return 0;
+        case DisconnectedMessage: renewKeyboardHook=true;nativeCursor.reset();cursorDPI=0;release(); title(); connectionWindowTick(); return 0;
         case FramePresentedMessage:
             if(ready() && renewKeyboardHook) refreshKeyboardHook();
             if(ready() && openOnFirstFrame) {
@@ -526,7 +576,7 @@ struct App {
         if(m==WM_NCCREATE) { a=reinterpret_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams); a->window=h; SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(a)); }
         return a?a->message(m,w,l):DefWindowProcW(h,m,w,l);
     }
-    ~App() { if(clipboardListening) RemoveClipboardFormatListener(window); if(hook) UnhookWindowsHookEx(hook); if(session) session->stop(); session.reset(); renderer.reset(); if(window) DestroyWindow(window); setup.reset(); if(localCursor) { SetCursor(LoadCursorW(nullptr,IDC_ARROW)); DestroyCursor(localCursor); } instance=nullptr; }
+    ~App() { tray.remove(); if(window) KillTimer(window,9); if(clipboardListening) RemoveClipboardFormatListener(window); if(hook) UnhookWindowsHookEx(hook); release(); if(session) session->stop(); session.reset(); renderer.reset(); if(window) DestroyWindow(window); setup.reset(); if(localCursor) { SetCursor(LoadCursorW(nullptr,IDC_ARROW)); DestroyCursor(localCursor); } instance=nullptr; }
 };
 App* App::instance=nullptr;
 }
@@ -538,6 +588,16 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
     bool winsock=false,mf=false,com=false;
     try {
         auto options=parse();
+        struct InstanceLock { HANDLE handle=nullptr; ~InstanceLock() { if(handle) CloseHandle(handle); } } single;
+        single.handle=CreateMutexW(nullptr,FALSE,L"Local\\ThunderDisplay.Client.v1");
+        const bool existing=GetLastError()==ERROR_ALREADY_EXISTS;
+        if(!single.handle) throw std::runtime_error("Single-instance registration failed");
+        if(existing || options.exitExisting) {
+            auto target=FindWindowW(L"ThunderDisplay",nullptr);
+            if(target && (options.exitExisting || !options.background))
+                PostMessageW(target,options.exitExisting?exitForInstallerMessage():showSettingsMessage(),0,0);
+            return 0;
+        }
         INITCOMMONCONTROLSEX controls{}; controls.dwSize=sizeof(controls); controls.dwICC=ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS;
         if(!InitCommonControlsEx(&controls)) throw std::runtime_error("Common controls initialization failed");
         WSADATA data; if(WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Winsock startup failed"); winsock=true;
@@ -552,6 +612,8 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             HWND h=CreateWindowExW(0,wc.lpszClassName,L"ThunderDisplay",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1280,800,nullptr,nullptr,wc.hInstance,&app);
             if(!h) throw std::runtime_error("Window creation failed");
             app.icons.apply(h);
+            app.tray.attach(h);
+            if(!SetTimer(h,9,100,nullptr)) throw std::runtime_error("Connection status timer failed");
             td::UITheme::system().apply(h);
             app.clipboardListening=AddClipboardFormatListener(h)!=FALSE;
             app.setup=std::make_unique<SetupWindow>(options); app.fullscreenHotkey=app.setup->fullscreenShortcut();
@@ -562,7 +624,8 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             app.setup->onShortcut=[&app](uint16_t shortcut){app.fullscreenHotkey=shortcut; app.title();};
             app.hook=SetWindowsHookExW(WH_KEYBOARD_LL,App::keyboard,wc.hInstance,0);
             if(!app.hook) throw std::runtime_error("Keyboard hook failed");
-            app.setup->present();
+            app.title();
+            if(options.showSettings && !options.background) app.setup->present();
             // Only an explicit CLI token starts streaming automatically.
             if(options.autoConnect) app.connect(options);
             MSG msg{};

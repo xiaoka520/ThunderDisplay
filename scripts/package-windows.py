@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Package the GUI EXE under a versioned name and reject console/stale builds."""
+"""Validate the GUI and build a localized, installable NSIS distribution."""
 from hashlib import sha256
 from pathlib import Path
 import re
 import struct
-from zipfile import ZipFile, ZIP_DEFLATED
+import shutil
+import subprocess
+import os
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,41 +52,60 @@ def validate_gui(data, version):
 def main():
     header = (ROOT / "windows-client/version.h").read_text()
     version = re.search(r'#define TD_VERSION_TEXT "([0-9.]+)"', header).group(1)
-    source = ROOT / "dist/windows-x64"
+    source = ROOT / "build/package/windows-x64"
+    (source / "licenses").mkdir(parents=True, exist_ok=True)
     (source / "licenses/ThunderDisplay-AGPL-3.0.txt").write_bytes((ROOT / "LICENSE").read_bytes())
     data = (source / "ThunderDisplayClient.exe").read_bytes()
     validate_gui(data, version)
-    folder = f"ThunderDisplay-GUI-{version}-x64"
-    filename = f"ThunderDisplay-GUI-{version}-x64.exe"
-    standalone = ROOT / "dist" / filename
-    standalone.write_bytes(data)
-    archive = ROOT / "dist" / f"ThunderDisplay-Windows-GUI-{version}-x64.zip"
+    for marker in (b"ThunderDisplay.ExitForInstaller.v1", b"window.return_to_setup", b"window.restore_remote"):
+        encoded = marker.decode().encode("utf-16-le") if marker.startswith(b"ThunderDisplay.") else marker
+        if encoded not in data:
+            raise ValueError(f"Missing tray / recovery build marker: {marker!r}")
+    compiler = shutil.which("makensis")
+    if not compiler:
+        for candidate in (Path("C:/Program Files (x86)/NSIS/makensis.exe"), Path("C:/Program Files/NSIS/makensis.exe")):
+            if candidate.is_file():
+                compiler = str(candidate)
+                break
+    if not compiler:
+        raise RuntimeError("Install NSIS 3 and add makensis to PATH")
+    output = ROOT / "dist" / f"ThunderDisplay-Windows-Setup-{version}-x64.exe"
+    output.parent.mkdir(exist_ok=True)
+    staged = source.parent / output.name
+    installed_kb = (sum(path.stat().st_size for path in source.rglob('*') if path.is_file()) + 1023) // 1024
+    prefix = "/" if os.name == "nt" else "-"
+    subprocess.run([compiler, f"{prefix}V3", f"{prefix}DTD_VERSION={version}",
+                    f"{prefix}DTD_INSTALLED_KB={installed_kb}",
+                    f"{prefix}DTD_SOURCE={source}", f"{prefix}DTD_ROOT={ROOT}", f"{prefix}DTD_OUTPUT={staged}",
+                    str(ROOT / "installers/windows/ThunderDisplay.nsi")], check=True)
+    if staged.stat().st_size < 100000 or staged.read_bytes()[:2] != b"MZ":
+        raise ValueError("Invalid installer output")
+    extractor = shutil.which("7zz") or shutil.which("7z")
+    if not extractor:
+        raise RuntimeError("Install 7-Zip and add 7zz or 7z to PATH for installer payload verification")
+    extracted = source.parent / "windows-installer-verify"
+    if extracted.exists(): shutil.rmtree(extracted)
+    subprocess.run([extractor, "x", "-y", f"-o{extracted}", str(staged)], check=True, stdout=subprocess.DEVNULL)
+    clients = list(extracted.rglob("ThunderDisplayClient.exe"))
+    if len(clients) != 1 or clients[0].read_bytes() != data:
+        raise ValueError("Windows installer embeds the wrong client")
+    if not list(extracted.rglob("*ninstall.exe")):
+        raise ValueError("Windows installer is missing its uninstaller")
     digest = sha256(data).hexdigest()
-    with ZipFile(archive, "w", ZIP_DEFLATED) as package:
-        package.writestr(f"{folder}/{filename}", data)
-        package.writestr(f"{folder}/SHA256SUMS.txt", f"{digest}  {filename}\n")
-        package.write(source / "START-HERE.txt", f"{folder}/START-HERE.txt")
-        for item in sorted((source / "licenses").rglob("*")):
-            if item.is_file():
-                package.write(item, f"{folder}/{item.relative_to(source).as_posix()}")
-    with ZipFile(archive) as package:
-        if package.testzip() is not None:
-            raise ValueError("Package integrity failed")
-        packed = package.read(f"{folder}/{filename}")
-        validate_gui(packed, version)
-        if packed != data or sha256(standalone.read_bytes()).hexdigest() != digest:
-            raise ValueError("Packaged EXE differs from the verified GUI build")
+    shutil.copyfile(staged, output)
     # Retire old versions only after the new package has passed verification.
     # Do not create an unversioned duplicate archive.
     for item in (ROOT / "dist").iterdir():
         known_build = re.fullmatch(r"ThunderDisplay-GUI-[0-9.]+-x64\.exe", item.name) or re.fullmatch(
-            r"ThunderDisplay-Windows-GUI-[0-9.]+-x64\.zip", item.name)
+            r"ThunderDisplay-Windows-GUI-[0-9.]+-x64\.zip", item.name) or re.fullmatch(
+            r"ThunderDisplay-Windows-Setup-[0-9.]+-x64\.exe", item.name)
         legacy = item.name in ("ThunderDisplay-Windows-x64.zip", ".DS_Store")
-        if item.is_file() and (known_build or legacy) and item not in (archive, standalone):
+        if item.is_file() and (known_build or legacy) and item != output:
             item.unlink()
-    print(f"GUI package verified: {archive}")
-    print(f"Standalone EXE: {standalone}")
-    print(f"EXE SHA256: {digest}")
+    legacy_folder = ROOT / "dist/windows-x64"
+    if legacy_folder.exists(): shutil.rmtree(legacy_folder)
+    print(f"Windows installer built: {output}")
+    print(f"Client payload SHA256: {digest}")
 
 
 if __name__ == "__main__":

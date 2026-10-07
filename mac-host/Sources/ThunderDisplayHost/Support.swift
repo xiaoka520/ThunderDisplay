@@ -54,7 +54,8 @@ func bridgeAddress() -> String? {
 
 struct Options {
     var bind: String?, port: UInt16 = 47990, display: UInt32?, token: String?, diagnose = false, encoderCheck = false, captureCheck = false
-    var startupStatus = false, repairStartup = false, cursorCheck = false
+    var startupStatus = false, repairStartup = false, registerLogin = false, unregisterLogin = false, cursorCheck = false
+    var installerConfig = false
     var loginWindow = false, loginWindowCheck = false
     var loginWindowFrameCheck = false
     var inputCheck = false, inputCheckQuartz = false, inputCheckKeyboardOnly = false
@@ -81,6 +82,9 @@ struct Options {
             if arg == "--startup-status" { startupStatus = true; continue }
             if arg == "--cursor-check" { cursorCheck = true; continue }
             if arg == "--repair-startup" { repairStartup = true; continue }
+            if arg == "--register-login" { registerLogin = true; continue }
+            if arg == "--unregister-login" { unregisterLogin = true; continue }
+            if arg == "--installer-config" { installerConfig = true; continue }
             if arg == "--background" { background = true; continue }
             if arg == "--encoder-check" { encoderCheck = true; continue }
             if arg == "--encoder-check-srgb" { encoderCheck = true; desktopColorCheck = true; continue }

@@ -20,17 +20,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let clipboard = ClipboardBridge()
     private let cursor = NativeCursorMonitor()
     private let startup = StartupServices()
+    private var darkIcon: Bool?
     private let options: Options
     init(options: Options) { self.options = options }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if let url = Bundle.main.url(forResource: "ThunderDisplay", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
-            NSApp.applicationIconImage = icon
-        }
         log("Desktop app started: uid=\(geteuid()); startup=\(options.background ? "background" : "interactive")")
         let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
         let appMenu = NSMenu(title: "ThunderDisplay"), editMenu = NSMenu(title: ui("编辑", "Edit"))
         appMenu.addItem(withTitle: ui("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: ",").target = self
+        appMenu.addItem(withTitle: ui("卸载 ThunderDisplay…", "Uninstall ThunderDisplay…"), action: #selector(openUninstaller), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: ui("退出 ThunderDisplay", "Quit ThunderDisplay"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for (title, action, key) in [(ui("剪切", "Cut"), "cut:", "x"), (ui("复制", "Copy"), "copy:", "c"), (ui("粘贴", "Paste"), "paste:", "v"), (ui("全选", "Select All"), "selectAll:", "a")] {
@@ -94,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !options.previewUI { observeWorkspace() }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item?.button?.title = "TD"
+        updateApplicationIcon()
         for sig in [SIGINT, SIGTERM] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -220,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
     private func refresh() {
+        updateApplicationIcon()
         guard let setup else { return }
         let now = ProcessInfo.processInfo.systemUptime
         updateStartup()
@@ -471,10 +471,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.target = self; menu.addItem(settings)
         let pair = NSMenuItem(title: ui("复制配对码", "Copy pairing code"), action: #selector(copyCode), keyEquivalent: "")
         pair.target = self; pair.isEnabled = setup?.usePairing.state == .on; menu.addItem(pair)
+        let uninstall = NSMenuItem(title: ui("卸载 ThunderDisplay…", "Uninstall ThunderDisplay…"), action: #selector(openUninstaller), keyEquivalent: "")
+        uninstall.target = self; menu.addItem(uninstall)
         menu.addItem(.separator()); menu.addItem(NSMenuItem(title: ui("退出", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item?.menu = menu
     }
     @objc private func showSettings() { setup?.present(); refresh() }
+    private func updateApplicationIcon() {
+        updateStatusIcon()
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        guard darkIcon != dark else { return }
+        let name = dark ? "ThunderDisplayDark" : "ThunderDisplay"
+        guard let url = Bundle.main.url(forResource: name, withExtension: "icns"), let icon = NSImage(contentsOf: url) else { return }
+        darkIcon = dark; NSApp.applicationIconImage = icon
+        setup?.setApplicationIcon(icon)
+    }
+    private func updateStatusIcon() {
+        guard let button = item?.button, button.image == nil else { return }
+        let image = NSImage(size: NSSize(width: 22, height: 22))
+        for scale in [1, 2, 3] {
+            let suffix = scale == 1 ? "" : "@\(scale)x"
+            guard let url = Bundle.main.url(forResource: "ThunderDisplayStatus" + suffix, withExtension: "png"),
+                  let data = try? Data(contentsOf: url), let representation = NSBitmapImageRep(data: data) else { continue }
+            representation.size = image.size
+            image.addRepresentation(representation)
+        }
+        guard !image.representations.isEmpty else { return }
+        image.isTemplate = true
+        button.title = ""; button.image = image; button.toolTip = "ThunderDisplay"
+    }
+    @objc private func openUninstaller() {
+        let url = URL(fileURLWithPath: "/Applications/ThunderDisplay Uninstaller.app")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            let alert = NSAlert(); alert.messageText = ui("未找到卸载程序", "Uninstaller missing")
+            alert.informativeText = ui("请重新运行 ThunderDisplay 安装包修复安装。", "Run the ThunderDisplay installer again to repair the installation.")
+            alert.runModal(); return
+        }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+    }
     @objc private func copyCode() { copyPairing() }
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate(); workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspaceObservers.removeAll()
@@ -520,8 +554,13 @@ do {
     } else if options.cursorCheck {
         _ = NSApplication.shared
         print(NativeCursorMonitor().diagnostic())
-    } else if options.startupStatus || options.repairStartup {
+    } else if options.installerConfig {
+        let encoder = PropertyListEncoder(); encoder.outputFormat = .xml
+        FileHandle.standardOutput.write(try encoder.encode(StartupServices().installationConfiguration()))
+    } else if options.startupStatus || options.repairStartup || options.registerLogin || options.unregisterLogin {
         let startup = StartupServices()
+        if options.registerLogin { try startup.setLogin(true) }
+        if options.unregisterLogin { try startup.setLogin(false) }
         if options.repairStartup { try startup.repairConfiguredStartup() }
         print("Login startup: \(startup.status(startup.login))")
         print("Boot service: \(startup.bootStatus)")

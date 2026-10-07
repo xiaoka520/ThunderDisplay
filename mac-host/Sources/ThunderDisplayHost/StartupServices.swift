@@ -120,6 +120,12 @@ final class StartupServices {
             }
         }
     }
+    func installationConfiguration() throws -> LoginWindowConfiguration {
+        let port = UserDefaults.standard.object(forKey: "hostPort") as? Int ?? 47990
+        guard let selectedPort = UInt16(exactly: port), selectedPort > 0 else { throw HostError("Invalid startup port") }
+        let pairing = UserDefaults.standard.bool(forKey: "requirePairing")
+        return LoginWindowConfiguration(port: selectedPort, requirePairing: pairing, token: pairing ? try pairingCode(nil) : nil, desktopUID: geteuid())
+    }
     private func administratorInstall(uninstall: Bool) throws {
         guard let script = Bundle.main.url(forResource: "install-boot-service", withExtension: "sh") else { throw HostError(ui("开机服务安装组件缺失", "Boot installer is missing")) }
         func shellQuote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'" }
@@ -128,10 +134,7 @@ final class StartupServices {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("ThunderDisplay-startup-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
         if !uninstall {
-            let port = UserDefaults.standard.object(forKey: "hostPort") as? Int ?? 47990
-            guard let selectedPort = UInt16(exactly: port), selectedPort > 0 else { throw HostError("Invalid startup port") }
-            let pairing = UserDefaults.standard.bool(forKey: "requirePairing")
-            let config = LoginWindowConfiguration(port: selectedPort, requirePairing: pairing, token: pairing ? try pairingCode(nil) : nil, desktopUID: geteuid())
+            let config = try installationConfiguration()
             try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let file = temporary.appendingPathComponent("config.plist")
             let encoder = PropertyListEncoder(); encoder.outputFormat = .xml

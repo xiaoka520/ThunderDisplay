@@ -391,7 +391,7 @@ void SetupWindow::status(const std::wstring& primary,const std::wstring& detail)
 }
 LRESULT SetupWindow::message(UINT m,WPARAM w,LPARAM l) {
     switch(m) {
-    case WM_CLOSE: if(onDisconnect) onDisconnect(); DestroyWindow(window); return 0;
+    case WM_CLOSE: ShowWindow(window,SW_HIDE); return 0;
     case WM_DESTROY: window=nullptr; PostQuitMessage(0); return 0;
     case WM_SIZE: layout(); return 0;
     case WM_SETTINGCHANGE: case WM_THEMECHANGED: case WM_SYSCOLORCHANGE: updateTheme(); return 0;
@@ -598,6 +598,7 @@ void SetupWindow::drawControl(DRAWITEMSTRUCT* item) {
 void SetupWindow::updateTheme() {
     if(updatingTheme) return;
     updatingTheme=true;
+    if(window) icons.apply(window);
     theme=td::UITheme::system();
     for(auto brush:{background,cardBackground,fieldBackground}) if(brush) DeleteObject(brush);
     background=CreateSolidBrush(theme.background); cardBackground=CreateSolidBrush(theme.card); fieldBackground=CreateSolidBrush(theme.field);

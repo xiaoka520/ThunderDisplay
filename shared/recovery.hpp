@@ -41,6 +41,33 @@ struct VideoHealth {
     static bool fresh(uint64_t now,uint64_t last) { return last && now>=last && now-last<StaleAfter; }
     static bool stalled(uint64_t now,uint64_t last) { return now>=last && now-last>=RestartAfter; }
 };
+// A saved image or a new TCP handshake cannot renew this deadline. Only a
+// newly decoded frame may bring the remote window back from the setup screen.
+struct RemoteWindowRecovery {
+    static constexpr uint64_t Timeout=3000000;
+    enum class Action { None, ReturnToSetup, RestoreRemote };
+    uint64_t lastVideo=0, unavailableSince=0;
+    bool watching=false, returned=false;
+    void begin(uint64_t now) { lastVideo=now; unavailableSince=now; watching=true; returned=false; }
+    void clear() { lastVideo=unavailableSince=0; watching=returned=false; }
+    Action update(uint64_t now,uint64_t decodedAt,bool connected,uint64_t peerActivityAt=0) {
+        if(!watching) return Action::None;
+        const bool newVideo=connected && decodedAt>lastVideo && VideoHealth::fresh(now,decodedAt);
+        if(newVideo) {
+            lastVideo=decodedAt; unavailableSince=0;
+            if(returned) { returned=false; return Action::RestoreRemote; }
+        }
+        if(!connected && !unavailableSince) unavailableSince=now;
+        if(connected && peerActivityAt && now>=peerActivityAt && now-peerActivityAt>=Timeout &&
+            !VideoHealth::fresh(now,decodedAt) && !unavailableSince) unavailableSince=peerActivityAt;
+        // A static desktop in a healthy session must not close its window.
+        // Once recovery starts, handshakes cannot renew the outage budget.
+        if(!returned && unavailableSince && now>=unavailableSince && now-unavailableSince>=Timeout) {
+            returned=true; return Action::ReturnToSetup;
+        }
+        return Action::None;
+    }
+};
 // Visible pixels and live-stream health have different lifetimes. Repainting
 // saved pixels must never refresh the clock that authorizes remote input.
 class DisplayedFrame {

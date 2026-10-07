@@ -162,14 +162,14 @@ void ClientSession::run() {
             checkRecoveryDeadline(); connectAndStream(host);
         } catch(const std::exception& e) { diagnosticLog("connection.error",e.what()); if(!stopFlag) setStatus(e.what()); }
         online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false;
-        expireHandover(); renderer.resetFrame(holdingFrame,false,stopFlag?"client stopped":"connection ended");
+        expireHandover(); renderer.resetFrame(!stopFlag,false,stopFlag?"client stopped":"connection ended");
         { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
         PostMessageW(window,DisconnectedMessage,0,0);
     }
     CoUninitialize();
 }
 void ClientSession::connectAndStream(const std::string& host) {
-    online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(holdingFrame,false,"new connection"); overflow=false; wantIDR=false;
+    online=false; videoDecodedAt=0; peerControlAt=0; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(true,false,"new connection"); overflow=false; wantIDR=false;
     Socket tcp(SOCK_STREAM); tcp.nonblocking();
     BOOL yes=TRUE; setsockopt(tcp.fd,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&yes),sizeof(yes));
     auto remote=endpoint(host,options.port);
@@ -278,11 +278,14 @@ void ClientSession::connectAndStream(const std::string& host) {
         auto now=micros();
         if(decoder && decoder->decodedFrames()!=decodedCount) {
             decodedCount=decoder->decodedFrames(); lastDecoded=decoder->lastDecodedAt();
+            videoDecodedAt=lastDecoded;
         }
         if(videoInterrupted && renderer.hasFrame() && td::VideoHealth::fresh(now,lastDecoded) && videoInterrupted.exchange(false))
             diagnosticLog("video.resumed","decoded="+std::to_string(decodedCount));
-        const auto lastLive=confirmedFrame?std::min(lastDecoded,renderer.lastPresentation()):lastDecoded;
-        if(!transitionReceived && !confirmedFrame && renderer.hasFrame()) {
+        const auto lastLive=confirmedFrame && renderer.presentationExpected() && renderer.lastPresentation()>=accepted ?
+            std::min(lastDecoded,renderer.lastPresentation()):lastDecoded;
+        if(!transitionReceived && !confirmedFrame && (renderer.hasFrame() ||
+            (!renderer.presentationExpected() && decodedCount && td::VideoHealth::fresh(now,lastDecoded)))) {
             holdingFrame=false; handoverHold.clear();
             lastStreamHost=host;
             confirmedFrame=true; retryBudget.succeeded(); retryBudget.streamDisplayed(); attemptNumber=0;
@@ -344,7 +347,7 @@ void ClientSession::connectAndStream(const std::string& host) {
             }
             if(n<0 && !wouldBlock()) throw std::runtime_error("TCP receive failed");
             if(n>0) for(auto& message:framer.push(b,size_t(n))) {
-                lastControl=micros(); auto type=td::Message(message[0]);
+                lastControl=micros(); peerControlAt=lastControl; auto type=td::Message(message[0]);
                 if(type==td::Message::SessionTransition) {
                     if(options.capabilityVersion<8 || !decoder || !td::validSessionTransition(message,sessionID))
                         throw std::runtime_error("Invalid session transition notice");

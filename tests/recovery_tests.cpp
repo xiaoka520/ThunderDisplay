@@ -4,6 +4,32 @@
 int main() {
     td::RetryBudget budget;
     constexpr uint64_t start=1000000;
+    using WindowAction=td::RemoteWindowRecovery::Action;
+    td::RemoteWindowRecovery window;
+    assert(window.update(start+10000000,0,false)==WindowAction::None);
+    window.begin(start);
+    assert(window.update(start+2999999,0,false)==WindowAction::None);
+    assert(window.update(start+3000000,0,false)==WindowAction::ReturnToSetup);
+    assert(window.update(start+4000000,0,true)==WindowAction::None); // TCP alone isn't recovery.
+    assert(window.update(start+5000000,start+1,true)==WindowAction::None); // Stale decoded image.
+    assert(window.update(start+5000000,start+5000000,true)==WindowAction::RestoreRemote);
+    assert(window.update(start+5000001,start+5000000,true)==WindowAction::None);
+    assert(window.update(start+6000000,start+5000000,false)==WindowAction::None);
+    assert(window.update(start+7000000,start+7000000,true)==WindowAction::None); // Short outage stays remote.
+    assert(window.update(start+17000000,start+7000000,true)==WindowAction::None); // Static desktop is connected.
+    assert(window.update(start+17000001,0,false)==WindowAction::None);
+    assert(window.update(start+20000000,0,false)==WindowAction::None);
+    assert(window.update(start+20000001,0,true)==WindowAction::ReturnToSetup); // Handshake cannot renew deadline.
+    assert(window.update(start+20000002,start+7000000,true)==WindowAction::None); // Repaint isn't new video.
+    window.clear();
+    assert(window.update(start+20000000,start+20000000,true)==WindowAction::None); // Manual disconnect never reopens.
+    window.begin(start);
+    assert(window.update(start+1,start+1,true,start+1)==WindowAction::None);
+    assert(window.update(start+10000000,start+1,true,start+10000000)==WindowAction::None); // Idle video, live heartbeat.
+    assert(window.update(start+12999999,start+1,true,start+10000000)==WindowAction::None);
+    assert(window.update(start+13000000,start+1,true,start+10000000)==WindowAction::ReturnToSetup); // Cable loss; TCP may not have failed yet.
+    assert(window.update(start+13000001,start+1,true,start+13000001)==WindowAction::None); // Heartbeat isn't a new desktop.
+    assert(window.update(start+13000002,start+13000002,true,start+13000002)==WindowAction::RestoreRemote);
     for(unsigned i=0;i<td::RetryBudget::Total;++i) {
         assert(budget.startAttempt(start+i*td::RetryBudget::Interval));
         assert(budget.attempts==i+1);

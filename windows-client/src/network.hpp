@@ -28,6 +28,8 @@ class ClientSession {
     std::atomic<bool> recoveryStopped{false}, videoInterrupted{false};
     td::HandoverHold handoverHold;
     std::atomic<bool> holdingFrame{false};
+    std::atomic<uint64_t> videoDecodedAt{0};
+    std::atomic<uint64_t> peerControlAt{0};
     void expireHandover();
     void checkRecoveryDeadline();
     void run();
@@ -43,6 +45,8 @@ public:
     bool retryStopped() const { return recoveryStopped; }
     bool interrupted() const { return videoInterrupted; }
     bool handingOver() const { return holdingFrame; }
+    uint64_t lastVideoDecodedAt() const { return videoDecodedAt; }
+    uint64_t lastPeerActivityAt() const { return std::max(videoDecodedAt.load(),peerControlAt.load()); }
     unsigned attempts() const { return attemptNumber; }
     static constexpr unsigned totalAttempts() { return td::RetryBudget::Total; }
     void send(td::Bytes data);

@@ -126,6 +126,13 @@ void Renderer::presentationLoop() {
                 if(result!=WAIT_OBJECT_0+1) throw std::runtime_error("Wait for presentation frame failed");
                 havePermit=true;
             }
+            // Keep the newest decoded sample while hidden. Restoring a static
+            // desktop must be able to present its first frame without waiting
+            // for another screen change, and must not busy-spin in the tray.
+            if(!presentationExpected()) {
+                if(WaitForSingleObject(stopPresentation,50)==WAIT_OBJECT_0) break;
+                continue;
+            }
             // Fetch AFTER display readiness, so newly decoded pictures replace
             // pending samples while waiting instead of becoming a stale FIFO.
             auto item=pictures.take(); if(!item || !pictures.current(*item)) continue;
@@ -218,7 +225,7 @@ bool Renderer::presentPicture(const td::LatestPicture<Picture>::Item& item) {
     std::lock_guard<std::mutex> lock(mutex);
     if(!pictures.current(item)) return false;
     auto* sample=item.picture.sample.Get(); const auto frameWidth=item.picture.width,frameHeight=item.picture.height,fps=item.picture.fps;
-    if(IsIconic(window)) return false;
+    if(!presentationExpected()) return false;
     resizeLocked();
     ComPtr<IMFMediaBuffer> buffer; check(sample->GetBufferByIndex(0,&buffer),"Decoded media buffer");
     ComPtr<IMFDXGIBuffer> gpu;

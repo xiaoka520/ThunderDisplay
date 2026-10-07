@@ -37,7 +37,7 @@ task_script_dir="$(cd "$(dirname "$0")" && pwd)"
 if [[ "$task_script_dir" == *.app/Contents/Resources ]]; then
     task_app="${1:-$task_script_dir/../..}"
 else
-    task_app="${1:-$task_script_dir/../dist/ThunderDisplayHost.app}"
+    task_app="${1:-$task_script_dir/../build/package/ThunderDisplayHost.app}"
 fi
 codesign --verify --deep --strict "$task_app"
 codesign --verify --strict "$task_app/Contents/MacOS/ThunderDisplayBoot"

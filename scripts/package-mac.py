@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Validate and package the current signed Mac app; retire older ZIPs afterward."""
+"""Validate signed apps and create the localized native macOS installer."""
 from hashlib import sha256
 from pathlib import Path
 import plistlib
 import re
 import struct
-from zipfile import ZipFile, ZIP_DEFLATED
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-app = ROOT / 'dist/ThunderDisplayHost.app'
+app = ROOT / 'build/package/ThunderDisplayHost.app'
 info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 version = info['CFBundleShortVersionString']
 client = re.search(r'#define TD_VERSION_TEXT "([0-9.]+)"', (ROOT / 'windows-client/version.h').read_text()).group(1)
@@ -16,6 +18,10 @@ assert version == client, 'Update both platforms together'
 assert info['CFBundleIdentifier'] == 'dev.thunderdisplay.host'
 assert info['CFBundleIconFile'] == 'ThunderDisplay', 'Missing application icon metadata'
 assert (app / 'Contents/Resources/ThunderDisplay.icns').read_bytes() == (ROOT / 'mac-host/Resources/ThunderDisplay.icns').read_bytes(), 'App icon differs from the generated artwork'
+assert (app / 'Contents/Resources/ThunderDisplayDark.icns').read_bytes() == (ROOT / 'mac-host/Resources/ThunderDisplayDark.icns').read_bytes(), 'Dark icon differs from the supplied artwork'
+for suffix in ('', '@2x', '@3x'):
+    name = f'ThunderDisplayStatus{suffix}.png'
+    assert (app / 'Contents/Resources' / name).read_bytes() == (ROOT / 'mac-host/Resources' / name).read_bytes(), 'Status icon differs from Icon/Icon.png'
 assert (app / 'Contents/_CodeSignature/CodeResources').stat().st_mode & 0o444 == 0o444, 'Public signature resource seal must be readable'
 for name in ['ThunderDisplayHost', 'ThunderDisplayBoot']:
     path = app / 'Contents/MacOS' / name
@@ -59,52 +65,119 @@ assert desktop['Label'] == 'dev.thunderdisplay.desktop' and desktop['RunAtLoad']
 assert desktop['LimitLoadToSessionType'] == 'Aqua' and 'UserName' not in desktop
 assert desktop['ProcessType'] == 'Interactive', 'Desktop streaming must not use background resource limits'
 assert desktop['ProgramArguments'] == ['/Library/Application Support/ThunderDisplay/ThunderDisplayHost.app/Contents/MacOS/ThunderDisplayHost', '--background']
-archive = ROOT / 'dist' / f'ThunderDisplay-Mac-{version}-arm64.zip'
-files = [p for p in sorted(app.rglob('*')) if p.is_file()]
-for path in files:
-    assert not any(part in ['.local-signing', '.DS_Store'] for part in path.parts)
-    assert path.suffix not in ['.p12', '.keychain', '.keychain-db', '.pem'], 'Private signing material must not be packaged'
-with ZipFile(archive, 'w', ZIP_DEFLATED) as package:
-    for path in files: package.write(path, path.relative_to(app.parent).as_posix())
-    package.writestr('START-HERE-Mac.txt', f'''ThunderDisplay {version} · Mac 主机
-放在固定位置后启动 .app，完成屏幕录制与键鼠权限。在设置中启用“登录时打开 ThunderDisplay”，系统登录项列表可见。
-新版自动迁移旧登录服务。自启动配置与当前主机运行状态分开显示；待批准不算启用。
-App 启动即自动运行主机，唤醒或显示器恢复后自动重建，不用手动点击启动。
-默认开启“保持 Mac 可连接”，防止系统自动睡眠；屏幕可熄灭，开关可关闭。
-雷雳不支持网络唤醒；手动让 Mac 睡眠后需先唤醒 Mac，随后主机自动恢复。
-随系统启动需系统管理员确认，安装独立发现daemon与LoginWindow图形组件；检查有效帧和输入授权后接受连接，登录后桌面主机接管。
-0.8.11：视频发送与大帧复制移出键鼠队列，Windows收包与解码显示分开；积压有界，参考帧丢失后请求关键帧恢复。新增转色、编解码、发送和显示分段耗时日志。需要同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。
-0.8.15：Mac与Windows应用统一使用根目录ThunderDisplay.png生成的多尺寸图标。
-0.8.14：首次视频通道探测补发关键帧，后续保活不再每两秒触发重编码；显式缺帧恢复保持有效。该修复位于Mac，Windows 0.8.13仍兼容。
-0.8.13：Mac验证速度优先后允许两帧有界硬件准入，仅保留最新捕获画面，并修正丢帧统计。桌面任务声明Interactive；串流活动期间声明低延迟活动，停止后释放。Windows大帧重组最短期限由25改为50毫秒，完整帧立即解码，缺包仍按有界期限恢复。请更新两端与开机组件。HiDPI、色深、色彩、码率与目标帧率不变，实际帧率须按运行统计确认。
-0.8.12：Mac只允许一帧进入硬件编码，完成后立即处理最新捕获帧。Windows收包、解码、显示分开；等待显示刷新时只保留最新已解码画面，不拖住解码。连接检查包含实际显示进度，每五秒向Mac回传各阶段耗时数值，不含画面或输入内容。需同时更新两端与Mac开机组件，保留现有画质参数，ROG实际延迟仍需双机复测。
-0.8.9修复交接冻结时Ready/Ping/关键帧消息被拦截，新桌面能正常开始送帧。冻结只暂停输入，快照立即重绘；普通断线清除旧画面，真实会话交接才无文字保留最后一帧，最多30秒。Windows新增连接独立TCP写线程，键鼠优先于剪贴板分片；鼠标换算使用独立几何快照，不等待显卡锁；解码批次只显示最新输出。Mac颜色转换和VT提交使用独立的单帧工作队列，不阻塞收包。不改变码率、色彩或像素尺寸。需要更新两端与Mac开机组件；真实ROG延迟与画面连续性仍需双机复测。
-0.8.8登录交接提速：每100毫秒检查登录完成，主动请求已安装且用户匹配的桌面任务，避免RunAtLoad等待；Windows收到有效交接通知后15秒内每250毫秒重试，优先复用Mac地址。保留最后一帧，无文字覆盖；需要更新两端与Mac开机组件，真实登录耗时仍需实测。
-0.8.2 登录前键鼠改用系统HID输入；安装后点击“更新开机组件与连接配置”更新系统副本。仅替换桌面App不足以更新登录前程序。
-0.8.3 移除登录前输入准备的全局状态查询，增加独立超时恢复与分阶段日志；需要更新开机组件。
-0.8.7重写登录前键鼠：包含登录前图形标记，主线程发送Quartz会话输入，取消HID失败回退与PID定向投递。需要更新开机组件；真实冷启动输入仍需复测。
-0.8.4 先释放交接端口再清理采集，增加限定用户的Aqua桌面启动任务；需更新开机组件。HID拒绝本地用户上下文时，仅在Quartz事件发送授权有效后尝试标准输入路径，冷启动控制仍需实测。
-0.7.5 修复旧开机注册在重启时抢占任务的问题；已有配置需重新启用此项以迁移，不能只替换 .app。
-FileVault 解锁不支持；macOS 登录界面捕获与控制仍待真实未登录会话验收，安装成功不等于已经验证可用。
-两端更新 {version} 后可用动态原生指针、文字 / 图片剪贴板与 20 Gbps 请求上限。
-0.7.6 动态指针优先使用 macOS 的高密度原图，逻辑大小与点击热点不放大；Windows 需同时更新。
-0.7.7 自动选择匹配 Windows 显示缩放的原生指针倍率，存在对应倍率时直接显示原像素。
-自动模式降低压缩强度，推荐160–1000 Mbps；高预算连接尝试限制帧QP以保留细节。
-两端更新后自动采用sRGB桌面色彩链路，仍为SDR/4:2:0，尚未实现P3/HDR。
-原生深浅色跟随系统。上限不是实测吞吐；硬件接受目标见 Windows 连接诊断。
-Login startup and the boot discovery helper are configurable in the Mac app.
-The boot helper does not capture loginwindow or FileVault preboot.
-The separate LoginWindow graphics agent verifies actual frames and input authorization before serving; pre-login remote control still requires real-session validation.
-Version 0.8.2 uses system HID input before login; update startup components in the Mac settings to update the system copy.
-Update both platforms to {version}. Native Windows GPU/cursor/theme behavior requires the ROG.
+
+for path in app.rglob('*'):
+    if path.is_file():
+        assert not any(part in ['.local-signing', '.DS_Store'] for part in path.parts)
+        assert path.suffix not in ['.p12', '.keychain', '.keychain-db', '.pem'], 'Do not package private signing material'
+assert (app / 'Contents/Resources/uninstall-app.sh').is_file()
+
+work = ROOT / 'build/package/mac-installer'
+if work.exists(): shutil.rmtree(work)
+payload = work / 'payload'
+applications = payload / 'Applications'
+applications.mkdir(parents=True)
+shutil.copytree(app, applications / app.name)
+uninstaller = applications / 'ThunderDisplay Uninstaller.app'
+subprocess.run(['/usr/bin/osacompile', '-o', str(uninstaller),
+                str(ROOT / 'installers/macos/Uninstaller.applescript')], check=True)
+uninstall_info_path = uninstaller / 'Contents/Info.plist'
+uninstall_info = plistlib.loads(uninstall_info_path.read_bytes())
+uninstall_info.update(CFBundleIdentifier='dev.thunderdisplay.uninstaller', CFBundleName='ThunderDisplay Uninstaller',
+                      CFBundleShortVersionString=version, CFBundleVersion=info['CFBundleVersion'],
+                      LSMinimumSystemVersion='13.0', CFBundleIconFile='ThunderDisplay')
+uninstall_info_path.write_bytes(plistlib.dumps(uninstall_info))
+shutil.copyfile(app / 'Contents/Resources/ThunderDisplay.icns', uninstaller / 'Contents/Resources/ThunderDisplay.icns')
+subprocess.run(['python3', str(ROOT / 'scripts/sign-mac.py'), str(uninstaller)], check=True)
+
+scripts = work / 'scripts'
+shutil.copytree(ROOT / 'installers/macos/scripts', scripts)
+for script in scripts.iterdir(): script.chmod(0o755)
+components = work / 'components.plist'
+subprocess.run(['/usr/bin/pkgbuild', '--analyze', '--root', str(payload), str(components)], check=True)
+entries = plistlib.loads(components.read_bytes())
+for entry in entries:
+    entry.update(BundleIsRelocatable=False, BundleHasStrictIdentifier=True, BundleIsVersionChecked=True,
+                 BundleOverwriteAction='upgrade')
+components.write_bytes(plistlib.dumps(entries))
+component = work / 'ThunderDisplay.pkg'
+subprocess.run(['/usr/bin/pkgbuild', '--root', str(payload), '--install-location', '/',
+                '--component-plist', str(components), '--identifier', 'dev.thunderdisplay.installer',
+                '--version', version, '--ownership', 'recommended', '--scripts', str(scripts), str(component)], check=True)
+
+resources = work / 'Resources'
+resources.mkdir()
+shutil.copyfile(ROOT / 'LICENSE', resources / 'License.txt')
+texts = {
+    'zh_CN.lproj': (
+        '安装 ThunderDisplay',
+        '将 Mac 桌面通过本地雷雳网桥传输到 Windows。',
+        '应用安装到“应用程序”，同时安装登录前、桌面和开机组件。升级会保留连接配置和权限身份。',
+        '安装完成',
+        'ThunderDisplay 已安装并启动，完成屏幕录制与辅助功能授权后即可连接。',
+        '使用菜单栏 ThunderDisplay 图标打开设置；卸载请使用其菜单里的“卸载 ThunderDisplay…”，或打开“应用程序”中的 ThunderDisplay Uninstaller。'),
+    'en.lproj': (
+        'Install ThunderDisplay',
+        'Stream your Mac desktop to Windows over the local Thunderbolt Bridge.',
+        'Installs the apps in Applications, plus boot, login-screen and desktop startup components. Upgrades retain connection configuration and signing identity.',
+        'Installation complete',
+        'ThunderDisplay is installed and running. Grant screen recording and accessibility access to connect.',
+        'Open settings from the ThunderDisplay menu bar icon. To uninstall, choose Uninstall ThunderDisplay from its menu or open ThunderDisplay Uninstaller in Applications.')
+}
+for language, text in texts.items():
+    folder = resources / language
+    folder.mkdir()
+    for filename, offset in [('Welcome.html', 0), ('Conclusion.html', 3)]:
+        title, first, second = text[offset:offset+3]
+        (folder / filename).write_text(f'''<!doctype html><html><head><meta charset="utf-8"><style>
+body {{ font: 15px -apple-system, sans-serif; margin: 28px; line-height: 1.65; }}
+h1 {{ font-size: 25px; line-height: 1.25; }}
+@media (prefers-color-scheme: dark) {{ body {{ color: #eee; }} }}
+</style></head><body><h1>{title}</h1><p>{first}</p><p>{second}</p></body></html>''')
+distribution = work / 'Distribution.xml'
+distribution.write_text(f'''<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+  <title>ThunderDisplay {version}</title>
+  <welcome file="Welcome.html" mime-type="text/html"/>
+  <license file="License.txt" mime-type="text/plain"/>
+  <conclusion file="Conclusion.html" mime-type="text/html"/>
+  <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+  <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+  <allowed-os-versions><os-version min="13.0"/></allowed-os-versions>
+  <choices-outline><line choice="main"/></choices-outline>
+  <choice id="main" title="ThunderDisplay" visible="false"><pkg-ref id="dev.thunderdisplay.installer"/></choice>
+  <pkg-ref id="dev.thunderdisplay.installer" version="{version}" onConclusion="none">ThunderDisplay.pkg</pkg-ref>
+</installer-gui-script>
 ''')
-    package.writestr('SHA256SUMS.txt', ''.join(f'{sha256((app / "Contents/MacOS" / name).read_bytes()).hexdigest()}  ThunderDisplayHost.app/Contents/MacOS/{name}\n' for name in ['ThunderDisplayHost','ThunderDisplayBoot']))
-with ZipFile(archive) as package:
-    assert package.testzip() is None, 'ZIP integrity check failed'
-    for path in files: assert package.read(path.relative_to(app.parent).as_posix()) == path.read_bytes()
-    for name in ['ThunderDisplayHost','ThunderDisplayBoot']:
-        assert package.getinfo(f'ThunderDisplayHost.app/Contents/MacOS/{name}').external_attr >> 16 & 0o111
-for path in app.parent.iterdir():
-    if path.is_file() and re.fullmatch(r'ThunderDisplay-Mac-[0-9.]+-arm64\.zip', path.name) and path != archive: path.unlink()
-print(f'Mac package verified: {archive}')
-print(f'Host SHA256: {sha256((app / "Contents/MacOS/ThunderDisplayHost").read_bytes()).hexdigest()}')
+ET.parse(distribution)
+output = ROOT / 'dist' / f'ThunderDisplay-Mac-Setup-{version}-arm64.pkg'
+output.parent.mkdir(exist_ok=True)
+staged = work / output.name
+subprocess.run(['/usr/bin/productbuild', '--distribution', str(distribution), '--resources', str(resources),
+                '--package-path', str(work), str(staged)], check=True)
+
+# Extract the actual PKG payload before publishing it. Verify installed bytes,
+# executable permissions, upgrade placement, scripts and signature resources.
+expanded = work / 'expanded'
+subprocess.run(['/usr/sbin/pkgutil', '--expand-full', str(staged), str(expanded)], check=True)
+installed_payload = expanded / 'ThunderDisplay.pkg/Payload/Applications'
+for bundle in (applications / app.name, uninstaller):
+    for source in bundle.rglob('*'):
+        if source.is_file():
+            packed = installed_payload / source.relative_to(applications)
+            assert packed.read_bytes() == source.read_bytes(), f'Installer payload mismatch: {source.name}'
+            if source.stat().st_mode & 0o111: assert packed.stat().st_mode & 0o111
+for filename in ('preinstall', 'postinstall'):
+    assert (expanded / 'ThunderDisplay.pkg/Scripts' / filename).read_bytes() == (scripts / filename).read_bytes()
+package_info = ET.parse(expanded / 'ThunderDisplay.pkg/PackageInfo').getroot()
+for bundle in package_info.findall('bundle'):
+    assert bundle.get('path', '').removeprefix('./').startswith('Applications/')
+assert all(len(node) == 0 for node in package_info.findall('relocate')), 'Installer must use fixed Applications paths'
+shutil.copyfile(staged, output)
+for old in output.parent.iterdir():
+    obsolete = re.fullmatch(r'ThunderDisplay-Mac-(?:Setup-)?[0-9.]+-arm64\.(?:zip|pkg)', old.name)
+    if old.is_file() and obsolete and old != output: old.unlink()
+legacy_app = ROOT / 'dist/ThunderDisplayHost.app'
+if legacy_app.exists(): shutil.rmtree(legacy_app)
+print(f'Mac installer verified: {output}')
+print(f'Host payload SHA256: {sha256((app / "Contents/MacOS/ThunderDisplayHost").read_bytes()).hexdigest()}')

@@ -92,6 +92,7 @@ public:
     void setPixelExact(bool value) { std::lock_guard<std::mutex> lock(mutex); pixelExact=value; updatePointerGeometryLocked(); }
     void setScalingQuality(uint8_t value) { std::lock_guard<std::mutex> lock(mutex); scalingQuality=std::min<uint8_t>(value,1); }
     bool hasFrame() const { return frameState.fresh(micros()); }
+    bool presentationExpected() const { return IsWindowVisible(window) && !IsIconic(window); }
     bool hasImage() const { return frameState.hasImage(); }
     uint64_t lastPresentation() const { return frameState.lastPresentation(); }
     std::string colorDescription();

@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+if [ "${3:-/}" != / ]; then
+    printf 'ThunderDisplay must be installed on the running system volume.\n' >&2; exit 1
+fi
+for task_path in /Applications/ThunderDisplayHost.app "/Applications/ThunderDisplay Uninstaller.app" "/Library/Application Support/ThunderDisplay"; do
+    if [ -L "$task_path" ]; then printf 'Refusing symlink installation destination.\n' >&2; exit 1; fi
+done
+# Stop the supervised agent before the old executable, otherwise KeepAlive
+# would relaunch it while the native Installer replaces its bundle.
+task_desktop_plist=/Library/LaunchAgents/dev.thunderdisplay.desktop.plist
+task_uid="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$task_desktop_plist" 2>/dev/null || true)"
+if [[ "$task_uid" =~ ^[0-9]{3,10}$ ]] && [ "$task_uid" -ge 500 ]; then
+    /bin/launchctl bootout "gui/$task_uid/dev.thunderdisplay.desktop" 2>/dev/null || true
+fi
+/bin/launchctl unload -S LoginWindow /Library/LaunchAgents/dev.thunderdisplay.loginwindow.plist 2>/dev/null || true
+/usr/bin/pkill -TERM -x ThunderDisplayHost 2>/dev/null || true
+for ((task_count=0; task_count<100; task_count++)); do
+    if ! /usr/bin/pgrep -x ThunderDisplayHost >/dev/null; then exit 0; fi
+    /bin/sleep 0.1
+done
+printf 'Quit ThunderDisplay and retry installation.\n' >&2; exit 1

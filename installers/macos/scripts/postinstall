@@ -1,0 +1,36 @@
+#!/bin/bash
+set -euo pipefail
+task_app=/Applications/ThunderDisplayHost.app
+task_host="$task_app/Contents/MacOS/ThunderDisplayHost"
+task_service_dir="/Library/Application Support/ThunderDisplay"
+/usr/bin/codesign --verify --deep --strict "$task_app"
+/usr/bin/codesign --verify --deep --strict "/Applications/ThunderDisplay Uninstaller.app"
+task_temporary="$(/usr/bin/mktemp -d /private/tmp/ThunderDisplay-install.XXXXXX)"
+trap '/bin/rm -rf "$task_temporary"' EXIT
+/bin/chmod 700 "$task_temporary"
+task_config="$task_temporary/config.plist"
+task_uid="$(/usr/bin/stat -f %u /dev/console)"
+if [ -f "$task_service_dir/loginwindow-config.plist" ]; then
+    # Preserve the port, optional pairing identity and intended desktop user.
+    if [ -L "$task_service_dir/loginwindow-config.plist" ] || [ "$(/usr/bin/stat -f %u "$task_service_dir/loginwindow-config.plist")" != 0 ]; then
+        printf 'Invalid existing startup configuration ownership.\n' >&2; exit 1
+    fi
+    /bin/cp "$task_service_dir/loginwindow-config.plist" "$task_config"
+elif [ "$task_uid" -ge 500 ] && [ "$task_uid" -lt 4294967295 ]; then
+    (umask 077; /bin/launchctl asuser "$task_uid" /usr/bin/sudo -H -u "#$task_uid" "$task_host" --installer-config > "$task_config")
+else
+    # New deployment without a user session: install the app now; the user
+    # chooses the target account when enabling system startup after sign-in.
+    printf 'App installed. Enable system startup from the intended user desktop.\n'
+    exit 0
+fi
+/bin/chmod 600 "$task_config"
+/bin/bash "$task_app/Contents/Resources/install-boot-service.sh" "$task_app" "$task_config"
+if [ "$task_uid" -ge 500 ] && [ "$task_uid" -lt 4294967295 ]; then
+    if ! /bin/launchctl asuser "$task_uid" /usr/bin/sudo -H -u "#$task_uid" "$task_host" --register-login >/dev/null; then
+        printf 'Login item registration needs confirmation in the app; desktop launch agent is installed.\n'
+    fi
+    # Opening the installed bundle activates the existing desktop agent through
+    # the instance lease rather than starting another listening host.
+    /bin/launchctl asuser "$task_uid" /usr/bin/sudo -H -u "#$task_uid" /usr/bin/open "$task_app"
+fi
