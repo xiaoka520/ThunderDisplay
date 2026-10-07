@@ -1,13 +1,13 @@
 # ThunderDisplay
 
-为 **Mac mini → 雷雳网桥 → Windows ** 编写的本地远程显示器。
+为 **Mac → 雷雳网桥 → Windows** 编写的本地远程显示器。
 
-Mac 使用 Swift / ScreenCaptureKit / VideoToolbox；Windows 使用 C++17 / Media Foundation / Direct3D 11。
+macOS 使用 Swift / ScreenCaptureKit / VideoToolbox；Windows 使用 C++17 / Media Foundation / Direct3D 11。
 运行不依赖互联网、云账户、Moonlight、Sunshine 或第三方视频库。
 
 ## 当前实现
 
-- Mac 全屏捕获；可选 Windows 本地显示 macOS 当前系统指针，动态同步形状、隐藏状态与原生点击热点，串流不重复绘制指针。
+- macOS 全屏捕获；可选 Windows 本地显示 macOS 当前系统指针，动态同步形状、隐藏状态与原生点击热点，串流不重复绘制指针。
 - HEVC Main / Main10 / H.264 High 硬件编码，8 / 10-bit 4:2:0，sRGB SDR（旧端 BT.709 兼容）；禁止 B 帧，实时编码，0.5 秒 GOP。
 - 默认自动协商：检测 Mac 源渲染像素与 Windows 显示器原生尺寸 / 最大可用刷新率，保留源比例、避免放大，自动选择高码率。手动支持 1–240 FPS。
 - TCP 配置、可选配对验证、心跳、键鼠；UDP Annex B 视频，单包最多 1200 字节。
@@ -16,12 +16,12 @@ Mac 使用 Swift / ScreenCaptureKit / VideoToolbox；Windows 使用 C++17 / Medi
 - 配对码验证默认关闭，可在 Mac 开启；关闭时仅接收选定接口同子网的连接。每连接随机视频会话、单客户端控制。
 - 有界队列，过期 / 丢失帧后请求 IDR，跳过依赖缺失的 P 帧。
 - HEVC 不可用时自动重连改用 H.264；断线自动重连；失焦 / 断线释放按键。
-- Mac 自动选择已有 IPv4 的雷雳网桥；Windows 从本机 Ethernet 接口广播发现，也可显式指定 IP。
-- Mac 圆角卡片界面，区分桌面逻辑尺寸、HiDPI 捕获源像素和最大可用模式，可选择捕获显示器；一次启动申请屏幕录制和辅助功能，自动检查授权，无权限 / 无网桥也能继续设置。
+- macOS 自动选择已有 IPv4 的雷雳网桥；Windows 从本机 Ethernet 接口广播发现，也可显式指定 IP。
+- macOS 圆角卡片界面，区分桌面逻辑尺寸、HiDPI 捕获源像素和最大可用模式，可选择捕获显示器；一次启动申请屏幕录制和辅助功能，自动检查授权，无权限 / 无网桥也能继续设置。
 - Windows 圆角卡片和控件，随窗口尺寸 / DPI 调整，可选择目标屏幕并检测原生尺寸、最大可用模式、刷新率和 HDR 状态；中文 / 英文跟随系统，也支持手动切换。
 - Windows 保存连接参数；配对码仅在勾选“记住”时使用当前 Windows 用户的 DPAPI 加密保存。
 - 两端随系统切换深浅色；Mac 原生语义颜色，Windows 原生标题栏 / 控件主题与高对比度支持。
-- Mac 原生登录项与独立系统启动组件：系统 daemon负责发现，LoginWindow agent负责登录界面捕获与输入检查，通过后接受串流，登录后桌面主机接管。登录前实机验收仍待完成；安装不代表已获得系统许可。
+- macOS 原生登录项与独立系统启动组件：系统 daemon负责发现，LoginWindow agent负责登录界面捕获与输入检查，通过后接受串流，登录后桌面主机接管。登录前实机验收仍待完成；安装不代表已获得系统许可。
 - 双向文字与图片剪贴板（UTF-8 / PNG / macOS TIFF / Windows DIB），不传文件。
 - Windows ThunderDisplay 系统托盘后台运行，关闭设置不退出；连续断连 3 秒返回设置，新画面恢复后重新打开远程窗口。
 - 两端提供安装向导：macOS 原生 PKG、Windows 中文 / 英文安装 EXE，包含升级、自启动配置与卸载入口。
@@ -30,8 +30,8 @@ GUI 显示模式仅“自动”和“自定义”，不再提供固定 FPS 档�
 
 ## TODO
 
-[]多显示器支持
-[]更快的画面传输
-[]Windows端UI优化
+[ ] 多显示器支持  
+[ ] 更快的画面传输  
+[ ] Windows端UI优化  
 
 
