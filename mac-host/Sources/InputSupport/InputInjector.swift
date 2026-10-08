@@ -14,23 +14,31 @@ public final class InputInjector: InputControlling {
     private let source: CGEventSource?
     private let authorized: () -> Bool
     private let post: (CGEvent) throws -> Void
+    private let desktop: DesktopPointer?
+    private let pointerPosition: () -> CGPoint?
+    private var relativeNeedsAnchor = true
     private var keys = Set<CGKeyCode>(), buttons = Set<UInt16>()
     private var lockedFlags: CGEventFlags = []
     private var point: CGPoint
     private var clickButton: UInt16?, clickPoint = CGPoint.zero, clickTime: UInt64 = 0, clickCount: Int64 = 1
-    public convenience init(display: CGDirectDisplayID, captureSize: CGSize, contentRect: CGRect,
+    public convenience init(display: CGDirectDisplayID, captureSize: CGSize, contentRect: CGRect, desktopBounds: [CGRect] = [],
                             authorized: @escaping () -> Bool = { CGPreflightPostEventAccess() },
                             post: @escaping (CGEvent) throws -> Void = { $0.post(tap: .cghidEventTap) },
                             eventSource: CGEventSource? = CGEventSource(stateID: .privateState)) {
-        self.init(bounds: CGDisplayBounds(display), captureSize: captureSize, contentRect: contentRect, authorized: authorized, post: post, eventSource: eventSource)
+        self.init(bounds: CGDisplayBounds(display), captureSize: captureSize, contentRect: contentRect,
+                  desktopBounds: desktopBounds, pointerPosition: { CGEvent(source: nil)?.location },
+                  authorized: authorized, post: post, eventSource: eventSource)
     }
-    public init(bounds: CGRect, captureSize: CGSize, contentRect: CGRect,
+    public init(bounds: CGRect, captureSize: CGSize, contentRect: CGRect, desktopBounds: [CGRect] = [],
+                pointerPosition: @escaping () -> CGPoint? = { nil },
                 authorized: @escaping () -> Bool, post: @escaping (CGEvent) throws -> Void,
                 eventSource: CGEventSource? = CGEventSource(stateID: .privateState)) {
         self.bounds = bounds; point = CGPoint(x: bounds.midX, y: bounds.midY)
         self.captureSize = captureSize; self.contentRect = contentRect
         self.authorized = authorized; self.post = post
         self.source = eventSource
+        self.desktop = desktopBounds.isEmpty ? nil : DesktopPointer(screens: desktopBounds)
+        self.pointerPosition = pointerPosition
     }
     private func flags(_ bits: UInt16) -> CGEventFlags {
         var f: CGEventFlags = []
@@ -48,17 +56,26 @@ public final class InputInjector: InputControlling {
         let f = flags(input.flags)
         lockedFlags = f.intersection(.maskAlphaShift)
         switch input.kind {
-        case 1, 2:
-            guard (0...65535).contains(input.x), (0...65535).contains(input.y) else { return }
-            let pixel = CGPoint(x: CGFloat(input.x) / 65535 * (captureSize.width - 1),
-                                y: CGFloat(input.y) / 65535 * (captureSize.height - 1))
-            // Ignore black bars on capture; button releases and active drags still reach the edge.
-            if !contentRect.contains(pixel), (input.kind == 1 && buttons.isEmpty) || (input.kind == 2 && down) { return }
-            let nx = min(1, max(0, (pixel.x - contentRect.minX) / max(1, contentRect.width - 1)))
-            let ny = min(1, max(0, (pixel.y - contentRect.minY) / max(1, contentRect.height - 1)))
-            point = CGPoint(x: bounds.minX + nx * max(0, bounds.width - 1), y: bounds.minY + ny * max(0, bounds.height - 1))
+        case 1, 2, 6, 7:
+            if input.kind == 6 || input.kind == 7 {
+                guard let desktop else { return }
+                if relativeNeedsAnchor {
+                    if let current = pointerPosition() { point = desktop.nearest(current) }
+                    relativeNeedsAnchor = false
+                }
+                if input.kind == 6 { point = desktop.move(from: point, by: CGPoint(x: Int(input.x), y: Int(input.y))) }
+            } else {
+                guard (0...65535).contains(input.x), (0...65535).contains(input.y) else { return }
+                let pixel = CGPoint(x: CGFloat(input.x) / 65535 * (captureSize.width - 1),
+                                    y: CGFloat(input.y) / 65535 * (captureSize.height - 1))
+                // Ignore black bars on capture; button releases and active drags still reach the edge.
+                if !contentRect.contains(pixel), (input.kind == 1 && buttons.isEmpty) || (input.kind == 2 && down) { return }
+                let nx = min(1, max(0, (pixel.x - contentRect.minX) / max(1, contentRect.width - 1)))
+                let ny = min(1, max(0, (pixel.y - contentRect.minY) / max(1, contentRect.height - 1)))
+                point = CGPoint(x: bounds.minX + nx * max(0, bounds.width - 1), y: bounds.minY + ny * max(0, bounds.height - 1))
+            }
             var type: CGEventType = .mouseMoved; var button: CGMouseButton = .left
-            if input.kind == 2 {
+            if input.kind == 2 || input.kind == 7 {
                 guard input.code < 3 else { return }
                 button = input.code == 0 ? .left : input.code == 1 ? .right : .center
                 type = input.code == 0 ? (down ? .leftMouseDown : .leftMouseUp) :
@@ -75,7 +92,7 @@ public final class InputInjector: InputControlling {
             else if buttons.contains(1) { type = .rightMouseDragged; button = .right }
             else if buttons.contains(2) { type = .otherMouseDragged; button = .center }
             let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button)
-            if input.kind == 2 { e?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
+            if input.kind == 2 || input.kind == 7 { e?.setIntegerValueField(.mouseEventClickState, value: clickCount) }
             guard let e else { throw InputPostingError.allocation }
             e.flags = deviceFlags(f); try post(e)
         case 3:
@@ -128,6 +145,7 @@ public final class InputInjector: InputControlling {
         }
         buttons.removeAll()
         clickButton = nil
+        relativeNeedsAnchor = true
     }
     // Windows virtual keys -> physical ANSI macOS keys; left/right modifiers remain distinct.
     private static let keyMap: [UInt16: CGKeyCode] = [

@@ -31,7 +31,20 @@ public struct Reader {
     public var atEnd: Bool { offset == data.count }
 }
 
-public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide, sessionTransition, sessionTransitionAck, videoStatistics }
+public enum Message: UInt8, Sendable { case hello = 1, welcome, input, requestIDR, ping, pong, failure, ready, capabilityQuery, capabilities, clipboardControl, clipboardText, cursorImage, clipboardImage, helloWide, welcomeWide, sessionTransition, sessionTransitionAck, videoStatistics, mouseMode, cursorPosition, rawVideoEndpoint, clientDiagnostics }
+
+public enum CursorPositionWire {
+    public static func packet(session: UInt64, visible: Bool, x: UInt16 = 0, y: UInt16 = 0) -> Data {
+        var w = Writer(); w.put(Message.cursorPosition.rawValue); w.put(session); w.put(UInt8(visible ? 1 : 0))
+        w.put(visible ? x : 0); w.put(visible ? y : 0); return w.data
+    }
+}
+
+public enum MouseModeWire {
+    public static func packet(session: UInt64, relative: Bool) -> Data {
+        var w = Writer(); w.put(Message.mouseMode.rawValue); w.put(session); w.put(UInt8(relative ? 1 : 0)); return w.data
+    }
+}
 
 /// A session-scoped notice, accepted only after pairing and stream negotiation.
 public enum SessionTransitionWire {
@@ -44,7 +57,10 @@ public enum SessionTransitionWire {
         return data == packet(session: session, acknowledgment: acknowledgment)
     }
 }
-public enum Codec: UInt8, Sendable { case h264 = 1, hevc = 2, hevc10 = 4 }
+public enum Codec: UInt8, Sendable {
+    case h264 = 1, hevc = 2, hevc10 = 4, rawP010 = 8, rawPacked10 = 16, rawDelta10 = 32
+    public var isRaw: Bool { self == .rawP010 || self == .rawPacked10 || self == .rawDelta10 }
+}
 
 public struct Hello: Sendable {
     public let udpPort: UInt16, width: UInt16, height: UInt16, fps: UInt16
@@ -58,7 +74,8 @@ public struct Hello: Sendable {
         bitrate = wide ? try r.get(UInt64.self) : UInt64(try r.get(UInt32.self)); codecMask = try r.get(); token = try r.bytes(32)
         guard r.atEnd, udpPort > 0, width >= 320, width <= 4096, height >= 240, height <= 4096,
               width % 2 == 0, height % 2 == 0, fps >= 1, fps <= 240,
-              bitrate >= 10_000_000, bitrate <= (wide ? 20_000_000_000 : 1_000_000_000), codecMask & 7 != 0, codecMask & ~7 == 0
+              bitrate >= 10_000_000, bitrate <= (wide ? 1_000_000_000_000 : 1_000_000_000), codecMask & 63 != 0, codecMask & ~63 == 0,
+              codecMask & 56 == 0 || (wide && (codecMask == 8 || codecMask == 16 || codecMask == 32))
         else { throw WireError.malformed }
     }
 }
@@ -69,7 +86,12 @@ public struct Input: Sendable {
         var r = Reader(data)
         guard try r.get(UInt8.self) == Message.input.rawValue else { throw WireError.malformed }
         kind = try r.get(); code = try r.get(); flags = try r.get(); x = try r.get(); y = try r.get()
-        guard r.atEnd, (1...5).contains(kind), flags & ~63 == 0 else { throw WireError.malformed }
+        guard r.atEnd, (1...7).contains(kind), flags & ~63 == 0 else { throw WireError.malformed }
+        if kind == 6 {
+            guard code == 0, (-32767...32767).contains(x), (-32767...32767).contains(y) else { throw WireError.malformed }
+        } else if kind == 7 {
+            guard code < 3, x == 0, y == 0 else { throw WireError.malformed }
+        }
     }
 }
 

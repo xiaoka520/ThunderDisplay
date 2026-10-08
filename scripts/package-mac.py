@@ -29,6 +29,8 @@ for name in ['ThunderDisplayHost', 'ThunderDisplayBoot']:
     assert data[:4] == b'\xcf\xfa\xed\xfe' and struct.unpack_from('<I', data, 4)[0] == 0x100000c, 'Expected arm64 Mach-O'
     assert path.stat().st_mode & 0o111, 'Missing executable permissions'
     if name == 'ThunderDisplayHost':
+        assert b'Uninstall ThunderDisplay' not in data and '卸载 ThunderDisplay'.encode() not in data, 'Remove uninstall menu entries'
+        assert all(marker in data for marker in (b'Windows client: ', b'windows-client.log', b'ThunderDisplay.windowsDiagnostics')), 'Missing Windows debug log reception'
         # Inspect real load commands, not a marker string in a log message.
         count = struct.unpack_from('<I', data, 16)[0]
         offset = 32
@@ -70,7 +72,12 @@ for path in app.rglob('*'):
     if path.is_file():
         assert not any(part in ['.local-signing', '.DS_Store'] for part in path.parts)
         assert path.suffix not in ['.p12', '.keychain', '.keychain-db', '.pem'], 'Do not package private signing material'
-assert (app / 'Contents/Resources/uninstall-app.sh').is_file()
+assert not (app / 'Contents/Resources/uninstall-app.sh').exists()
+assert (app / 'Contents/Resources/trash-cleanup.sh').read_bytes() == (ROOT / 'installers/macos/trash-cleanup.sh').read_bytes()
+cleanup = plistlib.loads((app / 'Contents/Resources/dev.thunderdisplay.cleanup.plist').read_bytes())
+assert cleanup['Label'] == 'dev.thunderdisplay.cleanup' and cleanup['UserName'] == 'root'
+assert cleanup['ProgramArguments'] == ['/bin/bash', '/Library/Application Support/ThunderDisplay/trash-cleanup.sh']
+assert cleanup['StartInterval'] == 10 and cleanup['ProcessType'] == 'Background'
 
 work = ROOT / 'build/package/mac-installer'
 if work.exists(): shutil.rmtree(work)
@@ -78,17 +85,7 @@ payload = work / 'payload'
 applications = payload / 'Applications'
 applications.mkdir(parents=True)
 shutil.copytree(app, applications / app.name)
-uninstaller = applications / 'ThunderDisplay Uninstaller.app'
-subprocess.run(['/usr/bin/osacompile', '-o', str(uninstaller),
-                str(ROOT / 'installers/macos/Uninstaller.applescript')], check=True)
-uninstall_info_path = uninstaller / 'Contents/Info.plist'
-uninstall_info = plistlib.loads(uninstall_info_path.read_bytes())
-uninstall_info.update(CFBundleIdentifier='dev.thunderdisplay.uninstaller', CFBundleName='ThunderDisplay Uninstaller',
-                      CFBundleShortVersionString=version, CFBundleVersion=info['CFBundleVersion'],
-                      LSMinimumSystemVersion='13.0', CFBundleIconFile='ThunderDisplay')
-uninstall_info_path.write_bytes(plistlib.dumps(uninstall_info))
-shutil.copyfile(app / 'Contents/Resources/ThunderDisplay.icns', uninstaller / 'Contents/Resources/ThunderDisplay.icns')
-subprocess.run(['python3', str(ROOT / 'scripts/sign-mac.py'), str(uninstaller)], check=True)
+assert [bundle.name for bundle in applications.iterdir()] == ['ThunderDisplayHost.app'], 'Only the main app is installed'
 
 scripts = work / 'scripts'
 shutil.copytree(ROOT / 'installers/macos/scripts', scripts)
@@ -115,14 +112,14 @@ texts = {
         '应用安装到“应用程序”，同时安装登录前、桌面和开机组件。升级会保留连接配置和权限身份。',
         '安装完成',
         'ThunderDisplay 已安装并启动，完成屏幕录制与辅助功能授权后即可连接。',
-        '使用菜单栏 ThunderDisplay 图标打开设置；卸载请使用其菜单里的“卸载 ThunderDisplay…”，或打开“应用程序”中的 ThunderDisplay Uninstaller。'),
+        '使用菜单栏 ThunderDisplay 图标打开设置；卸载时将“应用程序”中的 ThunderDisplay 拖进废纸篓，约 30 秒后后台组件自动退出并清理。'),
     'en.lproj': (
         'Install ThunderDisplay',
         'Stream your Mac desktop to Windows over the local Thunderbolt Bridge.',
         'Installs the apps in Applications, plus boot, login-screen and desktop startup components. Upgrades retain connection configuration and signing identity.',
         'Installation complete',
         'ThunderDisplay is installed and running. Grant screen recording and accessibility access to connect.',
-        'Open settings from the ThunderDisplay menu bar icon. To uninstall, choose Uninstall ThunderDisplay from its menu or open ThunderDisplay Uninstaller in Applications.')
+        'Open settings from the ThunderDisplay menu bar icon. To uninstall, move ThunderDisplay from Applications to Trash; background components stop and are removed after about 30 seconds.')
 }
 for language, text in texts.items():
     folder = resources / language
@@ -161,7 +158,8 @@ subprocess.run(['/usr/bin/productbuild', '--distribution', str(distribution), '-
 expanded = work / 'expanded'
 subprocess.run(['/usr/sbin/pkgutil', '--expand-full', str(staged), str(expanded)], check=True)
 installed_payload = expanded / 'ThunderDisplay.pkg/Payload/Applications'
-for bundle in (applications / app.name, uninstaller):
+assert sorted(path.name for path in installed_payload.iterdir()) == ['ThunderDisplayHost.app'], 'Installer must not include a separate uninstaller'
+for bundle in (applications / app.name,):
     for source in bundle.rglob('*'):
         if source.is_file():
             packed = installed_payload / source.relative_to(applications)

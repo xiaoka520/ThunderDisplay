@@ -95,4 +95,49 @@ final class InputInjectorTests: XCTestCase {
         guard !NativeHIDInput.isAuthorized else { throw XCTSkip("Permission is granted; native input is checked by the explicit GUI diagnostic") }
         XCTAssertThrowsError(try NativeHIDInput())
     }
+    func testRelativeMovementClickAndDragStayOnSecondaryDisplay() throws {
+        var events: [CGEvent] = []
+        let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
+        let device = InputInjector(bounds: bounds, captureSize: CGSize(width: 2560, height: 1440),
+            contentRect: CGRect(x: 0, y: 0, width: 2560, height: 1440),
+            desktopBounds: [bounds, CGRect(x: 1280, y: 0, width: 1920, height: 1080)],
+            pointerPosition: { CGPoint(x: 1270, y: 300) }, authorized: { true }, post: { events.append($0) })
+        try device.apply(input(6, 0, 0, 30, 0))
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1300, y: 300))
+        try device.apply(input(7, 0, 1))
+        XCTAssertEqual(events.last!.type, .leftMouseDown)
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1300, y: 300))
+        try device.apply(input(6, 0, 0, 100, 20))
+        XCTAssertEqual(events.last!.type, .leftMouseDragged)
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1400, y: 320))
+        try device.apply(input(7, 0, 0))
+        XCTAssertEqual(events.last!.type, .leftMouseUp)
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1400, y: 320))
+        // The HiDPI video is twice the logical size; raw movement is not doubled.
+        try device.apply(input(6, 0, 0, -200, 0))
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1200, y: 320))
+    }
+    func testFullscreenReleaseThenWindowMappingAndReacquisition() throws {
+        var events: [CGEvent] = [], actual = CGPoint(x: -30, y: 100)
+        let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
+        let device = InputInjector(bounds: bounds, captureSize: bounds.size, contentRect: bounds,
+            desktopBounds: [bounds, CGRect(x: -1280, y: 0, width: 1280, height: 720)],
+            pointerPosition: { actual }, authorized: { true }, post: { events.append($0) })
+        try device.apply(input(7, 1, 1))
+        try device.apply(input(5))
+        XCTAssertEqual(events.last!.type, .rightMouseUp)
+        XCTAssertEqual(events.last!.location, actual)
+        try device.apply(input(1, 0, 0, 65535, 65535))
+        XCTAssertEqual(events.last!.location, CGPoint(x: 1279, y: 719))
+        try device.apply(input(5))
+        actual = CGPoint(x: -300, y: 200)
+        try device.apply(input(6, 0, 0, -20, 10))
+        XCTAssertEqual(events.last!.location, CGPoint(x: -320, y: 210))
+    }
+    func testLegacyInjectorDoesNotAcceptRelativeMovementOrButtons() throws {
+        var events: [CGEvent] = []
+        let device = injector { events.append($0) }
+        try device.apply(input(6, 0, 0, 30, 0)); try device.apply(input(7, 0, 1))
+        XCTAssertTrue(events.isEmpty)
+    }
 }

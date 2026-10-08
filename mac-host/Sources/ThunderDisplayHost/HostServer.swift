@@ -13,12 +13,17 @@ private final class Peer: @unchecked Sendable {
     let accepted = DispatchTime.now().uptimeNanoseconds
     var session: UInt64 = 0, frame: UInt32 = 0, videoAddress: sockaddr_in?
     var engine: CaptureEngine?, injector: (any InputControlling)?
+    var rawSender: RawVideoSender?
+    var rawSupported = false, packedRawSupported = false, deltaRawSupported = false
     var sender: VideoSender?
-    var richFeatures = false, extendedFeatures = false, highBitrate = false, localCursor = false, clipboard = false
+    var richFeatures = false, extendedFeatures = false, highBitrate = false, linkBitrates = false, localCursor = false, clipboard = false
     var clipboardRequested = false
     var desktopSRGB = false, cursorVariants = false
     var sessionTransitions = false, transitionSent = false, transitionAcknowledged = false
     var videoStatistics = false, lastVideoStatistics: UInt64 = 0
+    var clientDiagnosticsSupported = false, clientDiagnosticsEnabled = false, lastClientDiagnostics: UInt64 = 0
+    var mouseModeSupported = false, relativeMouse = false
+    var cursorPositionSupported = false, cursorBounds = CGRect.zero, captureSize = CGSize.zero
     var videoPathConfirmed = false
     var keyboardSeen = false
     var clipboardInput = TextClipboardAssembler(), clipboardOutput: [Data] = []
@@ -64,6 +69,7 @@ final class HostServer: @unchecked Sendable {
     }
     // Snapshot collected on the AppKit thread; no NSScreen calls on the socket queue.
     var displayCapabilities: Data?
+    var desktopBounds: [CGRect] = [] // Main-thread snapshot; rebuilt when the arrangement changes.
     var captureDisplayID: UInt32? { display }
     func updateDisplayCapabilities(_ data: Data) { queue.async { [weak self] in self?.displayCapabilities = data } }
     init(ip: String, options: Options, token: String) {
@@ -154,8 +160,8 @@ final class HostServer: @unchecked Sendable {
         guard let kind = data.first.flatMap(Message.init(rawValue:)) else { throw WireError.malformed }
         if !p.negotiated {
             if kind == .capabilityQuery {
-                guard (data.count == 1 || (data.count == 2 && (2...9).contains(data[data.startIndex + 1])) ||
-                    (data.count == 3 && (4...9).contains(data[data.startIndex + 1]) && data[data.startIndex + 2] <= 1)), var capabilities = displayCapabilities else { throw WireError.malformed }
+                guard (data.count == 1 || (data.count == 2 && (2...16).contains(data[data.startIndex + 1])) ||
+                    (data.count == 3 && (4...16).contains(data[data.startIndex + 1]) && data[data.startIndex + 2] <= 1)), var capabilities = displayCapabilities else { throw WireError.malformed }
                 p.extendedFeatures = data.count >= 2 && data[data.startIndex + 1] >= 3
                 p.highBitrate = data.count >= 2 && data[data.startIndex + 1] >= 4
                 p.richFeatures = data.count >= 2 && data[data.startIndex + 1] >= 5
@@ -163,14 +169,32 @@ final class HostServer: @unchecked Sendable {
                 p.cursorVariants = data.count >= 2 && data[data.startIndex + 1] >= 7
                 p.sessionTransitions = data.count >= 2 && data[data.startIndex + 1] >= 8
                 p.videoStatistics = data.count >= 2 && data[data.startIndex + 1] >= 9
-                p.localCursor = p.richFeatures && localCursorAvailable && data.count == 3 && data[data.startIndex + 2] == 1
-                if capabilities.count >= 28 { capabilities[25] = (capabilities[25] & 3) | (p.extendedFeatures ? 12 : 0) | (p.highBitrate ? 16 : 0) | (localCursorAvailable && p.richFeatures ? 32 : 0) | (p.richFeatures ? 64 : 0) | (p.desktopSRGB ? 128 : 0) }
+                p.clientDiagnosticsSupported = data.count >= 2 && data[data.startIndex + 1] >= 16
+                p.linkBitrates = data.count >= 2 && data[data.startIndex + 1] >= 10
+                p.mouseModeSupported = data.count >= 2 && data[data.startIndex + 1] >= 11
+                p.rawSupported = data.count >= 2 && data[data.startIndex + 1] >= 13
+                if p.rawSupported && capabilities.count >= 28 { capabilities[23] |= 8; capabilities[24] = 10 }
+                p.packedRawSupported = data.count >= 2 && data[data.startIndex + 1] >= 14
+                if p.packedRawSupported && capabilities.count >= 28 { capabilities[23] |= 16 }
+                p.deltaRawSupported = data.count >= 2 && data[data.startIndex + 1] >= 15
+                if p.deltaRawSupported && capabilities.count >= 28 { capabilities[23] |= 32 }
+                p.cursorPositionSupported = data.count >= 2 && data[data.startIndex + 1] >= 12
+                p.relativeMouse = p.mouseModeSupported && desktopBounds.count > 1 && makeInputInjector == nil
+                // Query12 tracks the actual Mac position independently of video.
+                // Older multi-display clients retain the embedded video cursor.
+                let supportsLocalCursor = localCursorAvailable && (!p.relativeMouse || p.cursorPositionSupported)
+                p.localCursor = p.richFeatures && supportsLocalCursor &&
+                    ((data.count == 3 && data[data.startIndex + 2] == 1) || (p.relativeMouse && p.cursorPositionSupported))
+                if capabilities.count >= 28 { capabilities[25] = (capabilities[25] & 3) | (p.extendedFeatures ? 12 : 0) | (p.highBitrate ? 16 : 0) | (supportsLocalCursor && p.richFeatures ? 32 : 0) | (p.richFeatures ? 64 : 0) | (p.desktopSRGB ? 128 : 0) }
                 // Legacy clients parse only the original 8-bit capability payload.
                 if data.count == 1 && capabilities.count >= 28 { capabilities[23] = 3; capabilities[24] = 8 }
                 send(capabilities, p); return
             }
             let hello = try Hello(data)
             guard !hello.wide || p.richFeatures else { throw WireError.malformed }
+            guard hello.bitrate <= 20_000_000_000 || p.linkBitrates else {
+                fail(p, "High link bitrate requires capability query version 10. Update both platforms to 0.8.18."); return
+            }
             guard hello.height <= 2304 || p.extendedFeatures else { throw WireError.malformed }
             guard hello.bitrate <= 300_000_000 || p.highBitrate else { fail(p, "High bitrate requires capability query version 4. Update both platforms to 0.6.2."); return }
             guard ProtocolWire.acceptsToken(hello.token, expected: token, required: requirePairing) else {
@@ -179,16 +203,35 @@ final class HostServer: @unchecked Sendable {
             p.negotiated = true; p.lastSeen = DispatchTime.now().uptimeNanoseconds
             p.session = UInt64.random(in: 1 ... UInt64.max)
             var target = p.address; target.sin_port = hello.udpPort.bigEndian; p.videoAddress = target
+            if hello.codecMask & 8 != 0 && !p.rawSupported { throw WireError.malformed }
+            if hello.codecMask & 16 != 0 && !p.packedRawSupported { throw WireError.malformed }
+            if hello.codecMask & 32 != 0 && !p.deltaRawSupported { throw WireError.malformed }
             var selected: CaptureEngine?
+            if hello.codecMask == 8 { selected = try? CaptureEngine(hello: hello, codec: .rawP010, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
+            if hello.codecMask == 16 { selected = try? CaptureEngine(hello: hello, codec: .rawPacked10, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
+            if hello.codecMask == 32 { selected = try? CaptureEngine(hello: hello, codec: .rawDelta10, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
             if hello.codecMask & 4 != 0 { selected = try? CaptureEngine(hello: hello, codec: .hevc10, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
             if selected == nil && hello.codecMask & 2 != 0 { selected = try? CaptureEngine(hello: hello, codec: .hevc, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
             if selected == nil && hello.codecMask & 1 != 0 { selected = try? CaptureEngine(hello: hello, codec: .h264, queue: queue, cursorVisible: !p.localCursor, desktopSRGB: p.desktopSRGB) }
-            guard let engine = selected else { fail(p, p.desktopSRGB ? "DesktopColorUnavailable: No compatible sRGB hardware encoder" : "No compatible hardware encoder. Try H.264 or a lower mode."); return }
+            guard let engine = selected else {
+                fail(p, hello.codecMask & 56 != 0 ? "Raw P010 color conversion unavailable" :
+                    p.desktopSRGB ? "DesktopColorUnavailable: No compatible sRGB hardware encoder" : "No compatible hardware encoder. Try H.264 or a lower mode.")
+                return
+            }
             p.engine = engine
-            p.sender = try VideoSender(socket: udp, session: p.session, codec: engine.codec, target: target, fps: hello.fps) { [weak self, weak p] in
-                self?.queue.async { [weak self, weak p] in
-                    guard let self, let p, self.peer === p, !p.transitionSent else { return }
-                    p.engine?.requestIDR()
+            if engine.codec.isRaw {
+                p.rawSender = try RawVideoSender(ip: ip, peerIP: p.address.sin_addr.s_addr, session: p.session,
+                    width: Int(hello.width), height: Int(hello.height), packed: engine.codec != .rawP010, updates: engine.codec == .rawDelta10) { [weak self, weak p] reason in
+                    self?.queue.async { [weak self, weak p] in
+                        guard let self, let p, self.peer === p, !p.transitionSent else { return }; self.fail(p, reason)
+                    }
+                }
+            } else {
+                p.sender = try VideoSender(socket: udp, session: p.session, codec: engine.codec, target: target, fps: hello.fps) { [weak self, weak p] in
+                    self?.queue.async { [weak self, weak p] in
+                        guard let self, let p, self.peer === p, !p.transitionSent else { return }
+                        p.engine?.requestIDR()
+                    }
                 }
             }
             engine.onFrame = { [weak self, weak p] data, pts, key in
@@ -206,15 +249,19 @@ final class HostServer: @unchecked Sendable {
                         guard let self, let p, self.peer === p else { engine.stop(); return }
                         do {
                             let size = CGSize(width: Int(hello.width), height: Int(hello.height))
+                            p.cursorBounds = CGDisplayBounds(id); p.captureSize = size
                             p.injector = try self.makeInputInjector?(id, size, engine.contentRect) ??
-                                InputInjector(display: id, captureSize: size, contentRect: engine.contentRect)
+                                InputInjector(display: id, captureSize: size, contentRect: engine.contentRect,
+                                              desktopBounds: p.relativeMouse ? self.desktopBounds : [])
                         } catch {
                             self.onInputFailure?(error.localizedDescription)
                             self.fail(p, "InputUnavailable: " + error.localizedDescription); return
                         }
                         self.send(ProtocolWire.welcome(session: p.session, codec: engine.codec, hello: hello, acceptedBitrate: engine.effectiveBitrate), p)
+                        if let sender = p.rawSender { self.send(RawVideoWire.endpoint(session: p.session, port: sender.port), p) }
+                        if p.mouseModeSupported { self.send(MouseModeWire.packet(session: p.session, relative: p.relativeMouse), p) }
                         log("Paired \(ipString(p.address.sin_addr)); \(hello.width)x\(hello.height) target \(hello.fps) fps, \(engine.codec), \(engine.effectiveBitrate / 1_000_000) Mbps")
-                        self.onStatus?("Connected: \(hello.width)×\(hello.height) / \(hello.fps) Hz · \(engine.codec == .hevc10 ? "HEVC Main10 / SDR 10-bit" : engine.codec == .hevc ? "HEVC / SDR 8-bit" : "H.264 / SDR 8-bit")")
+                        self.onStatus?("Connected: \(hello.width)×\(hello.height) / \(hello.fps) Hz · \(engine.codec.isRaw ? "Uncompressed / SDR 10-bit" : engine.codec == .hevc10 ? "HEVC Main10 / SDR 10-bit" : engine.codec == .hevc ? "HEVC / SDR 8-bit" : "H.264 / SDR 8-bit")")
                     }
                 } catch { queue.async { [weak self, weak p] in if let p, self?.peer === p { if engine.codec == .hevc10 && CGPreflightScreenCaptureAccess() { self?.fail(p, "Main10Unavailable: Screen capture: \(error.localizedDescription)") }
                         else { self?.onCaptureFailure?(error.localizedDescription); self?.fail(p, "Screen capture: \(error.localizedDescription)") } } } }
@@ -230,6 +277,7 @@ final class HostServer: @unchecked Sendable {
         case .input:
             guard p.ready else { throw WireError.malformed }
             let input = try Input(data)
+            guard input.kind < 6 || p.relativeMouse else { throw WireError.malformed }
             guard !p.transitionSent else { return }
             guard inputAllowed?() ?? true else {
                 if handoverOnSessionEnd && p.sessionTransitions { announceTransition(p) }
@@ -261,6 +309,23 @@ final class HostServer: @unchecked Sendable {
             p.lastVideoStatistics=now
             let v=report.values
             log("Windows latency us avg/max: queue \(v[0])/\(v[1]); decode work \(v[2])/\(v[3]); render \(v[4])/\(v[5]); arrival to Present \(v[6])/\(v[7]); replaced pictures \(v[8])")
+        case .clientDiagnostics:
+            guard p.ready, p.clientDiagnosticsSupported else { throw WireError.malformed }
+            let report = try ClientDiagnostics(data, session: p.session)
+            guard !p.transitionSent else { return }
+            switch report.state {
+            case .start, .stop:
+                p.clientDiagnosticsEnabled = report.state == .start
+                send(data, p)
+                WindowsDiagnosticStore.shared.append(["sharing=\(p.clientDiagnosticsEnabled ? "enabled" : "disabled")"])
+            case .batch:
+                // A toggle-off may cross an already started TCP batch.
+                guard p.clientDiagnosticsEnabled else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now - p.lastClientDiagnostics >= 500_000_000 else { return }
+                p.lastClientDiagnostics = now
+                WindowsDiagnosticStore.shared.append(report.lines)
+            }
         case .clipboardControl:
             guard p.ready, p.extendedFeatures, data.count == 2, data[data.startIndex + 1] <= 1 else { throw WireError.malformed }
             p.clipboardRequested = data[data.startIndex + 1] == 1
@@ -298,6 +363,16 @@ final class HostServer: @unchecked Sendable {
             p.cursorOutput = BinaryWire.packets(image, kind: .cursorImage, id: p.cursorID, limit: BinaryWire.cursorLimit)
         }
     }
+    func sendCursorPosition(_ point: CGPoint, visible: Bool, session: UInt64) {
+        queue.async { [weak self] in
+            guard let self, let p = self.peer, p.session == session, p.ready, p.localCursor,
+                  p.relativeMouse, p.cursorPositionSupported, let engine = p.engine else { return }
+            let position = visible ? CapturedPointer.normalized(point, bounds: p.cursorBounds,
+                captureSize: p.captureSize, contentRect: engine.contentRect) : nil
+            self.send(CursorPositionWire.packet(session: session, visible: position != nil,
+                x: position?.0 ?? 0, y: position?.1 ?? 0), p)
+        }
+    }
     private func send(_ message: Data, _ p: Peer) {
         guard peer === p else { return }
         p.output.append(ProtocolWire.frame(message))
@@ -319,6 +394,10 @@ final class HostServer: @unchecked Sendable {
         // stream before it sends pixels from the session transition.
         if handoverOnSessionEnd, inputAllowed?() == false { announceTransition(p); return false }
         guard !stopping, !p.transitionSent, peer === p else { return false }
+        if let sender = p.rawSender {
+            p.frame &+= 1; if p.frame == 0 { p.frame = 1 }
+            return sender.enqueue(OutgoingVideoFrame(data: frame, pts: pts, id: p.frame, key: true))
+        }
         let limit = p.richFeatures ? ProtocolWire.maxFrameSize : p.highBitrate ? ProtocolWire.gigabitMaxFrameSize : ProtocolWire.legacyMaxFrameSize
         guard !frame.isEmpty, frame.count <= limit, p.videoAddress != nil else { return false }
         p.frame &+= 1
@@ -347,7 +426,7 @@ final class HostServer: @unchecked Sendable {
     }
     private func disconnect(_ p: Peer, _ reason: String) {
         guard peer === p else { return }
-        p.sender?.stop(); p.sender=nil
+        p.rawSender?.stop(); p.rawSender=nil; p.sender?.stop(); p.sender=nil
         p.injector?.releaseAll(); p.engine?.stop(); p.engine = nil
         onClipboardState?(p.session, false)
         onCursorState?(p.session, false, p.cursorVariants)
@@ -397,7 +476,7 @@ final class HostServer: @unchecked Sendable {
     private func announceTransition(_ p: Peer) {
         guard peer === p, p.ready, p.sessionTransitions, !p.transitionSent else { return }
         p.transitionSent = true; p.engine?.active = false
-        p.sender?.stop(); p.sender=nil
+        p.rawSender?.stop(); p.rawSender=nil; p.sender?.stop(); p.sender=nil
         p.clipboardOutput = []; p.cursorOutput = []
         send(SessionTransitionWire.packet(session: p.session), p)
         log("Session transition notice sent; old video and input retired")
@@ -421,7 +500,7 @@ final class HostServer: @unchecked Sendable {
         let closed = DispatchGroup()
         queue.sync {
             stopping = true
-            peer?.sender?.stop(); peer?.sender=nil
+            peer?.rawSender?.stop(); peer?.rawSender=nil; peer?.sender?.stop(); peer?.sender=nil
             timer?.cancel(); timer = nil
             func cancel(_ source: DispatchSourceRead?, fd: Int32) {
                 guard fd >= 0 else { return }

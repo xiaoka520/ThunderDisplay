@@ -1,0 +1,4 @@
+module RawPixelSupport {
+    header "RawPixelSupport.h"
+    export *
+}

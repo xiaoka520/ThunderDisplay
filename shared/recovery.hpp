@@ -40,6 +40,12 @@ struct VideoHealth {
     static constexpr uint64_t StaleAfter=3000000, RestartAfter=12000000;
     static bool fresh(uint64_t now,uint64_t last) { return last && now>=last && now-last<StaleAfter; }
     static bool stalled(uint64_t now,uint64_t last) { return now>=last && now-last>=RestartAfter; }
+    static bool firstFrameTimedOut(uint64_t now,uint64_t readyAt,bool raw,uint64_t receivedAt) {
+        if(now<readyAt || now-readyAt<=RestartAfter) return false;
+        // Allow a slow, progressing raw baseline to finish. A silent peer still
+        // expires, and even continuous partial data cannot renew this forever.
+        return !raw || now-readyAt>=60000000 || !receivedAt || now<receivedAt || now-receivedAt>=5000000;
+    }
 };
 // A saved image or a new TCP handshake cannot renew this deadline. Only a
 // newly decoded frame may bring the remote window back from the setup screen.

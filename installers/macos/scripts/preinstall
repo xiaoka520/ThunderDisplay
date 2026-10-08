@@ -6,6 +6,9 @@ fi
 for task_path in /Applications/ThunderDisplayHost.app "/Applications/ThunderDisplay Uninstaller.app" "/Library/Application Support/ThunderDisplay"; do
     if [ -L "$task_path" ]; then printf 'Refusing symlink installation destination.\n' >&2; exit 1; fi
 done
+# Avoid interpreting Installer's temporary bundle replacement as removal.
+/bin/launchctl bootout system/dev.thunderdisplay.cleanup 2>/dev/null || true
+trap 'task_result=$?; if [ "$task_result" != 0 ] && [ -d /Applications/ThunderDisplayHost.app ] && [ -f /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist ]; then /bin/launchctl bootstrap system /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist 2>/dev/null || true; fi' EXIT
 # Stop the supervised agent before the old executable, otherwise KeepAlive
 # would relaunch it while the native Installer replaces its bundle.
 task_desktop_plist=/Library/LaunchAgents/dev.thunderdisplay.desktop.plist

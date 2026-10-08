@@ -1,5 +1,6 @@
 import CoreMedia
 import CoreVideo
+import VideoToolbox
 import Foundation
 import Wire
 import CoreGraphics
@@ -105,6 +106,64 @@ func encoderCheck(bitrate: UInt64 = 10_000_000, desktopSRGB: Bool = false) throw
         log("Encoder bounded pipeline check \(codec): \(limit) ordered outputs, extra admissions refused")
     }
     print("Hardware HEVC / H.264 / HEVC Main10 encoder + \(desktopSRGB ? "sRGB desktop / BT.709 matrix" : "BT.709") color metadata checks passed at requested \(bitrate / 1_000_000) Mbps (synthetic frames; no screen capture or input injection; not a throughput benchmark).")
+}
+
+/// Measure the production capture/color/encoding path without networking or input.
+/// Use a moving test window for comparisons; idle desktops intentionally send fewer frames.
+func captureRateCheck(displayID: UInt32?, raw: Bool = false, updates: Bool = false, depth: Int = 3, unthrottled: Bool = false) throws {
+    guard CGPreflightScreenCaptureAccess() else { throw HostError("Authorize screen recording before --capture-rate-check") }
+    let id = displayID ?? CGMainDisplayID()
+    guard let mode = CGDisplayCopyDisplayMode(id) else { throw HostError("Selected display is unavailable") }
+    let scale = min(1, 4096 / Double(mode.pixelWidth), 4096 / Double(mode.pixelHeight))
+    let width = UInt16(Int(Double(mode.pixelWidth) * scale / 2) * 2)
+    let height = UInt16(Int(Double(mode.pixelHeight) * scale / 2) * 2)
+    var writer = Writer(); writer.put(Message.helloWide.rawValue); writer.put(UInt16(2)); writer.put(UInt16(50000))
+    writer.put(width); writer.put(height); writer.put(UInt16(60)); writer.put(UInt64(2_000_000_000)); writer.put(UInt8(raw ? 16 : 4))
+    writer.bytes(Data(repeating: 48, count: 32))
+    let queue = DispatchQueue(label: "ThunderDisplay.capture-rate-check", qos: .userInteractive)
+    let engine = try CaptureEngine(hello: Hello(writer.data), codec: raw ? .rawPacked10 : .hevc10, queue: queue, cursorVisible: !raw, desktopSRGB: true,
+        captureQueueDepth: depth, unthrottledCapture: unthrottled)
+    var failure: String?, frames = 0, began: UInt64 = 0, bytes = 0
+    var baseline: Data?, updateBytes = 0, updateTime: UInt64 = 0
+    queue.sync {
+        engine.onFailure = { failure = $0 }
+        engine.onFrame = { data, _, _ in
+            if raw && data.count != (try? RawVideoWire.byteCount(width: Int(width), height: Int(height), packed: true)) { failure = "Invalid packed ten-bit frame size"; return false }
+            if raw && frames == 0 {
+                log("Raw packed ten-bit full-frame size verified; no unused P010 word bits transmitted")
+            }
+            if updates {
+                let start = DispatchTime.now().uptimeNanoseconds
+                do {
+                    updateBytes += try RawVideoWire.update(data, baseline: baseline, baseID: UInt32(frames), width: Int(width), height: Int(height)).count
+                    baseline = data; updateTime += DispatchTime.now().uptimeNanoseconds-start
+                } catch { failure = "Raw update construction failed"; return false }
+            }
+            frames += 1; bytes += data.count; return true
+        }
+    }
+    Task {
+        do {
+            _ = try await engine.start(displayID: id)
+            queue.async { began = DispatchTime.now().uptimeNanoseconds; engine.active = true; engine.requestIDR() }
+        } catch { queue.async { failure = error.localizedDescription } }
+    }
+    let deadline = Date().addingTimeInterval(7)
+    while Date() < deadline {
+        if queue.sync(execute: { failure != nil }) { break }
+        _ = RunLoop.current.run(mode: .default, before: min(deadline, Date().addingTimeInterval(0.05)))
+    }
+    let result = queue.sync { () -> (Int, Int, Double, String?) in
+        let seconds = began == 0 ? 0 : Double(DispatchTime.now().uptimeNanoseconds - began) / 1e9
+        let result = (frames, bytes, seconds, failure); engine.stop(); return result
+    }
+    if let failure = result.3 { throw HostError(failure) }
+    guard result.0 > 0, result.2 > 0 else { throw HostError("Capture rate check returned no frames") }
+    log(raw ? "Capture rate diagnostic: raw P010 10-bit; capture/color/copy only; no compression" : "Capture rate diagnostic: Main10 sRGB; capture/color/encoding only")
+    log(String(format: "Capture rate result: %dx%d; %.1f fps; %d frames; %.1f Mbps",
+        Int(width), Int(height), Double(result.0) / result.2, result.0, Double(result.1) * 8 / result.2 / 1e6))
+    if updates { log(String(format: "Exact update capture diagnostic: %.3f Gbps; bytes/frame %d; compare/copy us avg %llu; queue %d; unthrottled %@; no network",
+        Double(updateBytes)*8/result.2/1e9, updateBytes/max(1,result.0), updateTime/UInt64(max(1,result.0))/1000, depth, unthrottled ? "true" : "false")) }
 }
 
 /// Requires existing screen permission. Logs metadata only, with no network or input.

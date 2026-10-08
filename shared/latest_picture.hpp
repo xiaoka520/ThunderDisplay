@@ -38,6 +38,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         auto item=std::move(pending); pending.reset(); return item;
     }
+    // A nonblocking Present may need to retry the last static frame. Never
+    // put it ahead of a newer arrival or back into a retired session.
+    bool restore(Item item) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if(stopped || item.generation!=generation || pending) return false;
+            pending.emplace(std::move(item));
+        }
+        changed.notify_one(); return true;
+    }
     bool current(const Item& item) const {
         std::lock_guard<std::mutex> lock(mutex); return !stopped && item.generation==generation;
     }

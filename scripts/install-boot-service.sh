@@ -84,6 +84,23 @@ if [[ "$task_old_desktop_uid" =~ ^[0-9]{3,10}$ ]]; then
     launchctl bootout "gui/$task_old_desktop_uid/$task_desktop_label" 2>/dev/null || true
 fi
 install -d -o root -g wheel -m 755 "$task_service_dir" /Library/LaunchAgents
+# Restoring the app from Trash and re-enabling startup must also restore its
+# removal watcher. Developer-only builds outside Applications are not watched.
+if [ -d /Applications/ThunderDisplayHost.app ] && [ ! -L /Applications/ThunderDisplayHost.app ] && \
+   [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' /Applications/ThunderDisplayHost.app/Contents/Info.plist 2>/dev/null || true)" = dev.thunderdisplay.host ]; then
+    for task_cleanup_path in "$task_service_dir/trash-cleanup.sh" "$task_service_dir/installed-app.marker" "/Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist"; do
+        if [ -L "$task_cleanup_path" ]; then printf 'Refusing symlink cleanup destination.\n' >&2; exit 1; fi
+    done
+    launchctl bootout system/dev.thunderdisplay.cleanup 2>/dev/null || true
+    install -o root -g wheel -m 755 "$task_app/Contents/Resources/trash-cleanup.sh" "$task_service_dir/trash-cleanup.sh"
+    install -o root -g wheel -m 644 "$task_app/Contents/Resources/dev.thunderdisplay.cleanup.plist" /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist
+    (umask 077; touch "$task_service_dir/installed-app.marker")
+    chown root:wheel "$task_service_dir/installed-app.marker"
+    chmod 600 "$task_service_dir/installed-app.marker"
+    rm -f "$task_service_dir/trash-cleanup.pending"
+    launchctl enable system/dev.thunderdisplay.cleanup
+    launchctl bootstrap system /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist
+fi
 rm -rf "$task_system_app.new"
 ditto "$task_app" "$task_system_app.new"
 chown -R root:wheel "$task_system_app.new"

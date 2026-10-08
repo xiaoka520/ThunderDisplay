@@ -11,6 +11,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private(set) var encodingSpeedPrioritized = false
     let desktopSRGB: Bool
     private let cursorVisible: Bool
+    private let captureQueueDepth: Int, unthrottledCapture: Bool
     private let hello: Hello, queue: DispatchQueue
     // RGB transfer and VT submission can block. Keep socket/input delivery on
     // the original queue. At most two hardware admissions overlap transfer and
@@ -54,21 +55,32 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var latestImage: CVPixelBuffer?, latestTime = CMTime.zero, lastPresentation: CMTime?
     private var latestImagePending = false
     private var submitted = 0, dropped = 0, encoded = 0, captured = 0
+    private var captureIdle = 0, captureOther = 0
     private var keyFrames = 0, keyRequests = 0, encodedBytes = 0
     private var consecutiveEncoderDrops = 0
     private var lastStats = DispatchTime.now().uptimeNanoseconds
     // Each stage has its own count because VT submission and completion are
     // asynchronous. All aggregates are updated on the control queue.
-    private var latencyTotals = [UInt64](repeating: 0, count: 7)
-    private var latencyMaxima = [UInt64](repeating: 0, count: 7)
-    private var latencyCounts = [UInt64](repeating: 0, count: 7)
+    private var latencyTotals = [UInt64](repeating: 0, count: 9)
+    private var latencyMaxima = [UInt64](repeating: 0, count: 9)
+    private var latencyCounts = [UInt64](repeating: 0, count: 9)
     private static let background = CGColor(gray: 0, alpha: 1)
 
-    init(hello: Hello, codec: Codec, queue: DispatchQueue, cursorVisible: Bool = true, desktopSRGB: Bool = false) throws {
+    init(hello: Hello, codec: Codec, queue: DispatchQueue, cursorVisible: Bool = true, desktopSRGB: Bool = false,
+         captureQueueDepth: Int = 3, unthrottledCapture: Bool = false) throws {
+        guard (3...8).contains(captureQueueDepth) else { throw HostError("Invalid capture queue depth") }
+        self.captureQueueDepth = captureQueueDepth; self.unthrottledCapture = unthrottledCapture
         effectiveBitrate = hello.bitrate
         self.desktopSRGB = desktopSRGB
         self.hello = hello; self.codec = codec; self.queue = queue; self.cursorVisible = cursorVisible
         super.init()
+        if codec.isRaw {
+            guard desktopSRGB else { throw HostError("Raw P010 requires sRGB desktop negotiation") }
+            effectiveBitrate = UInt64(try RawVideoWire.byteCount(width: Int(hello.width), height: Int(hello.height), packed: codec != .rawP010)) * 8 * UInt64(hello.fps)
+            try configurePixelTransfer()
+            log("Raw P010: \(hello.width)×\(hello.height), 10-bit, \(effectiveBitrate / 1_000_000) Mbps at \(hello.fps) fps; compression bypassed")
+            return
+        }
         var status: OSStatus = -1
         // Low-latency rate control can accept tall frames / very high bitrates
         // but drop every frame. Use normal hardware rate control for these
@@ -116,25 +128,29 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             try set(kVTCompressionPropertyKey_TransferFunction, desktopSRGB ? kCVImageBufferTransferFunction_sRGB : kCVImageBufferTransferFunction_ITU_R_709_2)
             try set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
             if codec == .hevc10 || desktopSRGB {
-                let transferStatus = VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
-                guard transferStatus == noErr, let transfer else { throw HostError("10-bit pixel transfer unavailable: \(transferStatus)") }
-                for (key, value) in [(kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
-                                     (kVTPixelTransferPropertyKey_DestinationTransferFunction, desktopSRGB ? kCVImageBufferTransferFunction_sRGB : kCVImageBufferTransferFunction_ITU_R_709_2),
-                                     (kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)] {
-                    let result = VTSessionSetProperty(transfer, key: key, value: value)
-                    guard result == noErr else { throw HostError("10-bit transfer color property: \(result)") }
-                }
-                let attributes = [kCVPixelBufferWidthKey: Int(hello.width), kCVPixelBufferHeightKey: Int(hello.height),
-                    kCVPixelBufferPixelFormatTypeKey: codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                    kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
-                let poolStatus = CVPixelBufferPoolCreate(nil, nil, attributes, &tenBitPool)
-                guard poolStatus == kCVReturnSuccess else { throw HostError("10-bit pixel pool unavailable: \(poolStatus)") }
+                try configurePixelTransfer()
             }
             let delay = VTSessionSetProperty(compression, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 1))
             if delay != noErr { log("Encoder does not expose MaxFrameDelayCount (\(delay)); bounded hardware admission remains active") }
             let prepared = VTCompressionSessionPrepareToEncodeFrames(compression)
             guard prepared == noErr else { throw HostError("Prepare encoder: \(prepared)") }
         } catch { VTCompressionSessionInvalidate(compression); self.compression = nil; throw error }
+    }
+    private var tenBit: Bool { codec == .hevc10 || codec.isRaw }
+    private func configurePixelTransfer() throws {
+        let transferStatus = VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer)
+        guard transferStatus == noErr, let transfer else { throw HostError("10-bit pixel transfer unavailable: \(transferStatus)") }
+        for (key, value) in [(kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
+                     (kVTPixelTransferPropertyKey_DestinationTransferFunction, desktopSRGB ? kCVImageBufferTransferFunction_sRGB : kCVImageBufferTransferFunction_ITU_R_709_2),
+                     (kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)] {
+            let result = VTSessionSetProperty(transfer, key: key, value: value)
+            guard result == noErr else { throw HostError("10-bit transfer color property: \(result)") }
+        }
+        let attributes = [kCVPixelBufferWidthKey: Int(hello.width), kCVPixelBufferHeightKey: Int(hello.height),
+            kCVPixelBufferPixelFormatTypeKey: tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        let poolStatus = CVPixelBufferPoolCreate(nil, nil, attributes, &tenBitPool)
+        guard poolStatus == kCVReturnSuccess else { throw HostError("10-bit pixel pool unavailable: \(poolStatus)") }
     }
     private func configureBitrate() throws {
         let key = kVTCompressionPropertyKey_AverageBitRate
@@ -202,9 +218,16 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         let desktopBefore = CGDisplayBounds(display.displayID).size
         let config = SCStreamConfiguration()
         config.width = Int(hello.width); config.height = Int(hello.height)
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(hello.fps))
-        config.queueDepth = 3; config.showsCursor = cursorVisible; config.capturesAudio = false
-        config.pixelFormat = codec == .hevc10 ? kCVPixelFormatType_ARGB2101010LEPacked : desktopSRGB ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let sourceHz = CGDisplayCopyDisplayMode(display.displayID)?.refreshRate ?? 0
+        // At the source refresh rate, let SCK follow source updates. A second
+        // exact 1/fps throttle skipped updates in the controlled 60 Hz trial.
+        // Keep throttling when requesting less than the source rate or when the
+        // source rate is unknown; higher-rate monitors cannot flood a 60 fps request.
+        let followsSource = codec == .rawDelta10 && sourceHz > 1 && Double(hello.fps) + 0.01 >= sourceHz
+        config.minimumFrameInterval = unthrottledCapture || followsSource ? .zero : CMTime(value: 1, timescale: CMTimeScale(hello.fps))
+        log("Capture cadence: requested \(hello.fps) fps, source \(sourceHz) Hz; source updates \(unthrottledCapture || followsSource); queue \(captureQueueDepth)")
+        config.queueDepth = captureQueueDepth; config.showsCursor = cursorVisible; config.capturesAudio = false
+        config.pixelFormat = tenBit ? kCVPixelFormatType_ARGB2101010LEPacked : desktopSRGB ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.colorSpaceName = desktopSRGB ? CGColorSpace.sRGB : CGColorSpace.itur_709
         config.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
         config.scalesToFit = true
@@ -267,10 +290,13 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         queue.async { [weak self] in guard let self, !self.stopped else { return }; self.onFailure?(error.localizedDescription) }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard !stopped, type == .screen, CMSampleBufferIsValid(sample), compression != nil,
+        guard !stopped, type == .screen, CMSampleBufferIsValid(sample), (compression != nil || codec.isRaw),
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let status = attachments.first?[.status] as? Int, status == SCFrameStatus.complete.rawValue,
-              let image = CMSampleBufferGetImageBuffer(sample) else { return }
+              let status = attachments.first?[.status] as? Int else { return }
+        if active, status != SCFrameStatus.complete.rawValue {
+            if status == SCFrameStatus.idle.rawValue { captureIdle += 1 } else { captureOther += 1 }
+        }
+        guard status == SCFrameStatus.complete.rawValue, let image = CMSampleBufferGetImageBuffer(sample) else { return }
         // An initially busy capture may still be encoded on completion. Count
         // it as discarded only when a newer capture actually replaces it.
         if active, latestImagePending { dropped += 1 }
@@ -282,7 +308,8 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     }
     // Also used by the permission-free synthetic hardware encoder diagnostic.
     func encodeImage(_ image: CVPixelBuffer, time: CMTime) {
-        guard active, !stopped, let compression, admissions.count < hardwareAdmissionLimit else { return }
+        guard active, !stopped, (compression != nil || codec.isRaw), admissions.count < hardwareAdmissionLimit else { return }
+        let compression = self.compression
         if latestImage === image { latestImagePending = false }
         onInputFormat?(CVPixelBufferGetPixelFormatType(image))
         if origin == nil { origin = time }
@@ -316,14 +343,14 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             }
         }
     }
-    private func encodeAdmittedImage(_ image: CVPixelBuffer, compression: VTCompressionSession,
+    private func encodeAdmittedImage(_ image: CVPixelBuffer, compression: VTCompressionSession?,
                                      time: CMTime, properties: CFDictionary?, admission: Admission) throws -> (transfer: UInt64, submit: UInt64) {
         var input = image
         var transferTime: UInt64 = 0
         let format = CVPixelBufferGetPixelFormatType(image)
-        let expectedYUV = codec == .hevc10 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        if (codec == .hevc10 || desktopSRGB) && format != expectedYUV {
-            let expectedRGB = codec == .hevc10 ? kCVPixelFormatType_ARGB2101010LEPacked : kCVPixelFormatType_32BGRA
+        let expectedYUV = tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        if (tenBit || desktopSRGB) && format != expectedYUV {
+            let expectedRGB = tenBit ? kCVPixelFormatType_ARGB2101010LEPacked : kCVPixelFormatType_32BGRA
             guard format == expectedRGB, let transfer, let tenBitPool else {
                 throw HostError(desktopSRGB ? "DesktopColorUnavailable: Capture did not produce the requested RGB format" : "Main10Unavailable: Capture did not produce 10-bit pixels")
             }
@@ -344,6 +371,28 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             input = converted
         }
         let began = DispatchTime.now().uptimeNanoseconds
+        if codec.isRaw {
+            guard CVPixelBufferGetPixelFormatType(input) == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                  CVPixelBufferLockBaseAddress(input, .readOnly) == kCVReturnSuccess else { throw HostError("Raw P010 pixel buffer unavailable") }
+            defer { CVPixelBufferUnlockBaseAddress(input, .readOnly) }
+            let locked = DispatchTime.now().uptimeNanoseconds
+            guard let y = CVPixelBufferGetBaseAddressOfPlane(input, 0), let uv = CVPixelBufferGetBaseAddressOfPlane(input, 1) else { throw HostError("Raw P010 planes unavailable") }
+            let yStride = CVPixelBufferGetBytesPerRowOfPlane(input, 0), uvStride = CVPixelBufferGetBytesPerRowOfPlane(input, 1)
+            let data = try RawVideoWire.pack(width: Int(hello.width), height: Int(hello.height),
+                luma: UnsafeRawBufferPointer(start: y, count: yStride * Int(hello.height)), lumaStride: yStride,
+                chroma: UnsafeRawBufferPointer(start: uv, count: uvStride * Int(hello.height) / 2), chromaStride: uvStride, packed: codec != .rawP010)
+            let copied = DispatchTime.now().uptimeNanoseconds
+            var packed = PackedOutput(); packed.frame = data; packed.key = true
+            packed.pts = UInt64(max(0, CMTimeGetSeconds(time)) * 1_000_000)
+            let finished = DispatchTime.now().uptimeNanoseconds, result = packed
+            queue.async { [self] in
+                guard !stopped else { return }
+                recordLatency(7, locked-began); recordLatency(8, copied-locked)
+                output(status: noErr, info: [], packed: result, received: finished, packing: finished-began, finished: finished, admission: admission)
+            }
+            return (transferTime, 0)
+        }
+        guard let compression else { throw HostError("Compression session unavailable") }
         let result = VTCompressionSessionEncodeFrame(compression, imageBuffer: input, presentationTimeStamp: time,
             duration: CMTime(value: 1, timescale: CMTimeScale(hello.fps)), frameProperties: properties,
             sourceFrameRefcon: Unmanaged.passUnretained(admission).toOpaque(), infoFlagsOut: nil)
@@ -402,20 +451,21 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         }
         consecutiveEncoderDrops = 0
         if let format = packed.format { onFormat?(format) }
-        if frame.count > ProtocolWire.maxFrameSize || onFrame?(frame, packed.pts, packed.key) != true { forceKey = true; dropped += 1 }
+        if frame.count > (codec.isRaw ? 4096 * 4096 * 3 : ProtocolWire.maxFrameSize) || onFrame?(frame, packed.pts, packed.key) != true { forceKey = true; dropped += 1 }
         else { encoded += 1; encodedBytes += frame.count; if packed.key { keyFrames += 1 } }
         let now = DispatchTime.now().uptimeNanoseconds
         if now - lastStats >= 5_000_000_000 {
             let elapsed = Double(now - lastStats) / 1_000_000_000
-            log(String(format: "Encoded %.1f fps, admitted %d, dropped %d, %@; captured %.1f fps", Double(encoded)/elapsed, submitted, dropped, String(describing: codec), Double(captured)/elapsed))
+            log(String(format: "\(codec.isRaw ? "Prepared raw" : "Encoded") %.1f fps, admitted %d, dropped %d, %@; captured %.1f fps", Double(encoded)/elapsed, submitted, dropped, String(describing: codec), Double(captured)/elapsed))
+            log(String(format: "Capture callbacks: complete %d, idle %d, other %d; requested %d fps; callbacks %.1f fps", captured, captureIdle, captureOther, Int(hello.fps), Double(captured+captureIdle+captureOther)/elapsed))
             log("Video recovery: keyframes \(keyFrames), key requests \(keyRequests), bytes per frame \(encodedBytes/max(1,encoded))")
-            let names = ["worker queue", "RGB transfer", "VT submit", "admission to callback", "bitstream copy", "control return", "capture age"]
+            let names = codec.isRaw ? ["worker queue", "RGB transfer", "compression bypassed", "admission to pixels", "P010 copy", "control return", "capture age", "P010 lock", "native pack"] : ["worker queue", "RGB transfer", "VT submit", "admission to callback", "bitstream copy", "control return", "capture age"]
             let stages = names.indices.map { index in
                 "\(names[index]) \(latencyTotals[index]/max(1,latencyCounts[index])/1000)/\(latencyMaxima[index]/1000)"
             }.joined(separator: "; ")
             log("Encoder latency us avg/max: \(stages)")
-            latencyTotals = [UInt64](repeating: 0, count: 7); latencyMaxima = latencyTotals; latencyCounts = latencyTotals
-            lastStats = now; submitted = 0; dropped = 0; encoded = 0; captured = 0
+            latencyTotals = [UInt64](repeating: 0, count: 9); latencyMaxima = latencyTotals; latencyCounts = latencyTotals
+            lastStats = now; submitted = 0; dropped = 0; encoded = 0; captured = 0; captureIdle = 0; captureOther = 0
             keyFrames = 0; keyRequests = 0; encodedBytes = 0
         }
     }

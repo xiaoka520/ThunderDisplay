@@ -3,6 +3,109 @@
 #include <d3dcompiler.h>
 #include "scaler.hpp"
 #include "desktop_color.hpp"
+#include "raw_video.hpp"
+#include "media_thread.hpp"
+
+std::shared_ptr<Renderer::RawPlanePicture> Renderer::makeRawPlanes(UINT fw,UINT fh) {
+    auto planes=std::make_shared<RawPlanePicture>();
+    for(unsigned plane=0;plane<2;++plane) {
+        D3D11_TEXTURE2D_DESC description{};
+        description.Width=plane?fw/2:fw; description.Height=plane?fh/2:fh;
+        description.MipLevels=description.ArraySize=description.SampleDesc.Count=1;
+        description.Format=plane?DXGI_FORMAT_R16G16_UNORM:DXGI_FORMAT_R16_UNORM;
+        description.Usage=D3D11_USAGE_DEFAULT; description.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        check(device_->CreateTexture2D(&description,nullptr,&planes->textures[plane]),"Raw ten-bit plane texture");
+        check(device_->CreateShaderResourceView(planes->textures[plane].Get(),nullptr,&planes->views[plane]),"Raw ten-bit plane view");
+    }
+    return planes;
+}
+void Renderer::uploadRawPlanes(const std::shared_ptr<RawPlanePicture>& target,const td::Bytes& pixels,UINT fw,UINT fh,
+    const std::vector<td::RawVideoRegion>& regions) {
+    if(pixels.size()!=td::rawP010Bytes(uint16_t(fw),uint16_t(fh))) throw std::runtime_error("Invalid raw plane upload size");
+    for(const auto& region:regions) td::checkRawRegion(uint16_t(fw),uint16_t(fh),region);
+    for(const auto& region:regions) {
+        D3D11_BOX luma{region.x,region.y,0,region.x+region.width,region.y+region.height,1};
+        D3D11_BOX chroma{region.x/2,region.y/2,0,(region.x+region.width)/2,(region.y+region.height)/2,1};
+        const auto* y=pixels.data()+(size_t(region.y)*fw+region.x)*2;
+        const auto* uv=pixels.data()+(size_t(fw)*fh+size_t(region.y/2)*fw+region.x)*2;
+        context->UpdateSubresource(target->textures[0].Get(),0,&luma,y,fw*2,0);
+        context->UpdateSubresource(target->textures[1].Get(),0,&chroma,uv,fw*2,0);
+    }
+}
+void Renderer::verifyRawPlaneUploads() {
+    // One small synthetic check on the real D3D device, before desktop pixels
+    // are uploaded. Validate all ten-bit values, both plane pitches, partial
+    // updates and preservation of an earlier in-flight GPU snapshot.
+    constexpr UINT fw=320,fh=240;
+    td::Bytes original(td::rawP010Bytes(fw,fh));
+    for(size_t i=0;i<original.size()/2;++i) {
+        const uint16_t value=uint16_t((i*17+11)%1024)<<6;
+        std::memcpy(original.data()+i*2,&value,2);
+    }
+    auto baseline=makeRawPlanes(fw,fh),before=makeRawPlanes(fw,fh),after=makeRawPlanes(fw,fh);
+    context->ClearState(); uploadRawPlanes(baseline,original,fw,fh,{{0,0,fw,fh}});
+    for(unsigned plane=0;plane<2;++plane) context->CopyResource(before->textures[plane].Get(),baseline->textures[plane].Get());
+    auto updated=original;
+    const td::RawVideoRegion region{128,64,64,32};
+    for(unsigned row=0;row<region.height+region.height/2;++row) {
+        const unsigned imageRow=row<region.height?region.y+row:fh+region.y/2+row-region.height;
+        for(unsigned column=0;column<region.width;++column) {
+            const uint16_t value=uint16_t((row*31+column*7+333)%1024)<<6;
+            std::memcpy(updated.data()+(size_t(imageRow)*fw+region.x+column)*2,&value,2);
+        }
+    }
+    uploadRawPlanes(baseline,updated,fw,fh,{region});
+    for(unsigned plane=0;plane<2;++plane) context->CopyResource(after->textures[plane].Get(),baseline->textures[plane].Get());
+    auto verify=[&](const std::shared_ptr<RawPlanePicture>& snapshot,const td::Bytes& expected) {
+        for(unsigned plane=0;plane<2;++plane) {
+            D3D11_TEXTURE2D_DESC description{}; snapshot->textures[plane]->GetDesc(&description);
+            description.Usage=D3D11_USAGE_STAGING; description.BindFlags=0; description.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> staging; check(device_->CreateTexture2D(&description,nullptr,&staging),"Raw plane synthetic readback texture");
+            context->CopyResource(staging.Get(),snapshot->textures[plane].Get());
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            check(context->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"Raw plane synthetic readback");
+            struct Unmap { ID3D11DeviceContext* context; ID3D11Resource* resource; ~Unmap(){context->Unmap(resource,0);} } unmap{context.Get(),staging.Get()};
+            const auto* data=static_cast<const uint8_t*>(mapped.pData);
+            const size_t start=plane?size_t(fw)*fh*2:0;
+            for(UINT row=0;row<description.Height;++row)
+                if(std::memcmp(data+size_t(row)*mapped.RowPitch,expected.data()+start+size_t(row)*fw*2,fw*2))
+                    throw std::runtime_error("Raw GPU ten-bit partial-upload self-check failed");
+        }
+    };
+    verify(before,original); verify(after,updated);
+    diagnosticLog("video.raw.gpu.check","PASS synthetic all-1024-values; partial Y/UV updates; immutable snapshots; no desktop readback");
+}
+bool Renderer::presentRaw(const td::Bytes& pixels,UINT fw,UINT fh,UINT fps,uint64_t arrivedAt,
+    const std::vector<td::RawVideoRegion>* changed) {
+    if(pixels.size()!=td::rawP010Bytes(uint16_t(fw),uint16_t(fh))) throw std::runtime_error("Invalid P010 upload size");
+    checkFailure();
+    std::shared_ptr<RawPlanePicture> selected;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(!desktopSRGB || bitDepth!=10) throw std::runtime_error("Raw planes require ten-bit sRGB presentation");
+        if(!rawPlanesChecked) { verifyRawPlaneUploads(); rawPlanesChecked=true; }
+        if(!rawBaseline || rawWidth!=fw || rawHeight!=fh) {
+            rawBaseline=makeRawPlanes(fw,fh); rawPlanesPool={}; rawWidth=fw; rawHeight=fh; rawBaselineReady=false;
+            diagnosticLog("video.raw.gpu","ten-bit R16/R16G16 planes; changed-region upload; three immutable GPU snapshots");
+        }
+        for(auto& candidate:rawPlanesPool) {
+            if(!candidate) candidate=makeRawPlanes(fw,fh);
+            if(candidate.use_count()==1) { selected=candidate; break; }
+        }
+        if(!selected) return false;
+        const std::vector<td::RawVideoRegion> full{{0,0,fw,fh}};
+        const auto& regions=changed && rawBaselineReady?*changed:full;
+        context->ClearState();
+        uploadRawPlanes(rawBaseline,pixels,fw,fh,regions);
+        rawBaselineReady=true;
+        // GPU-local copies freeze the complete frame. Producer updates and
+        // presenter draws use the same ordered context; in-use snapshots are
+        // retained independently and never overwritten by the next upload.
+        for(unsigned plane=0;plane<2;++plane) context->CopyResource(selected->textures[plane].Get(),rawBaseline->textures[plane].Get());
+    }
+    Picture picture{nullptr,fw,fh,fps,arrivedAt,std::move(selected)};
+    return pictures.push(std::move(picture));
+}
 
 bool Renderer::initScaling(UINT fw,UINT fh,UINT tw,UINT ch) {
     if(!scalingQuality || !scalingFailure.empty()) return false;
@@ -113,11 +216,11 @@ Renderer::Latency Renderer::presentationLatency() {
 void Renderer::presentationLoop() {
     const auto com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     try {
-        check(com,"Initialize presentation apartment"); SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        check(com,"Initialize presentation apartment"); MediaThreadPriority priority("presenter");
         uint64_t statsAt=micros(),count=0,renderTotal=0,renderMax=0,ageTotal=0,ageMax=0,ageCount=0,statsGeneration=UINT64_MAX;
         bool havePermit=false;
         while(!presenterStopped) {
-            if(!pictures.wait()) continue;
+            if(!pictures.wait() && !repaintRequested.load()) continue;
             if(!havePermit) {
                 const HANDLE waits[]={stopPresentation,frameReady};
                 const auto result=WaitForMultipleObjects(2,waits,FALSE,100);
@@ -135,12 +238,39 @@ void Renderer::presentationLoop() {
             }
             // Fetch AFTER display readiness, so newly decoded pictures replace
             // pending samples while waiting instead of becoming a stale FIFO.
-            auto item=pictures.take(); if(!item || !pictures.current(*item)) continue;
+            auto item=pictures.take();
+            if(!item) {
+                if(!repaintRequested.exchange(false)) continue;
+                bool submitted=false,retry=false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if(frameState.hasImage() && retainedRGB && !IsIconic(window)) {
+                        submitted=repaintImageLocked(); retry=!submitted;
+                    }
+                }
+                if(submitted) havePermit=false;
+                if(retry) {
+                    repaintRequested=true;
+                    const DWORD retryMs=std::max<DWORD>(1,1000/std::max<UINT>(1,liveFPS));
+                    if(WaitForSingleObject(stopPresentation,retryMs)==WAIT_OBJECT_0) break;
+                }
+                continue;
+            }
+            if(!pictures.current(*item)) continue;
+            repaintRequested=false; // This live frame also satisfies a pending paint/resize.
             if(statsGeneration!=item->generation) {
                 statsGeneration=item->generation; statsAt=micros(); count=renderTotal=renderMax=ageTotal=ageMax=ageCount=0;
             }
             const auto began=micros();
-            if(!presentPicture(*item)) continue; // Keep readiness if no Present occurred.
+            if(!presentPicture(*item)) {
+                pictures.restore(std::move(*item));
+                // No Present was queued. Keep the consumed readiness permit:
+                // a static last frame must not require another DXGI signal.
+                // Release the graphics lock and bound retry work.
+                const DWORD retryMs=std::max<DWORD>(1,1000/std::max<UINT>(1,liveFPS));
+                if(WaitForSingleObject(stopPresentation,retryMs)==WAIT_OBJECT_0) break;
+                continue;
+            }
             havePermit=false; const auto now=micros();
             const auto render=now-began,age=now>=item->picture.arrivedAt?now-item->picture.arrivedAt:0;
             ++count; renderTotal+=render; renderMax=std::max(renderMax,render);
@@ -162,7 +292,7 @@ void Renderer::presentationLoop() {
     if(SUCCEEDED(com)) CoUninitialize();
 }
 void Renderer::present(IMFSample* sample,UINT frameWidth,UINT frameHeight,UINT fps,uint64_t arrivedAt) {
-    checkFailure(); Picture picture{sample,frameWidth,frameHeight,fps,arrivedAt}; pictures.push(std::move(picture));
+    checkFailure(); Picture picture{sample,frameWidth,frameHeight,fps,arrivedAt,{}}; pictures.push(std::move(picture));
 }
 void Renderer::updatePointerGeometryLocked() {
     std::lock_guard<std::mutex> lock(pointerMutex);
@@ -180,6 +310,7 @@ bool Renderer::resizeLocked() {
     check(swap->ResizeBuffers(0,w,h,DXGI_FORMAT_UNKNOWN,DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT|
         (tearing?DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING:0)),"Resize swap chain");
     width=w; height=h; enumerator.Reset(); processor.Reset();
+    dxgiBaseline=false; dxgiDisplayFPS=-1;
     updatePointerGeometryLocked();
     return true;
 }
@@ -205,8 +336,12 @@ bool Renderer::pointerPosition(int px,int py,bool dragging,int32_t& x,int32_t& y
     std::lock_guard<std::mutex> lock(pointerMutex);
     return pointerGeometry && pointerGeometry->pointer(px,py,dragging,pointerWidth,pointerHeight,x,y);
 }
-void Renderer::resize() { std::lock_guard<std::mutex> lock(mutex); if(resizeLocked()) repaintImageLocked(); }
+void Renderer::resize() { repaintRequested=true; }
 RECT Renderer::viewport() { std::lock_guard<std::mutex> lock(pointerMutex); return pointerViewport; }
+bool Renderer::remotePointerPosition(uint16_t x,uint16_t y,int& px,int& py) {
+    std::lock_guard<std::mutex> lock(pointerMutex);
+    return pointerGeometry && pointerGeometry->remotePointer(x,y,pointerWidth,pointerHeight,px,py);
+}
 std::string Renderer::colorDescription() {
     // Periodic status on the socket thread must not wait for a busy Present.
     std::unique_lock<std::mutex> lock(mutex,std::try_to_lock);
@@ -225,8 +360,14 @@ bool Renderer::presentPicture(const td::LatestPicture<Picture>::Item& item) {
     std::lock_guard<std::mutex> lock(mutex);
     if(!pictures.current(item)) return false;
     auto* sample=item.picture.sample.Get(); const auto frameWidth=item.picture.width,frameHeight=item.picture.height,fps=item.picture.fps;
+    liveFPS=fps;
     if(!presentationExpected()) return false;
     resizeLocked();
+    if(item.picture.rawPlanes) {
+        if(bitDepth!=10 || !desktopSRGB) throw std::runtime_error("Raw ten-bit color negotiation changed");
+        td::PresentationGeometry geometry(frameWidth,frameHeight,width,height,pixelExact);
+        return presentDesktopColor(nullptr,0,frameWidth,frameHeight,geometry,item.picture.rawPlanes->views[0].Get(),item.picture.rawPlanes->views[1].Get());
+    }
     ComPtr<IMFMediaBuffer> buffer; check(sample->GetBufferByIndex(0,&buffer),"Decoded media buffer");
     ComPtr<IMFDXGIBuffer> gpu;
     if(FAILED(buffer.As(&gpu))) throw std::runtime_error("Decoder returned CPU memory. Hardware D3D11 decoding is required; update GPU drivers or use --codec h264.");
@@ -237,9 +378,8 @@ bool Renderer::presentPicture(const td::LatestPicture<Picture>::Item& item) {
     td::PresentationGeometry geometry(frameWidth,frameHeight,width,height,pixelExact);
     auto& dest=geometry.destination; auto& crop=geometry.source;
     if(desktopSRGB) {
-        try { presentDesktopColor(texture.Get(),slice,frameWidth,frameHeight,geometry); }
+        try { return presentDesktopColor(texture.Get(),slice,frameWidth,frameHeight,geometry); }
         catch(const std::exception& e) { throw std::runtime_error(std::string("DesktopColorUnavailable: ")+e.what()); }
-        return true;
     }
     // The shader supports anti-aliasing footprints up to a 4:1 shrink per axis.
     bool scaleSupported=double(crop.right-crop.left)/(dest.right-dest.left)<=4 && double(crop.bottom-crop.top)/(dest.bottom-dest.top)<=4;
@@ -293,10 +433,9 @@ bool Renderer::presentPicture(const td::LatestPicture<Picture>::Item& item) {
     D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable=TRUE; stream.pInputSurface=input.Get();
     check(videoContext->VideoProcessorBlt(processor.Get(),target.Get(),0,1,&stream),"GPU YUV to RGB conversion");
     if(highQuality) scaleToBackBuffer(back.Get(),geometry);
-    presentBackBuffer();
-    return true;
+    return presentBackBuffer();
 }
-void Renderer::presentBackBuffer() {
+bool Renderer::presentBackBuffer() {
     {
         ComPtr<ID3D11Texture2D> back; check(swap->GetBuffer(0,IID_PPV_ARGS(&back)),"Handover frame buffer");
         D3D11_TEXTURE2D_DESC d{},old{}; back->GetDesc(&d); if(retainedRGB) retainedRGB->GetDesc(&old);
@@ -309,10 +448,29 @@ void Renderer::presentBackBuffer() {
         context->ClearState(); context->CopyResource(retainedRGB.Get(),back.Get());
     }
     auto started=micros();
-    auto result=swap->Present(vsync?1:0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+    auto result=swap->Present(vsync?1:0,DXGI_PRESENT_DO_NOT_WAIT|((!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0));
+    if(result==DXGI_ERROR_WAS_STILL_DRAWING) {
+        ++presentBusyCount;
+        const auto now=micros();
+        if(now-presentBusyLoggedAt>=5000000) {
+            diagnosticLog("display.present.busy","retry_latest=1 attempts="+std::to_string(presentBusyCount)+
+                " duration_us="+std::to_string(now-started));
+            presentBusyLoggedAt=now;
+        }
+        return false;
+    }
     checkPresent(result,"Present");
     if(result!=DXGI_STATUS_OCCLUDED) {
         auto now=micros(),previous=frameState.lastPresentation();
+        ++presented;
+        if(previous && now>previous) {
+            const auto gap=now-previous;
+            auto maximum=maximumInterval.load();
+            while(gap>maximum && !maximumInterval.compare_exchange_weak(maximum,gap)) {}
+            // A long interval is evidence of a pause, not automatically a lost frame: the source may be idle.
+            if(gap>2000000/std::max<UINT>(1,liveFPS)) ++lateIntervals;
+        }
+        if(ClientDiagnostics::instance().remoteEnabled()) sampleDisplayStatistics(now);
         if(now-started>100000) diagnosticLog("display.present.slow","duration_us="+std::to_string(now-started));
         if(previous && now>previous && now-previous>500000)
             diagnosticLog("display.frame.gap","duration_us="+std::to_string(now-previous));
@@ -321,6 +479,20 @@ void Renderer::presentBackBuffer() {
             PostMessageW(window,FramePresentedMessage,0,0);
         }
     }
+    return true;
+}
+void Renderer::sampleDisplayStatistics(uint64_t now) {
+    if(now-dxgiSampleAt<1000000) return;
+    dxgiSampleAt=now;
+    DXGI_FRAME_STATISTICS current{};
+    if(FAILED(swap->GetFrameStatistics(&current))) { dxgiBaseline=false; dxgiDisplayFPS=-1; return; }
+    LARGE_INTEGER frequency{};
+    if(dxgiBaseline && current.SyncQPCTime.QuadPart>previousDXGI.SyncQPCTime.QuadPart &&
+       current.PresentCount>=previousDXGI.PresentCount && QueryPerformanceFrequency(&frequency)) {
+        const auto elapsed=current.SyncQPCTime.QuadPart-previousDXGI.SyncQPCTime.QuadPart;
+        dxgiDisplayFPS=double(current.PresentCount-previousDXGI.PresentCount)*double(frequency.QuadPart)/double(elapsed);
+    } else dxgiDisplayFPS=-1;
+    previousDXGI=current; dxgiBaseline=true;
 }
 void Renderer::checkPresent(HRESULT result,const char* operation) {
     if(FAILED(result)) {
@@ -342,7 +514,9 @@ bool Renderer::repaintImageLocked() {
     // Preserve pixels exactly whenever the buffer geometry/precision matches.
     if(saved.Width==output.Width && saved.Height==output.Height && saved.Format==output.Format) {
         context->ClearState(); context->CopyResource(back.Get(),retainedRGB.Get());
-        checkPresent(swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0),"Present retained frame");
+        const auto result=swap->Present(0,DXGI_PRESENT_DO_NOT_WAIT|((!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0));
+        if(result==DXGI_ERROR_WAS_STILL_DRAWING) return false;
+        checkPresent(result,"Present retained frame");
         return true;
     }
     if(!frozenVertex) {
@@ -371,7 +545,8 @@ float4 ps(V v) : SV_Target { return image.Sample(sampleImage,v.uv); }
     D3D11_VIEWPORT viewport{float(r.left),float(r.top),float(r.right-r.left),float(r.bottom-r.top),0,1};
     context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
     // A repaint of the saved pixels never advances live-frame freshness.
-    auto result=swap->Present(0,(!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0);
+    auto result=swap->Present(0,DXGI_PRESENT_DO_NOT_WAIT|((!vsync && tearing)?DXGI_PRESENT_ALLOW_TEARING:0));
+    if(result==DXGI_ERROR_WAS_STILL_DRAWING) return false;
     checkPresent(result,"Present retained frame");
     return true;
 }
@@ -381,6 +556,8 @@ bool Renderer::resetFrame(bool preserve,bool keepSnapshot,const char* reason) {
     pictures.retire();
     { std::lock_guard<std::mutex> lock(presentationState); latency={}; }
     std::lock_guard<std::mutex> lock(mutex);
+    rawBaselineReady=false;
+    dxgiBaseline=false; dxgiDisplayFPS=-1; dxgiSampleAt=0;
     const bool hold=preserve && retainedRGB;
     diagnosticLog(hold?"display.hold":"display.clear",reason);
     frameState.reset(hold);
@@ -409,7 +586,8 @@ bool Renderer::resetFrame(bool preserve,bool keepSnapshot,const char* reason) {
     InvalidateRect(window,nullptr,FALSE);
     return false;
 }
-void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,UINT fh,const td::PresentationGeometry& geometry) {
+bool Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,UINT fh,const td::PresentationGeometry& geometry,
+    ID3D11ShaderResourceView* nativeLuma,ID3D11ShaderResourceView* nativeChroma) {
     if(!colorVertex || !colorPixel || !colorBlitPixel || !colorConstants || !colorSampler) {
         ComPtr<ID3DBlob> vs,ps,blit,error;
         auto compile=[&](const char* entry,const char* profile,ID3DBlob** output) {
@@ -425,9 +603,12 @@ void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,U
         sd.MaxAnisotropy=1; sd.ComparisonFunc=D3D11_COMPARISON_NEVER; sd.MaxLOD=D3D11_FLOAT32_MAX;
         check(device_->CreateSamplerState(&sd,&colorSampler),"Desktop chroma sampler");
     }
-    D3D11_TEXTURE2D_DESC source{}; texture->GetDesc(&source);
+    const bool nativePlanes=nativeLuma && nativeChroma;
+    D3D11_TEXTURE2D_DESC source{};
+    if(nativePlanes) { source.Width=fw; source.Height=fh; }
+    else { if(!texture) throw std::runtime_error("Missing desktop color input"); texture->GetDesc(&source); }
     D3D11_TEXTURE2D_DESC previous{}; if(colorYUV) colorYUV->GetDesc(&previous);
-    if(!colorYUV || !colorLuma || !colorChroma || previous.Width!=source.Width || previous.Height!=source.Height || previous.Format!=source.Format) {
+    if(!nativePlanes && (!colorYUV || !colorLuma || !colorChroma || previous.Width!=source.Width || previous.Height!=source.Height || previous.Format!=source.Format)) {
         colorYUV.Reset(); colorLuma.Reset(); colorChroma.Reset();
         auto d=source; d.MipLevels=1; d.ArraySize=1; d.Usage=D3D11_USAGE_DEFAULT; d.BindFlags=D3D11_BIND_SHADER_RESOURCE; d.CPUAccessFlags=0; d.MiscFlags=0;
         check(device_->CreateTexture2D(&d,nullptr,&colorYUV),"Desktop GPU YUV copy texture");
@@ -446,14 +627,15 @@ void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,U
         check(device_->CreateRenderTargetView(colorRGB.Get(),nullptr,&colorTarget),"Desktop sRGB target");
         check(device_->CreateShaderResourceView(colorRGB.Get(),nullptr,&colorRGBView),"Desktop sRGB view");
     }
-    context->ClearState(); context->CopySubresourceRegion(colorYUV.Get(),0,0,0,0,texture,slice,nullptr);
+    context->ClearState();
+    if(!nativePlanes) context->CopySubresourceRegion(colorYUV.Get(),0,0,0,0,texture,slice,nullptr);
     float parameters[8]={float(source.Width),float(source.Height),float(bitDepth==10),0,0,0,float(fw),float(fh)};
     context->UpdateSubresource(colorConstants.Get(),0,nullptr,parameters,0,0);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->VSSetShader(colorVertex.Get(),nullptr,0); context->PSSetShader(colorPixel.Get(),nullptr,0);
     auto cb=colorConstants.Get(); context->PSSetConstantBuffers(0,1,&cb);
     auto sampler=colorSampler.Get(); context->PSSetSamplers(0,1,&sampler);
-    ID3D11ShaderResourceView* planes[2]={colorLuma.Get(),colorChroma.Get()}; context->PSSetShaderResources(0,2,planes);
+    ID3D11ShaderResourceView* planes[2]={nativePlanes?nativeLuma:colorLuma.Get(),nativePlanes?nativeChroma:colorChroma.Get()}; context->PSSetShaderResources(0,2,planes);
     auto target=colorTarget.Get(); context->OMSetRenderTargets(1,&target,nullptr);
     D3D11_VIEWPORT viewport{0,0,float(fw),float(fh),0,1}; context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
     auto& s=geometry.source; auto& d=geometry.destination;
@@ -474,5 +656,5 @@ void Renderer::presentDesktopColor(ID3D11Texture2D* texture,UINT slice,UINT fw,U
         auto render=output.Get(); context->OMSetRenderTargets(1,&render,nullptr);
         viewport={float(d.left),float(d.top),float(d.right-d.left),float(d.bottom-d.top),0,1}; context->RSSetViewports(1,&viewport); context->Draw(3,0); context->ClearState();
     }
-    presentBackBuffer();
+    return presentBackBuffer();
 }

@@ -14,11 +14,12 @@ public final class VideoMailbox: @unchecked Sendable {
     private let lock=NSLock()
     private var pending: OutgoingVideoFrame?
     private var draining=false, stopped=false, needsKey=true
+    private var replaced: UInt64 = 0
     public init() {}
     public func push(_ frame: OutgoingVideoFrame) -> (accepted: Bool, start: Bool) {
         lock.lock(); defer { lock.unlock() }
         guard !stopped else { return (false,false) }
-        if pending != nil { pending=nil; needsKey=true }
+        if pending != nil { pending=nil; needsKey=true; replaced &+= 1 }
         guard !needsKey || frame.key else { return (false,false) }
         if frame.key { needsKey=false }
         pending=frame
@@ -35,4 +36,5 @@ public final class VideoMailbox: @unchecked Sendable {
     }
     public func stop() { lock.lock(); stopped=true; pending=nil; lock.unlock() }
     public var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    public var replacedFrames: UInt64 { lock.lock(); defer { lock.unlock() }; return replaced }
 }

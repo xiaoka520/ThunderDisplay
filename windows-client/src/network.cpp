@@ -161,15 +161,15 @@ void ClientSession::run() {
             diagnosticLog("connection.attempt","attempt="+std::to_string(retryBudget.attempts)+" host="+host);
             checkRecoveryDeadline(); connectAndStream(host);
         } catch(const std::exception& e) { diagnosticLog("connection.error",e.what()); if(!stopFlag) setStatus(e.what()); }
-        online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; videoInterrupted=false;
+        online=false; clipboardOnline=false; richClipboard=false; localCursorActive=false; relativeMouseActive=false; remoteCursorActive=false; videoInterrupted=false;
         expireHandover(); renderer.resetFrame(!stopFlag,false,stopFlag?"client stopped":"connection ended");
-        { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset(); }
+        { std::lock_guard<std::mutex> lock(mutex); clipboardIncoming.reset();imageIncoming.reset();cursorIncoming.reset();cursorPositionIncoming.reset(); }
         PostMessageW(window,DisconnectedMessage,0,0);
     }
     CoUninitialize();
 }
 void ClientSession::connectAndStream(const std::string& host) {
-    online=false; videoDecodedAt=0; peerControlAt=0; clipboardOnline=false; richClipboard=false; localCursorActive=false; renderer.resetFrame(true,false,"new connection"); overflow=false; wantIDR=false;
+    online=false; videoDecodedAt=0; peerControlAt=0; clipboardOnline=false; richClipboard=false; localCursorActive=false; relativeMouseActive=false; remoteCursorActive=false; renderer.resetFrame(true,false,"new connection"); overflow=false; wantIDR=false;
     Socket tcp(SOCK_STREAM); tcp.nonblocking();
     BOOL yes=TRUE; setsockopt(tcp.fd,IPPROTO_TCP,TCP_NODELAY,reinterpret_cast<const char*>(&yes),sizeof(yes));
     auto remote=endpoint(host,options.port);
@@ -189,6 +189,13 @@ void ClientSession::connectAndStream(const std::string& host) {
     }
     sockaddr_in local{}; int localLength=sizeof(local);
     if(getsockname(tcp.fd,reinterpret_cast<sockaddr*>(&local),&localLength)) throw std::runtime_error("Cannot obtain route address");
+    const auto link=td::detectNetworkLink(host,ip(local.sin_addr));
+    const auto linkLimit=link.bitrateLimit();
+    { std::lock_guard<std::mutex> lock(mutex); currentLink=link; }
+    diagnosticLog("network.link","local="+ip(local.sin_addr)+" index="+std::to_string(link.index)+
+        " receive_bps="+std::to_string(link.receiveRate)+" transmit_bps="+std::to_string(link.transmitRate)+" bitrate_limit_bps="+std::to_string(linkLimit));
+    if(options.customBitrate) options.settings.bitrate=options.bitrateMaximum?linkLimit:std::min(desiredBitrate,linkLimit);
+    else options.settings.bitrate=td::automaticBitrate(options.settings.width,options.settings.height,options.settings.fps,(options.uncompressed?4:requestedCodecMask),std::min(linkLimit,td::LegacyMaxBitrate));
     local.sin_port=0;
     Socket udp(SOCK_DGRAM); udp.nonblocking();
     int receiveBuffer=8*1024*1024; setsockopt(udp.fd,SOL_SOCKET,SO_RCVBUF,reinterpret_cast<const char*>(&receiveBuffer),sizeof(receiveBuffer));
@@ -211,6 +218,10 @@ void ClientSession::connectAndStream(const std::string& host) {
     td::ControlFramer framer; std::unique_ptr<VideoWorker> decoder; std::unique_ptr<td::Reassembler> assembler;
     uint64_t accepted=micros(),lastControl=accepted,lastPing=accepted,lastIDR=0,lastFrame=accepted;
     uint64_t sessionID=0,videoPackets=0,completeFrames=0,readyAt=0,lastStatus=0,lastProbe=0,lastDiagnostic=0;
+    uint64_t videoBytes=0,lastRemoteReport=0;
+    std::optional<bool> remoteRequested;
+    bool remoteAcknowledged=false;
+    td::PerformanceWindow performance;
     td::Codec codec=td::Codec::H264;
     sockaddr_in videoEndpoint=remote; bool haveVideoPort=false;
     std::string streamDescription;
@@ -222,6 +233,7 @@ void ClientSession::connectAndStream(const std::string& host) {
     td::ClipboardAssembler clipboardAssembler;
     td::BlobAssembler imageAssembler,cursorAssembler;
     auto failureWithFallback=[&](td::Codec used,const std::string& reason) {
+        if(options.uncompressed) return reason; // Never trade away an explicitly selected raw/10-bit mode.
         if(desktopSRGB && reason.find("DesktopColorUnavailable:")!=std::string::npos) {
             options.capabilityVersion=5;
             fallbackDescription="Desktop color unavailable; reconnecting with legacy color: "+reason;
@@ -255,6 +267,9 @@ void ClientSession::connectAndStream(const std::string& host) {
         }
     };
     auto stageText=[&] {
+        if(codec==td::Codec::RawDelta10) return "Uncompressed changed regions: exact 10-bit pixels + GPU upload; no video decoder";
+        if(codec==td::Codec::RawPacked10) return "Uncompressed packed10: lossless unpack + GPU upload; no video decoder";
+        if(td::isRaw(codec)) return "Uncompressed P010: direct GPU upload; no video decoder";
         if(videoInterrupted) return "Video interrupted; requesting a fresh keyframe";
         switch(td::videoStage(videoPackets,completeFrames,decoder->submittedFrames(),decoder->decodedFrames(),renderer.hasFrame())) {
         case td::VideoStage::NoPackets: return "No video packets; check the Mac capture and UDP firewall";
@@ -276,9 +291,37 @@ void ClientSession::connectAndStream(const std::string& host) {
         }
         if(overflow) throw std::runtime_error("Input queue overflow; reconnecting to release held keys");
         auto now=micros();
+        auto counters=[&] {
+            return td::PerformanceCounters{td::isRaw(codec)?decoder->submittedFrames():completeFrames,
+                td::isRaw(codec)?decoder->receivedVideoBytes():videoBytes,decoder->decodedFrames(),renderer.presentedFrames(),
+                decoder->discardedFrames(),decoder->replacedFrames()+renderer.replacedFrames(),renderer.lateFrameIntervals()};
+        };
+        if(online && decoder && !transitionReceived && options.capabilityVersion>=16) {
+            const bool enabled=debugLogs.load();
+            if(!remoteRequested && !enabled) remoteRequested=false;
+            if(!remoteRequested || *remoteRequested!=enabled) {
+                if(sender->send(td::clientDiagnostics(sessionID,enabled?1:0))==td::ControlOutbox::Result::Queued) {
+                    remoteRequested=enabled; remoteAcknowledged=false; lastRemoteReport=now;
+                    performance.reset(now,counters()); renderer.takeMaximumFrameInterval();
+                    if(enabled) diagnosticLog("client.debug","version=" TD_VERSION_TEXT " target_fps="+std::to_string(options.settings.fps)+
+                        " width="+std::to_string(options.settings.width)+" height="+std::to_string(options.settings.height)+
+                        " driver_receive_bps="+std::to_string(link.receiveRate)+" vsync="+std::to_string(options.vsync));
+                    if(enabled) diagnosticLog("network.link","index="+std::to_string(link.index)+" receive_bps="+std::to_string(link.receiveRate)+
+                        " transmit_bps="+std::to_string(link.transmitRate)+" bitrate_limit_bps="+std::to_string(linkLimit));
+                }
+            }
+            if(enabled && remoteAcknowledged && now-lastRemoteReport>=1000000) {
+                diagnosticLog("video.performance",performance.sample(now,counters(),renderer.takeMaximumFrameInterval(),options.settings.fps,
+                    renderer.presentationExpected(),renderer.displayFPS()));
+                if(auto logs=ClientDiagnostics::instance().takeRemote(); !logs.empty())
+                    sender->send(td::clientDiagnostics(sessionID,2,logs));
+                lastRemoteReport=now;
+            }
+        }
         if(decoder && decoder->decodedFrames()!=decodedCount) {
             decodedCount=decoder->decodedFrames(); lastDecoded=decoder->lastDecodedAt();
             videoDecodedAt=lastDecoded;
+            if(td::isRaw(codec)) lastFrame=lastDecoded;
         }
         if(videoInterrupted && renderer.hasFrame() && td::VideoHealth::fresh(now,lastDecoded) && videoInterrupted.exchange(false))
             diagnosticLog("video.resumed","decoded="+std::to_string(decodedCount));
@@ -299,18 +342,19 @@ void ClientSession::connectAndStream(const std::string& host) {
             // stall deadline and real socket failures still clear the image.
             diagnosticLog("video.interrupted","decode_gap_us="+std::to_string(now-lastDecoded));
             renderer.resetFrame(true,true,"brief video interruption"); wantIDR=true;
-            PostMessageW(window,ReleaseInputMessage,0,0);
+            PostMessageW(window,ReleaseInputMessage,4,0); // Video resume may reacquire fullscreen mouse control.
         }
         if(!transitionReceived && confirmedFrame && td::VideoHealth::stalled(now,lastLive)) throw std::runtime_error("Video stalled: reconnecting to restore live frames");
         if(now-lastControl>10000000 || (!decoder && now-accepted>15000000)) throw std::runtime_error("Host timed out");
-        if(decoder && now-lastProbe>(haveVideoPort?2000000u:500000u)) {
+        if(decoder && !td::isRaw(codec) && now-lastProbe>(haveVideoPort?2000000u:500000u)) {
             auto probe=td::videoProbe(sessionID); auto& target=haveVideoPort?videoEndpoint:remote;
             sendto(udp.fd,probe.data(),int(probe.size()),0,reinterpret_cast<sockaddr*>(&target),sizeof(target)); lastProbe=now;
         }
         if(decoder && now-lastStatus>1000000) {
             setStatus(streamDescription+"\r\n"+renderer.colorDescription()+"\r\n"+stageText()+"\r\nClipboard active: "+(clipboardOnline?"yes":"no")+"\r\nVideo packets: "+std::to_string(videoPackets)+
                 " | Complete frames: "+std::to_string(completeFrames)+" | Submitted: "+std::to_string(decoder->submittedFrames())+
-                " | Decoded: "+std::to_string(decoder->decodedFrames())); lastStatus=now;
+                " | Decoded: "+std::to_string(decoder->decodedFrames())+
+                (debugLogs.load()?(options.capabilityVersion>=16?(remoteAcknowledged?"\r\nDebug logs: sharing with Mac":"\r\nDebug logs: waiting for Mac acknowledgment"):"\r\nDebug logs: update Mac to 0.8.26"):"")); lastStatus=now;
         }
         if(decoder && now-lastDiagnostic>5000000) {
             diagnosticLog("video.counters","packets="+std::to_string(videoPackets)+" complete="+std::to_string(completeFrames)+
@@ -326,7 +370,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                 report.put(uint32_t(std::min<uint64_t>(display.replaced,UINT32_MAX))); send(std::move(report.data));
             }
         }
-        if(decoder && !confirmedFrame && !renderer.hasFrame() && now-readyAt>12000000) {
+        if(decoder && !confirmedFrame && !renderer.hasFrame() && td::VideoHealth::firstFrameTimedOut(now,readyAt,td::isRaw(codec),decoder->lastRawReceivedAt())) {
             if(!decoder->decodedFrames() && completeFrames && (nativeNegotiated || td::fallbackCodecMask(codec,options.settings.codecMask,options.colorDepth)))
                 throw std::runtime_error(failureWithFallback(codec,"first frame decode timed out"));
             throw std::runtime_error(std::string("First frame timed out: ")+stageText()+" | Video packets: "+std::to_string(videoPackets)+
@@ -348,11 +392,21 @@ void ClientSession::connectAndStream(const std::string& host) {
             if(n<0 && !wouldBlock()) throw std::runtime_error("TCP receive failed");
             if(n>0) for(auto& message:framer.push(b,size_t(n))) {
                 lastControl=micros(); peerControlAt=lastControl; auto type=td::Message(message[0]);
+                if(type==td::Message::ClientDiagnostics && options.capabilityVersion>=16 && decoder) {
+                    td::Reader ack(message);
+                    if(message.size()!=11 || ack.get<uint8_t>()!=uint8_t(td::Message::ClientDiagnostics) || ack.get<uint8_t>()!=1 ||
+                       ack.get<uint64_t>()!=sessionID) throw std::runtime_error("Invalid diagnostic sharing acknowledgment");
+                    const auto state=ack.get<uint8_t>();
+                    if(state>1) throw std::runtime_error("Invalid diagnostic sharing acknowledgment");
+                    remoteAcknowledged=remoteRequested && *remoteRequested==(state==1);
+                    diagnosticLog("client.debug",std::string("mac_ack=")+(state?"enabled":"disabled"));
+                    continue;
+                }
                 if(type==td::Message::SessionTransition) {
                     if(options.capabilityVersion<8 || !decoder || !td::validSessionTransition(message,sessionID))
                         throw std::runtime_error("Invalid session transition notice");
                     // Gate and retire input immediately, before any media join.
-                    online=false; clipboardOnline=false; localCursorActive=false;
+                    online=false; clipboardOnline=false; localCursorActive=false; relativeMouseActive=false; remoteCursorActive=false;
                     sender->transition(sessionID);
                     if(!transitionReceived) {
                         // Retire all media work before freezing the snapshot;
@@ -376,7 +430,9 @@ void ClientSession::connectAndStream(const std::string& host) {
                 }
                 if(type==td::Message::Capabilities && querying) {
                     td::HostCapabilities capabilities(message);
-                    auto mask=td::negotiatedCodecMask(requestedCodecMask,options.colorDepth,options.displayBits,capabilities.codecMask);
+                    if(options.uncompressed && (options.capabilityVersion<13 || !(capabilities.codecMask&8)))
+                        throw std::runtime_error("Uncompressed P010 requires Mac host 0.8.21 or newer");
+                    auto mask=options.uncompressed?uint8_t(4):td::negotiatedCodecMask(requestedCodecMask,options.colorDepth,options.displayBits,capabilities.codecMask&7);
                     nativeNegotiated=options.nativePixels && (capabilities.flags&8);
                     clipboardSupported=(capabilities.flags&4)!=0;
                     largeFrames=(capabilities.flags&16)!=0;
@@ -384,14 +440,28 @@ void ClientSession::connectAndStream(const std::string& host) {
                     cursorSupported=richFeatures && (capabilities.flags&32)!=0;
                     desktopSRGB=options.capabilityVersion>=6 && (capabilities.flags&128)!=0;
                     renderer.setDesktopSRGB(desktopSRGB);
-                    if(options.settings.bitrate>td::LegacyMaxBitrate && (!options.autoQuality || options.customBitrate) && !richFeatures) throw std::runtime_error("Bitrate above 1000 Mbps requires both platforms 0.7.0 or later");
-                    if(options.settings.bitrate>300000000 && (!options.autoQuality || options.customBitrate) && !largeFrames)
-                        throw std::runtime_error("Bitrate above 300 Mbps requires Mac Host 0.6.2 or later. Update the Mac or lower the custom bitrate.");
-                    if(options.autoQuality) options.settings=td::bestQuality(capabilities.current,options.display,mask,nativeNegotiated,options.customBitrate?options.settings.bitrate:0,largeFrames?td::LegacyMaxBitrate:300000000);
-                    else { options.settings.codecMask=mask; if(options.autoFrameRate) options.settings.fps=td::negotiatedFrameRate(capabilities.current,options.display); }
+                    const auto hostLimit=richFeatures?(options.capabilityVersion>=10?td::MaxBitrate:td::DefaultBitrateLimit):largeFrames?td::LegacyMaxBitrate:uint64_t(300000000);
+                    const auto limit=std::min(linkLimit,hostLimit),autoLimit=std::min(limit,td::LegacyMaxBitrate);
+                    const auto requested=options.bitrateMaximum?linkLimit:desiredBitrate;
+                    const auto overrideRate=options.customBitrate?std::min(requested,limit):0;
+                    if(options.autoQuality) options.settings=td::bestQuality(capabilities.current,options.display,mask,nativeNegotiated,overrideRate,autoLimit);
+                    else {
+                        options.settings.codecMask=mask;
+                        if(options.autoFrameRate) options.settings.fps=td::negotiatedFrameRate(capabilities.current,options.display);
+                        options.settings.bitrate=options.customBitrate?overrideRate:td::automaticBitrate(options.settings.width,options.settings.height,options.settings.fps,mask,autoLimit);
+                    }
+                    if(options.uncompressed) {
+                        if(!desktopSRGB) throw std::runtime_error("Raw P010 requires desktop sRGB capture");
+                        options.settings.codecMask=options.capabilityVersion>=15 && (capabilities.codecMask&32)?32:options.capabilityVersion>=14 && (capabilities.codecMask&16)?16:8; options.settings.bitDepth=10;
+                        if(options.settings.codecMask!=32) options.settings.fps=std::min<uint16_t>(60,options.settings.fps);
+                        options.settings.bitrate=td::rawVideoRate(options.settings.width,options.settings.height,options.settings.fps,td::Codec(options.settings.codecMask));
+                    }
                     if(options.settings.height>2304 && !(capabilities.flags&8)) throw std::runtime_error("Update the Mac host to use native HiDPI pixels above 2304 lines");
                     sourceDescription="Mac display: "+capabilities.name+" | "+std::to_string(capabilities.current.width)+"×"+
                         std::to_string(capabilities.current.height)+" | "+std::to_string(capabilities.current.hz)+" Hz\r\n";
+                    sourceDescription+="Link bitrate limit: "+std::to_string(linkLimit/1000000)+" Mbps"+
+                        (td::knownLinkRate(link.receiveRate)?" (driver-reported receive speed)":" (20 Gbps fallback)")+"\r\n";
+                    if(options.customBitrate && requested>hostLimit) sourceDescription+="Host protocol bitrate limit: "+std::to_string(hostLimit/1000000)+" Mbps; update the Mac host for the full link range.\r\n";
                     sender->send(td::hello(options.settings,ntohs(local.sin_port),options.token,richFeatures)); querying=false;
                     setStatus("Auto quality negotiated: "+std::to_string(options.settings.width)+"×"+std::to_string(options.settings.height)+
                         " | "+std::to_string(options.settings.fps)+" Hz | "+std::to_string(options.settings.bitrate/1000000)+" Mbps");
@@ -413,13 +483,35 @@ void ClientSession::connectAndStream(const std::string& host) {
                     }
                     streamDescription=sourceDescription+host+" | "+std::to_string(welcome.settings.width)+"×"+std::to_string(welcome.settings.height)+
                         " | target "+std::to_string(welcome.settings.fps)+" Hz | "+std::to_string(welcome.settings.bitrate/1000000)+" Mbps | "+
-                        (welcome.codec==td::Codec::HEVC10?"HEVC Main10 / SDR 10-bit":welcome.codec==td::Codec::HEVC?"HEVC / SDR 8-bit":"H.264 / SDR 8-bit")+std::string(" / 4:2:0 / D3D11")+
+                        (welcome.codec==td::Codec::RawDelta10?"Uncompressed changed regions / SDR 10-bit":welcome.codec==td::Codec::RawPacked10?"Uncompressed packed10 / SDR 10-bit":td::isRaw(welcome.codec)?"Uncompressed P010 / SDR 10-bit":welcome.codec==td::Codec::HEVC10?"HEVC Main10 / SDR 10-bit":welcome.codec==td::Codec::HEVC?"HEVC / SDR 8-bit":"H.264 / SDR 8-bit")+std::string(" / 4:2:0 / D3D11")+
                         (options.clipboard?(clipboardSupported?(richFeatures?"\r\nClipboard: text and images requested (64 KiB / 32 MiB)":"\r\nText clipboard: requested (64 KiB)"):"\r\nText clipboard: unavailable on this Mac host"):"\r\nText clipboard: disabled")+
                         (localCursorActive?"\r\nCursor: live macOS system cursor (video cursor hidden)":options.localCursor?(richFeatures?"\r\nCursor: video (native cursor access unavailable on this Mac)":"\r\nCursor: video (update Mac to 0.7.0 for live system cursors)"):"\r\nCursor: video")+
                         (welcome.settings.bitrate!=options.settings.bitrate?"\r\nHardware encoder bitrate limit: requested "+std::to_string(options.settings.bitrate/1000000)+" Mbps, accepted "+std::to_string(welcome.settings.bitrate/1000000)+" Mbps":"")+
                         (fallbackDescription.empty()?"":"\r\nLast fallback: "+fallbackDescription);
                     setStatus(streamDescription);
                     diagnosticLog("connection.stream",streamDescription);
+                } else if(type==td::Message::RawVideoEndpoint && options.uncompressed && decoder && td::isRaw(codec)) {
+                    auto endpoint=remote; endpoint.sin_port=htons(td::rawEndpoint(message,sessionID));
+                    decoder->startRaw(endpoint,sessionID);
+                } else if(type==td::Message::MouseMode && options.capabilityVersion>=11 && decoder) {
+                    relativeMouseActive=td::relativeMouseMode(message,sessionID);
+                    if(relativeMouseActive) {
+                        remoteCursorActive=options.capabilityVersion>=12 && cursorSupported;
+                        localCursorActive=remoteCursorActive.load();
+                        auto cursorText=streamDescription.find("\r\nCursor: ");
+                        if(cursorText!=std::string::npos) {
+                            auto end=streamDescription.find("\r\n",cursorText+2);
+                            streamDescription.replace(cursorText,end==std::string::npos?std::string::npos:end-cursorText,
+                                remoteCursorActive?"\r\nCursor: independent macOS cursor (multi-display control)":"\r\nCursor: video (multi-display control)");
+                        }
+                        streamDescription+="\r\nMouse: fullscreen crosses Mac displays; windowed returns to Windows";
+                        setStatus(streamDescription);
+                    }
+                } else if(type==td::Message::CursorPosition && remoteCursorActive && decoder) {
+                    td::CursorPosition position(message,sessionID);
+                    bool notify=false;
+                    { std::lock_guard<std::mutex> lock(mutex);notify=!cursorPositionIncoming.has_value();cursorPositionIncoming=position; }
+                    if(notify) PostMessageW(window,CursorPositionMessage,0,0);
                 } else if(type==td::Message::CursorImage && cursorSupported && decoder) {
                     if(auto image=cursorAssembler.push(message,td::Message::CursorImage,td::CursorImageLimit)) {
                         { std::lock_guard<std::mutex> lock(mutex);cursorIncoming=std::move(*image); }
@@ -458,7 +550,7 @@ void ClientSession::connectAndStream(const std::string& host) {
                     }
                     auto header=td::VideoHeader::parse(b,size_t(n));
                     if(header && header->session==sessionID && header->codec==codec) {
-                        ++videoPackets; assembler->push(b,size_t(n),micros());
+                        ++videoPackets; videoBytes+=uint64_t(n); assembler->push(b,size_t(n),micros());
                     }
                 }
                 // Drain complete access units frequently: a burst must not evict usable frames.

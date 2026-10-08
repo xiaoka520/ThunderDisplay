@@ -15,6 +15,46 @@ func log(_ message: String) {
     hostLogger.notice("\(message, privacy: .public)")
 }
 
+// Bounded remote performance logs; file I/O never runs on capture/input queues.
+final class WindowsDiagnosticStore: @unchecked Sendable {
+    static let shared = WindowsDiagnosticStore()
+    private let queue = DispatchQueue(label: "ThunderDisplay.windowsDiagnostics", qos: .utility)
+    private let lock = NSLock()
+    private var pending = 0
+    private let logger = Logger(subsystem: "dev.thunderdisplay.host", category: "windows-client")
+    private let file: URL
+    init(directory: URL? = nil) {
+        let folder = directory ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ThunderDisplay")
+        file = folder.appendingPathComponent("windows-client.log")
+    }
+    func append(_ lines: [String]) {
+        guard !lines.isEmpty else { return }
+        lock.lock()
+        guard pending < 16 else { lock.unlock(); return }
+        pending += 1; lock.unlock()
+        queue.async { [self] in
+            defer { lock.lock(); pending -= 1; lock.unlock() }
+            for line in lines { logger.notice("Windows client: \(line, privacy: .public)") }
+            do {
+                let manager = FileManager.default
+                try manager.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let size = (try? manager.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue ?? 0
+                if size >= 2 * 1024 * 1024 {
+                    let previous = file.deletingLastPathComponent().appendingPathComponent("windows-client.previous.log")
+                    try? manager.removeItem(at: previous)
+                    try manager.moveItem(at: file, to: previous)
+                }
+                if !manager.fileExists(atPath: file.path) { _ = manager.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
+                let handle = try FileHandle(forWritingTo: file)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                let received = ISO8601DateFormatter().string(from: Date())
+                try handle.write(contentsOf: Data(lines.map { "received=\(received) Windows client: \($0)\n" }.joined().utf8))
+            } catch { logger.error("Windows diagnostic log write failed: \(error.localizedDescription, privacy: .public)") }
+        }
+    }
+}
+
 struct HostBindError: Error, CustomStringConvertible {
     let ip: String, port: UInt16, code: Int32
     var addressInUse: Bool { code == EADDRINUSE }
@@ -65,6 +105,10 @@ struct Options {
     var encoderCheckBitrate: UInt64 = 10_000_000
     var desktopColorCheck = false
     var captureCheckLocalCursor = false
+    var captureRateCheck = false
+    var rawCaptureRateCheck = false
+    var updateCaptureRateCheck = false, captureDepthFive = false, unthrottledCaptureCheck = false
+    var rawTransportCheck = false
     var requirePairing = false, pairingOverride: Bool?, permissionProbe = false
     var relaunchParent: Int32?
     init() throws {
@@ -92,6 +136,12 @@ struct Options {
             if arg == "--encoder-check-20g" { encoderCheck = true; encoderCheckBitrate = 20_000_000_000; continue }
             if arg == "--encoder-check-gigabit" { encoderCheck = true; encoderCheckBitrate = 1_000_000_000; continue }
             if arg == "--capture-check-local-cursor" { captureCheck = true; captureCheckNative = true; captureCheckLocalCursor = true; continue }
+            if arg == "--capture-rate-check" { captureRateCheck = true; continue }
+            if arg == "--capture-rate-check-raw" { captureRateCheck = true; rawCaptureRateCheck = true; continue }
+            if arg == "--capture-rate-check-updates" { captureRateCheck = true; rawCaptureRateCheck = true; updateCaptureRateCheck = true; continue }
+            if arg == "--capture-depth-five" { captureDepthFive = true; continue }
+            if arg == "--capture-unthrottled" { unthrottledCaptureCheck = true; continue }
+            if arg == "--raw-transport-check" { rawTransportCheck = true; continue }
             if arg == "--capture-check-native" || arg == "--capture-check-native-10bit" { captureCheck = true; captureCheckNative = true; captureCheck10 = arg.hasSuffix("-10bit"); continue }
             if arg == "--capture-check-10bit" { captureCheck = true; captureCheck10 = true; continue }
             if arg == "--capture-check" { captureCheck = true; continue }

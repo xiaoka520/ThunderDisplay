@@ -1,5 +1,6 @@
 #pragma once
 #include "common.hpp"
+#include "client_diagnostics.hpp"
 #include "../version.h"
 #include <shlobj.h>
 #include <condition_variable>
@@ -18,6 +19,8 @@ class ClientDiagnostics {
     std::thread writer;
     bool stopped=false;
     unsigned dropped=0;
+    td::RemoteDiagnostics remote;
+    std::atomic<bool> sharing{false};
     static constexpr uintmax_t MaxBytes=2*1024*1024;
     void run() {
         for(;;) {
@@ -61,8 +64,13 @@ public:
         wake.notify_one(); if(writer.joinable()) writer.join();
     }
     std::wstring path() const { return file.wstring(); }
+    void setRemoteEnabled(bool value) {
+        remote.setEnabled(value); sharing=value;
+        write("client.debug",std::string("share_with_mac=")+(value?"1":"0")+" version=" TD_VERSION_TEXT);
+    }
+    bool remoteEnabled() const { return sharing.load(); }
+    std::string takeRemote() { return remote.take(); }
     void write(const char* event,std::string details={}) {
-        if(file.empty()) return;
         if(details.size()>2048) details.resize(2048);
         for(auto& c:details) if(static_cast<unsigned char>(c)<32) c=' ';
         SYSTEMTIME now{}; GetLocalTime(&now);
@@ -70,6 +78,8 @@ public:
         line<<std::setfill('0')<<std::setw(4)<<now.wYear<<'-'<<std::setw(2)<<now.wMonth<<'-'<<std::setw(2)<<now.wDay
             <<' '<<std::setw(2)<<now.wHour<<':'<<std::setw(2)<<now.wMinute<<':'<<std::setw(2)<<now.wSecond<<'.'<<std::setw(3)<<now.wMilliseconds
             <<" tick_us="<<micros()<<' '<<event<<' '<<details;
+        remote.push(event,line.str());
+        if(file.empty()) return;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if(pending.size()>=256) { ++dropped; return; }

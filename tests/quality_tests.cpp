@@ -35,7 +35,9 @@ int main() {
     auto hevc=bestQuality({2560,1600,120},{2560,1600,240},2);
     auto h264=bestQuality({2560,1600,120},{2560,1600,240},1);
     REQUIRE(h264.bitrate>hevc.bitrate && h264.codecMask==1 && hevc.codecMask==2);
-    for(uint64_t ceiling:{uint64_t(159999999),uint64_t(1000000001)}) {
+    auto slowerLink=bestQuality({4096,2560,60},{2560,1600,240},7,true,0,100000000);
+    REQUIRE(slowerLink.bitrate==100000000 && slowerLink.width==native.width);
+    for(uint64_t ceiling:{uint64_t(9999999),uint64_t(1000000001)}) {
         bool rejected=false; try { bestQuality({2560,1600,60},{2560,1600,240},3,false,0,ceiling); } catch(...) { rejected=true; } REQUIRE(rejected);
     }
     for(auto source:std::vector<DisplayLimits>{{0,0,0},{2560,1600,0},{40000,2400,240},{12000,240,240}}) {
@@ -68,6 +70,10 @@ int main() {
     REQUIRE(fallbackCodecMask(Codec::HEVC,3,8)==1);
     auto main10=w.data; main10[23]=7; main10[24]=10;
     REQUIRE(HostCapabilities(main10).streamBits==10);
+    for(auto rawMask:{11,15,27,31,59,63}) {
+        auto raw=main10; raw[23]=uint8_t(rawMask);
+        REQUIRE(HostCapabilities(raw).codecMask==rawMask && HostCapabilities(raw).streamBits==10);
+    }
     main10[24]=8; bool rejected=false; try { HostCapabilities c(main10); } catch(...) { rejected=true; } REQUIRE(rejected);
     auto ten=bestQuality({2560,1600,60},{2560,1600,240},4); REQUIRE(ten.codecMask==4 && ten.width==2560);
     ControlFramer framer; auto packet=framed(w.data);

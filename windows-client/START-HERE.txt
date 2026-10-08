@@ -1,6 +1,6 @@
-ThunderDisplay 0.8.17 · Windows 安装版 / Windows installer
+ThunderDisplay 0.8.30 · Windows 安装版 / Windows installer
 
-运行 ThunderDisplay-Windows-Setup-0.8.17-x64.exe，按安装向导完成安装。
+运行 ThunderDisplay-Windows-Setup-0.8.30-x64.exe，按安装向导完成安装。
 可选择 Windows 登录后在托盘启动，以及桌面快捷方式。
 默认安装位置：%LOCALAPPDATA%\Programs\ThunderDisplay。
 
@@ -11,13 +11,50 @@ ThunderDisplay 0.8.17 · Windows 安装版 / Windows installer
 
 填写 Mac 的雷雳网桥 IPv4 或留空自动发现。配对码默认关闭。
 自动模式保留 Mac HiDPI 源像素；自定义可修改尺寸与码率。帧率仍按两端显示器协商。
+码率使用滑块调节：最左侧自动，最右侧为实际连接网卡报告的接收速率；无法检测时回退 20 Gbps。
+右上角可直接输入整数 Mbps，按回车确认；留空或输入 0 恢复自动。手填精确到 1 Mbps。
+拖动时吸附附近整值，吸附间隔随码率增大（10 / 50 / 100 / 500 / 1000 Mbps 等）；方向键可直接离开吸附值。
+界面显示网卡名称、发送 / 接收速率和当前上限。右端最大值随链路变化，旧自定义码率会迁移保留。
+超过 20 Gbps 的请求范围需两端均为 0.8.18；编码器仍可能报告更低的硬件接受值。
 8 / 10-bit HEVC 为 SDR 4:2:0，未新增 HDR 或 4:4:4。
+可选“无压缩 · 10 位（高速链路）”：两端更新至 0.8.26 后仅传输变化区域，保持源像素、全部 10 位 SDR 4:2:0 数值，跳过视频压缩与解码。帧率按两端屏幕协商，最高 240 fps；当前源屏 60 Hz 时仍协商 60 fps。
+局部拖动和滚动可减少重复像素；全画面持续变化的 4096×2560 / 60 fps 仍需约 9.4 Gbps，网络开销另计。不使用码率滑块；旧端继续兼容原来的完整 packed10 / P010 传输。
+0.8.23 为 Mac 视频连接申请最高 8 MiB 发送缓冲，Windows 接收与像素还原/上传并行，三个复用缓冲只保留最新完整帧。实际帧率受采集与链路吞吐影响，升级后需实测。
+带宽不足时跳过排队的旧帧，不自动降低尺寸或色深。实际帧率同时取决于 Mac 采集、网桥吞吐与 Windows GPU 上传 / 显示。
 全屏快捷键默认 Ctrl+Alt+Enter，可在设置中自定义；Ctrl+Alt+Shift+Esc 释放输入。
+Mac 有多块显示器时，无边框全屏会接管鼠标，按 macOS 排列跨屏移动、点击和拖动；窗口模式下可直接移出 TD 回到 Windows。
+实体屏和虚拟屏采用相同规则，Windows 自己的显示器排列不改变远端跨屏方向。画面保持 Mac 选定屏幕，鼠标移到其他 Mac 屏幕后不会出现在 TD 画面中。
+多屏鼠标需两端均更新至 0.8.19；失焦、断线、退出全屏或释放输入时解除鼠标锁定。
+两端 0.8.21 可独立同步 Mac 原生指针形状和位置，鼠标不再等待视频编码；系统不支持原生指针读取时仍保留视频指针。
 连接偏好保存在当前用户注册表，配对码只有主动勾选记住时才加密保存。
 
 升级安装会关闭旧客户端，保留连接偏好。卸载使用 Windows 已安装的应用或开始菜单卸载入口。
 
 Run the Setup EXE. Optional sign-in startup runs in the ThunderDisplay tray; shortcuts open settings.
 Closing settings keeps the application running. Use the tray menu to quit.
+Bitrate slider: Auto at the left, driver-reported receive-link limit at the right; 20 Gbps fallback if unavailable.
+Enter an exact integer Mbps in the top-right field; Enter confirms, empty or 0 selects Auto.
+Dragging snaps near round values with progressively larger steps; typing keeps 1 Mbps precision.
+Both platforms need 0.8.18 for requested bitrates above 20 Gbps. Hardware encoder limits remain visible.
+Optional Uncompressed · 10-bit (fast link) uses exact changed-region updates with 0.8.26 on both ends. It preserves source pixels and all ten meaningful bits of SDR 4:2:0, bypasses video compression/decoding, and follows both displays up to 240 fps. A 60 Hz source still negotiates 60 fps.
+Continuous full-screen changes at 4096x2560 / 60 fps still need approximately 9.4 Gbps, excluding overhead. Unchanged regions are reused for local window movement and scrolling. The bitrate slider is unused; older peers retain compatible full-frame packed10 / P010.
+Video TCP buffers retain system autotuning instead of a fixed 1 MiB limit. Mac diagnostics report actual windows and replaced pending frames.
+Slow links discard old pending frames without lowering resolution or precision. Capture, bridge throughput and Windows GPU presentation determine the actual frame rate.
 A continuous 3-second outage returns to settings; bounded automatic recovery continues and new video restores the remote window.
 Upgrade and uninstall through the installer / Windows Installed apps. Connection preferences are retained.
+
+调试掉帧：Windows 设置 → 连接诊断，勾选“调试：将性能日志发送到 Mac”。可在连接中开关，无需重新连接；默认关闭并记住选择。两端需 0.8.26。日志自动回传，Mac 保存到 ~/Library/Logs/ThunderDisplay/windows-client.log，并写入系统日志的 windows-client 分类。仅共享新产生的 TD 性能/显示日志，最多约 4 KB/秒，不上传屏幕、剪贴板或按键内容。
+接收、上传、Present 提交帧率分别测量；DXGI 显示统计不可用时标记 -1，不用协商的 60 Hz 充当实测帧率。静止桌面可能降低采集帧率，长帧间隔也可能来自源端停更。
+
+Debug stutter: Windows settings → Connection diagnostics → Debug: share performance logs with Mac. Toggle while connected; disabled by default, choice remembered. Both ends require 0.8.26. New TD performance/display logs appear in ~/Library/Logs/ThunderDisplay/windows-client.log and the Mac windows-client system log category. At most about 4 KB/sec, with bounded queues and input priority. No screen, clipboard or key contents, and no historical disk-log export. Receive/upload/Present rates are measured independently; unavailable DXGI display statistics are -1. Target refresh rate is never reported as measured FPS.
+
+0.8.27 减少无压缩模式的逐帧处理量：按每块像素的修订记录累计所有变化，跳过待显示帧也不会漏更新；CPU 仅复制/还原变化块，GPU 使用 16 位亮度/色度纹理，仅上传变化区域，以完整独立 GPU 图像提交显示。全部十位有效值、4096×2560 源像素与现有色彩转换保持一致。每个客户端首次无压缩连接会做小型合成 GPU 校验，检查所有 1024 个十位数值、区域更新和旧画面独立性；不会读取回当前桌面。调试日志新增处理字节数、区域数、CPU 还原和 GPU 上传的分开耗时。视频线程使用 Windows 多媒体调度。
+
+当前 BetterDisplay 虚拟屏虽报告 240 Hz，实机整屏采集约 60 fps，独立窗口可约 120 fps。更高的协商参数不等于真实整屏采集达到该帧率。本版优化 TD 的掉帧开销，不宣称突破该虚拟屏路径的刷新限制，也不以重复帧冒充更高帧率。
+
+0.8.30：日志框默认更高。拖动底部“拖动调整日志高度”手柄可以上下拉伸，高度自动保存；双击手柄恢复默认高度。手柄获得焦点后可用上下方向键微调。日志刷新保留阅读位置和选区，不自动滚动。
+0.8.30: The taller log panel resizes vertically using its bottom grip and remembers its height. Double-click the grip to reset; focused Up/Down keys adjust it. Text refresh preserves the viewport and selection without automatically scrolling.
+
+0.8.28 修复无压缩首帧启动：Windows 视频连接立即申请至少 16 MiB 接收缓冲，使用非阻塞接收和就绪等待，避免短时接收超时后继续使用 Winsock 状态不确定的连接；网络接收线程不再注册 Playback 调度。Mac 恢复此前的分段 send 路径。新增首帧接收进度及实际缓冲诊断。仅修改 TD 自身的视频连接，不修改全局网络配置。
+
+0.8.29 把视频接收缓冲设置移到 TCP 建立连接之前，避免握手后扩大缓冲却仍通告 65,280 字节窗口。首帧持续收到数据时允许传完（最多 60 秒）；5 秒没有字节进展仍中断。字节速率按实际到达统计，即使首帧未完成也能看到真实接收速率。

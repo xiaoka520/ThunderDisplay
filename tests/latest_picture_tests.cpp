@@ -17,13 +17,20 @@ int main() {
     assert(pictures.discardedPictures()==998);
     auto newest=pictures.take(); assert(newest && newest->picture==1000);
     assert(!pictures.take());
+    // A busy display must retry the final static image, but new arrivals win.
+    assert(pictures.restore(*newest));
+    auto retry=pictures.take(); assert(retry && retry->picture==1000);
+    assert(pictures.push(1001)); assert(!pictures.restore(*retry));
+    assert(pictures.take()->picture==1001);
     // Session retirement invalidates both a popped item and queued pictures.
     assert(pictures.push(1001)); pictures.retire();
     assert(!pictures.current(*inFlight) && !pictures.current(*newest) && !pictures.take());
+    assert(!pictures.restore(*retry));
     assert(pictures.push(2000)); assert(pictures.take()->picture==2000);
     auto waiter=std::async(std::launch::async,[&]{return pictures.wait(std::chrono::seconds(5));});
     pictures.retire(true); assert(waiter.wait_for(std::chrono::milliseconds(100))==std::future_status::ready);
     assert(!waiter.get() && !pictures.push(2001));
+    assert(!pictures.restore(*retry));
     // Resource destruction may re-enter diagnostics; it must run outside lock.
     td::LatestPicture<std::shared_ptr<unsigned>> resources;
     bool released=false;

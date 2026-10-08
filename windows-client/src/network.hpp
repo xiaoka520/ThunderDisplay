@@ -3,6 +3,7 @@
 #include "clipboard.hpp"
 #include "blob.hpp"
 #include "recovery.hpp"
+#include "network_link.hpp"
 
 class ControlSender;
 class ClientSession {
@@ -11,17 +12,23 @@ class ClientSession {
     HWND window;
     uint8_t requestedCodecMask;
     std::atomic<bool> stopFlag{false}, online{false}, wantIDR{false}, overflow{false};
+    std::atomic<bool> debugLogs{false};
     std::thread worker;
     std::mutex mutex;
     std::shared_ptr<ControlSender> control;
     std::optional<std::string> clipboardIncoming;
     std::optional<td::Bytes> imageIncoming,cursorIncoming;
+    std::optional<td::CursorPosition> cursorPositionIncoming;
     std::atomic<bool> richClipboard{false};
     uint32_t clipboardID=0;
     std::atomic<bool> clipboardOnline{false};
     std::atomic<bool> localCursorActive{false};
+    std::atomic<bool> relativeMouseActive{false};
+    std::atomic<bool> remoteCursorActive{false};
     std::string status;
     std::string fallbackDescription;
+    std::optional<td::NetworkLink> currentLink;
+    uint64_t desiredBitrate;
     std::string lastStreamHost; // Worker-only; verified by a displayed live frame.
     td::RetryBudget retryBudget;
     std::atomic<unsigned> attemptNumber{0};
@@ -37,7 +44,7 @@ class ClientSession {
     std::string discover();
     void setStatus(std::string value);
 public:
-    ClientSession(ClientOptions options,Renderer& renderer,HWND hwnd): options(std::move(options)),renderer(renderer),window(hwnd),requestedCodecMask(this->options.settings.codecMask) {}
+    ClientSession(ClientOptions options,Renderer& renderer,HWND hwnd): options(std::move(options)),renderer(renderer),window(hwnd),requestedCodecMask(this->options.settings.codecMask),desiredBitrate(this->options.settings.bitrate) { debugLogs=this->options.debugLogs; }
     ~ClientSession() { stop(); }
     void start() { worker=std::thread([this]{run();}); }
     void stop() { stopFlag=true; if(worker.joinable()) worker.join(); }
@@ -55,9 +62,14 @@ public:
     bool imageClipboardEnabled() const { return clipboardOnline && richClipboard; }
     std::optional<td::Bytes> takeImage() { std::lock_guard<std::mutex> lock(mutex);auto image=std::move(imageIncoming);imageIncoming.reset();return image; }
     std::optional<td::Bytes> takeCursor() { std::lock_guard<std::mutex> lock(mutex);auto image=std::move(cursorIncoming);cursorIncoming.reset();return image; }
+    std::optional<td::CursorPosition> takeCursorPosition() { std::lock_guard<std::mutex> lock(mutex);auto point=cursorPositionIncoming;cursorPositionIncoming.reset();return point; }
     std::optional<std::string> takeClipboard() { std::lock_guard<std::mutex> lock(mutex); auto text=std::move(clipboardIncoming); clipboardIncoming.reset(); return text; }
     bool clipboardEnabled() const { return clipboardOnline; }
     bool localCursorEnabled() const { return localCursorActive; }
+    bool relativeMouseEnabled() const { return relativeMouseActive; }
+    bool remoteCursorEnabled() const { return remoteCursorActive; }
     void requestIDR() { wantIDR=true; }
+    void setDebugLogs(bool enabled) { debugLogs=enabled; }
     std::string currentStatus() { std::lock_guard<std::mutex> lock(mutex); return status; }
+    std::optional<td::NetworkLink> networkLink() { std::lock_guard<std::mutex> lock(mutex); return currentLink; }
 };

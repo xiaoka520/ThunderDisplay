@@ -12,7 +12,7 @@ int main() {
         REQUIRE(layout.contentHeight()>=height);
         REQUIRE(layout.qualityTop()==layout.networkTop()+layout.networkHeight()+20);
         REQUIRE(layout.diagnosticsTop()==layout.qualityTop()+layout.qualityHeight()+20);
-        REQUIRE(layout.diagnosticsTop()+174+layout.extraHeight()+60<=layout.contentHeight());
+        REQUIRE(layout.shortcutsTop()+60<=layout.contentHeight());
         for(auto count:{2,3}) {
             int previousRight=0;
             for(int index=0;index<count;++index) {
@@ -26,6 +26,26 @@ int main() {
     }
     td::SetupLayout compact{840,960,false,false},expanded{840,960,true,true};
     REQUIRE(expanded.minimumHeight()>compact.minimumHeight());
+
+    // Resizing the log must extend its card/footer and page range together,
+    // without moving the other settings or resetting the document viewport.
+    REQUIRE(compact.logHeight()==220);
+    for(int preferred:{-1,0,120,220,600,960,100000}) for(int height:{350,960,2600}) {
+        td::SetupLayout layout{840,height,false,false,preferred};
+        REQUIRE(layout.logHeight()>=120 && layout.logHeight()<=960);
+        REQUIRE(layout.logResizeTop()==layout.logTop()+layout.logHeight()+4);
+        REQUIRE(layout.logResizeTop()+28+12==layout.diagnosticsTop()+layout.diagnosticsHeight());
+        REQUIRE(layout.shortcutsTop()==layout.diagnosticsTop()+layout.diagnosticsHeight()+16);
+        REQUIRE(layout.shortcutsTop()+60+8<=layout.contentHeight());
+        REQUIRE(layout.qualityTop()==compact.qualityTop());
+        REQUIRE(layout.diagnosticsTop()==compact.diagnosticsTop());
+        REQUIRE(layout.contentHeight()>=height);
+        td::SetupScroll document; document.resize(compact.contentHeight(),height); document.moveTo(200);
+        auto before=document.position(); document.resize(layout.contentHeight(),height);
+        REQUIRE(document.position()==std::min(before,std::max(0,layout.contentHeight()-height)));
+    }
+    REQUIRE(td::SetupLayout::boundedLogHeight(-1)==120);
+    REQUIRE(td::SetupLayout::boundedLogHeight(100000)==960);
 
     // Reproduce a bottom field retaining focus while the user scrolls upward.
     // Ordinary wheel/key messages must never pull the page back to that field.

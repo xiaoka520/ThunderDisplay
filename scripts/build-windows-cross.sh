@@ -18,7 +18,7 @@ mkdir -p "$task_root/build/package/windows-x64/licenses"
     "$task_root/windows-client/src/decoder.cpp" "$task_root/windows-client/src/video_worker.cpp" "$task_root/windows-client/src/renderer.cpp" \
     -o "$task_root/build/package/windows-x64/ThunderDisplayClient.exe" \
     -lws2_32 -liphlpapi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -ld3d11 -ld3dcompiler -ldxgi -ldxguid \
-    -lole32 -loleaut32 -luser32 -lshell32 -lgdi32 -ladvapi32 -lcrypt32 -lcomctl32 -ldwmapi -luxtheme -lwindowscodecs
+    -lole32 -loleaut32 -luser32 -lshell32 -lgdi32 -ladvapi32 -lcrypt32 -lcomctl32 -ldwmapi -luxtheme -lwindowscodecs -lavrt
 rm "$task_root/build/package/windows-x64/client-resource.o"
 cp "$task_toolchain/LICENSE.TXT" "$task_root/build/package/windows-x64/licenses/LLVM.txt"
 cp "$task_root/windows-client/START-HERE.txt" "$task_root/build/package/windows-x64/START-HERE.txt"

@@ -26,6 +26,26 @@ def validate_gui(data, version):
         raise ValueError("Legacy mandatory-token entry point found")
     if b"Cursor: live macOS system cursor (video cursor hidden)" not in data:
         raise ValueError("Missing system cursor build marker")
+    if b"Mouse: fullscreen crosses Mac displays; windowed returns to Windows" not in data:
+        raise ValueError("Missing fullscreen multi-display pointer support")
+    for marker in (b"Raw ten-bit plane texture", b"Uncompressed P010 / SDR 10-bit", b"Uncompressed packed10 / SDR 10-bit", b"Cursor: independent macOS cursor (multi-display control)"):
+        if marker not in data:
+            raise ValueError(f"Missing uncompressed / independent cursor support: {marker!r}")
+    for marker in (b"receiver=independent", b"pending_replaced=", b"Raw video buffer pool exhausted"):
+        if marker not in data:
+            raise ValueError(f"Missing pipelined raw receiver: {marker!r}")
+    for marker in (b"Uncompressed changed regions / SDR 10-bit", b"Invalid raw update baseline", b"exact-updates"):
+        if marker not in data:
+            raise ValueError(f"Missing exact changed-region transmission: {marker!r}")
+    for marker in (b"upload=changed-planes", b"snapshot_copy_bytes_avg=", b"processed_P010_bytes_avg=", b"video.raw.gpu.check", b"MMCSS Playback/high"):
+        if marker not in data:
+            raise ValueError(f"Missing partial raw pixel processing: {marker!r}")
+    for marker in (b"phase=before_connect", b"video.raw.startup", b"first_complete_frame_bytes=", b"raw receiver above-normal; nonblocking socket polling"):
+        if marker not in data:
+            raise ValueError(f"Missing first-frame connection recovery: {marker!r}")
+    for marker in (b"video.performance", b"present_fps=", b"dxgi_display_fps=", b"Invalid diagnostic sharing acknowledgment"):
+        if marker not in data:
+            raise ValueError(f"Missing opt-in Windows-to-Mac diagnostics: {marker!r}")
     if b"Explicit sRGB shader conversion" not in data:
         raise ValueError("Missing desktop color conversion build marker")
     if b"ThunderDisplay handover" not in data or b"Invalid session transition notice" not in data:
@@ -41,12 +61,14 @@ def validate_gui(data, version):
     for preset in ("缩放与边缘", "1:1 原始像素显示（窗口较小时裁剪画面）", "60 Hz · 高画质", "120 Hz · 超清", "165 Hz · 超清", "240 Hz · 低延迟"):
         if preset.encode("utf-16-le") in data:
             raise ValueError("Fixed FPS presets must not appear in the GUI")
-    for control in ("重连已停止，请手动重新连接。", "控制通道已建立，等待首帧…", "自定义码率", "本地指针 · macOS 原生（同步系统形状与点击热点）"):
+    for control in ("重连已停止，请手动重新连接。", "控制通道已建立，等待首帧…", "视频码率", "请输入有效码率", "请修正视频码率后再连接。", "网桥速率尚未检测到，码率上限暂用 20 Gbps。连接后按实际网卡重新核对。", "本地指针 · macOS 原生（同步系统形状与点击热点）"):
         if control.encode("utf-16-le") not in data:
             raise ValueError(f"Missing control: {control}")
-    for text in (f"ThunderDisplay {version} · 连接 Mac", "配对码", "显示模式", "连接 Mac", "全屏快捷键", "串流色深", "清晰度优先：保留 Mac HiDPI 像素（自动模式）", "双向剪贴板：文字与图片（连接后复制）"):
+    for text in (f"ThunderDisplay {version} · 连接 Mac", "配对码", "显示模式", "连接 Mac", "全屏快捷键", "串流色深", "清晰度优先：保留 Mac HiDPI 像素（自动模式）", "双向剪贴板：文字与图片（连接后复制）", "调试：将性能日志发送到 Mac（可在连接中切换）"):
         if text.encode("utf-16-le") not in data:
             raise ValueError(f"Missing GUI version/control: {text}")
+    if "拖动调整日志高度".encode("utf-16-le") not in data or "LogPanelHeight".encode("utf-16-le") not in data:
+        raise ValueError("Missing resizable diagnostics panel / saved height")
 
 
 def main():

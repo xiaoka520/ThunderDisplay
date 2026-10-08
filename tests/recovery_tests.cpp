@@ -4,6 +4,15 @@
 int main() {
     td::RetryBudget budget;
     constexpr uint64_t start=1000000;
+    assert(!td::VideoHealth::firstFrameTimedOut(start+12000000,start,false,0));
+    assert(td::VideoHealth::firstFrameTimedOut(start+12000001,start,false,start+12000001));
+    assert(!td::VideoHealth::firstFrameTimedOut(start+15000000,start,true,start+14000000));
+    assert(td::VideoHealth::firstFrameTimedOut(start+15000000,start,true,0));
+    assert(td::VideoHealth::firstFrameTimedOut(start+15000000,start,true,start+10000000));
+    assert(!td::VideoHealth::firstFrameTimedOut(start+15000000,start,true,start+10000001));
+    assert(td::VideoHealth::firstFrameTimedOut(start+15000000,start,true,start+15000001));
+    assert(!td::VideoHealth::firstFrameTimedOut(start+59999999,start,true,start+59999999));
+    assert(td::VideoHealth::firstFrameTimedOut(start+60000000,start,true,start+60000000));
     using WindowAction=td::RemoteWindowRecovery::Action;
     td::RemoteWindowRecovery window;
     assert(window.update(start+10000000,0,false)==WindowAction::None);

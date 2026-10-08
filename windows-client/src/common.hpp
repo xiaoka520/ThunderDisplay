@@ -28,21 +28,21 @@ inline void check(HRESULT hr, const char* where) {
 inline uint64_t micros() {
     return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-constexpr UINT StatusMessage=WM_APP+1, DisconnectedMessage=WM_APP+2, FramePresentedMessage=WM_APP+3, KeyboardMessage=WM_APP+4, ReleaseInputMessage=WM_APP+5, ClipboardMessage=WM_APP+6,CursorMessage=WM_APP+7;
+constexpr UINT StatusMessage=WM_APP+1, DisconnectedMessage=WM_APP+2, FramePresentedMessage=WM_APP+3, KeyboardMessage=WM_APP+4, ReleaseInputMessage=WM_APP+5, ClipboardMessage=WM_APP+6,CursorMessage=WM_APP+7,CursorPositionMessage=WM_APP+8;
 struct ClientOptions {
     std::string host, token;
     uint16_t port=td::Port;
     td::Settings settings;
     bool fullscreen=false, vsync=false, explicitSettings=false, pairing=false, autoConnect=false;
     bool background=false, showSettings=false, exitExisting=false;
-    bool autoQuality=true, customBitrate=false, pixelExact=false, nativePixels=true, clipboard=true;
+    bool autoQuality=true, customBitrate=false, bitrateMaximum=false, pixelExact=false, nativePixels=true, clipboard=true;
     bool autoFrameRate=true;
-    bool localCursor=false;
+    bool localCursor=false, uncompressed=false, debugLogs=false;
     uint8_t scalingQuality=1; // 0 compatibility, 1 Lanczos (no sharpening).
     uint16_t fullscreenHotkey=td::DefaultFullscreenHotkey;
     unsigned displayBits=0;
     uint8_t colorDepth=0;
-    uint8_t capabilityVersion=9;
+    uint8_t capabilityVersion=16;
     td::DisplayLimits display;
     RECT displayBounds{};
 };

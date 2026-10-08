@@ -71,13 +71,15 @@ private final class SystemCursorReader {
 final class NativeCursorMonitor {
     private let reader = SystemCursorReader()
     private var timer: Timer?, session: UInt64 = 0, previous: Data?, variants = false
+    private var previousPosition: CGPoint?, previousVisibility: Bool?
     var available: Bool { reader.read() != nil }
     func diagnostic() -> String {
         guard let (images, size, hotspot) = reader.read() else { return "Native cursor unavailable; use video cursor" }
         return "Native cursor representations: \(images.map { "\($0.width)×\($0.height)" }.joined(separator: ", ")); logical points: \(size.width)×\(size.height); hotspot: \(hotspot.x),\(hotspot.y); visible: \(reader.isVisible())"
     }
     var onImage: ((UInt64, Data) -> Void)?
-    func stop() { timer?.invalidate(); timer = nil; session = 0; previous = nil }
+    var onPosition: ((UInt64, CGPoint, Bool) -> Void)?
+    func stop() { timer?.invalidate(); timer = nil; session = 0; previous = nil; previousPosition = nil; previousVisibility = nil }
     func setSession(_ session: UInt64, enabled: Bool, variants: Bool = false) {
         if !enabled && self.session != session { return }
         stop(); guard enabled else { return }; self.session = session; self.variants = variants
@@ -88,6 +90,11 @@ final class NativeCursorMonitor {
     private func poll() {
         guard session != 0 else { return }
         let showing = reader.isVisible()
+        if let point = CGEvent(source: nil)?.location,
+           point != previousPosition || showing != previousVisibility {
+            previousPosition = point; previousVisibility = showing
+            onPosition?(session, point, showing)
+        }
         guard let (images, size, hotspot) = reader.read() else { return }
         // A cursor animation can update pixels without changing the shape seed.
         // Compare native pixels before PNG encoding instead of skipping by seed.

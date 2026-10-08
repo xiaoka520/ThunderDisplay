@@ -4,7 +4,27 @@ task_app=/Applications/ThunderDisplayHost.app
 task_host="$task_app/Contents/MacOS/ThunderDisplayHost"
 task_service_dir="/Library/Application Support/ThunderDisplay"
 /usr/bin/codesign --verify --deep --strict "$task_app"
-/usr/bin/codesign --verify --deep --strict "/Applications/ThunderDisplay Uninstaller.app"
+for task_path in "$task_service_dir" "$task_service_dir/trash-cleanup.sh" "$task_service_dir/installed-app.marker" \
+    "$task_service_dir/trash-cleanup.pending" /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist; do
+    if [ -L "$task_path" ]; then printf 'Refusing symlink cleanup destination.\n' >&2; exit 1; fi
+done
+# Trash removal is handled by a short-lived root-owned cleanup job. It is
+# separate from the nobody boot discovery helper, which has no admin access.
+/usr/bin/install -d -o root -g wheel -m 755 "$task_service_dir"
+/usr/bin/install -o root -g wheel -m 755 "$task_app/Contents/Resources/trash-cleanup.sh" "$task_service_dir/trash-cleanup.sh"
+/usr/bin/install -o root -g wheel -m 644 "$task_app/Contents/Resources/dev.thunderdisplay.cleanup.plist" /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist
+(umask 077; /usr/bin/touch "$task_service_dir/installed-app.marker")
+/usr/sbin/chown root:wheel "$task_service_dir/installed-app.marker"
+/bin/chmod 600 "$task_service_dir/installed-app.marker"
+/bin/rm -f "$task_service_dir/trash-cleanup.pending"
+/bin/launchctl bootout system/dev.thunderdisplay.cleanup 2>/dev/null || true
+/bin/launchctl enable system/dev.thunderdisplay.cleanup
+/bin/launchctl bootstrap system /Library/LaunchDaemons/dev.thunderdisplay.cleanup.plist
+task_legacy_uninstaller="/Applications/ThunderDisplay Uninstaller.app"
+if [ -d "$task_legacy_uninstaller" ] && [ ! -L "$task_legacy_uninstaller" ] && \
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$task_legacy_uninstaller/Contents/Info.plist" 2>/dev/null || true)" = dev.thunderdisplay.uninstaller ]; then
+    /bin/rm -rf "$task_legacy_uninstaller"
+fi
 task_temporary="$(/usr/bin/mktemp -d /private/tmp/ThunderDisplay-install.XXXXXX)"
 trap '/bin/rm -rf "$task_temporary"' EXIT
 /bin/chmod 700 "$task_temporary"

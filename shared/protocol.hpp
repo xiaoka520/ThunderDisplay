@@ -15,9 +15,10 @@ namespace td {
 using Bytes = std::vector<uint8_t>;
 constexpr uint16_t Port = 47990;
 constexpr size_t HeaderSize = 40, FragmentSize = 1160, LegacyMaxFrameSize = 4 * 1024 * 1024, GigabitMaxFrameSize=16*1024*1024, MaxFrameSize = 64 * 1024 * 1024, ControlLimit = 4096;
-constexpr uint64_t LegacyMaxBitrate=1000000000, MaxBitrate = 20000000000ULL;
-enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide, SessionTransition, SessionTransitionAck, VideoStatistics };
-enum class Codec : uint8_t { H264=1, HEVC=2, HEVC10=4 };
+constexpr uint64_t LegacyMaxBitrate=1000000000, DefaultBitrateLimit=20000000000ULL, MaxBitrate=1000000000000ULL;
+enum class Message : uint8_t { Hello=1, Welcome, Input, RequestIDR, Ping, Pong, Failure, Ready, CapabilityQuery, Capabilities, ClipboardControl, ClipboardText, CursorImage, ClipboardImage, HelloWide, WelcomeWide, SessionTransition, SessionTransitionAck, VideoStatistics, MouseMode, CursorPosition, RawVideoEndpoint, ClientDiagnostics };
+enum class Codec : uint8_t { H264=1, HEVC=2, HEVC10=4, RawP010=8, RawPacked10=16, RawDelta10=32 };
+inline bool isRaw(Codec codec) { return codec==Codec::RawP010 || codec==Codec::RawPacked10 || codec==Codec::RawDelta10; }
 
 // Optional UDP return-path probe; the existing TCP/UDP video wire format is unchanged.
 inline std::string videoProbe(uint64_t session) { return "TDVIDEO1 "+std::to_string(session); }
@@ -66,6 +67,27 @@ inline Bytes sessionTransition(uint64_t session,bool acknowledgment=false) {
 inline bool validSessionTransition(const Bytes& data,uint64_t session,bool acknowledgment=false) {
     return session && data==sessionTransition(session,acknowledgment);
 }
+inline Bytes mouseMode(uint64_t session,bool relative) {
+    Writer w; w.put(uint8_t(Message::MouseMode)); w.put(session); w.put(uint8_t(relative?1:0)); return w.data;
+}
+inline bool relativeMouseMode(const Bytes& data,uint64_t session) {
+    if(!session || (data!=mouseMode(session,false) && data!=mouseMode(session,true)))
+        throw std::runtime_error("Invalid mouse mode");
+    return data.back()!=0;
+}
+struct CursorPosition {
+    bool visible=false;
+    uint16_t x=0,y=0;
+    CursorPosition()=default;
+    CursorPosition(const Bytes& data,uint64_t session) {
+        Reader r(data);
+        if(!session || r.get<uint8_t>()!=uint8_t(Message::CursorPosition) || r.get<uint64_t>()!=session)
+            throw std::runtime_error("Invalid cursor session");
+        auto shown=r.get<uint8_t>(); x=r.get<uint16_t>(); y=r.get<uint16_t>();
+        if(!r.end() || shown>1 || (!shown && (x || y))) throw std::runtime_error("Invalid cursor position");
+        visible=shown!=0;
+    }
+};
 struct Settings {
     uint16_t width=2560, height=1600, fps=120;
     uint64_t bitrate=120000000;
@@ -89,9 +111,9 @@ struct Welcome {
         auto type=r.get<uint8_t>(); bool wide=type==uint8_t(Message::WelcomeWide);
         if((!wide && type!=uint8_t(Message::Welcome)) || r.get<uint16_t>()!=(wide?2:1)) throw std::runtime_error("Protocol mismatch");
         session=r.get<uint64_t>(); codec=Codec(r.get<uint8_t>());
-        settings.bitDepth=codec==Codec::HEVC10?10:8;
+        settings.bitDepth=(codec==Codec::HEVC10 || isRaw(codec))?10:8;
         settings.width=r.get<uint16_t>(); settings.height=r.get<uint16_t>(); settings.fps=r.get<uint16_t>(); settings.bitrate=wide?r.get<uint64_t>():r.get<uint32_t>();
-        if(!r.end() || session==0 || (codec!=Codec::H264 && codec!=Codec::HEVC && codec!=Codec::HEVC10) || settings.width<320 || settings.width>4096 ||
+        if(!r.end() || session==0 || (codec!=Codec::H264 && codec!=Codec::HEVC && codec!=Codec::HEVC10 && !(wide && isRaw(codec))) || settings.width<320 || settings.width>4096 ||
            settings.height<240 || settings.height>4096 || settings.width%2 || settings.height%2 ||
            settings.fps<1 || settings.fps>240 ||
            settings.bitrate<10000000 || settings.bitrate>(wide?MaxBitrate:LegacyMaxBitrate)) throw std::runtime_error("Invalid welcome");

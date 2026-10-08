@@ -1,5 +1,5 @@
 #pragma once
-#include "protocol.hpp"
+#include "bitrate.hpp"
 #include <cmath>
 
 namespace td {
@@ -24,11 +24,9 @@ inline Settings bestQuality(DisplayLimits source,DisplayLimits target,uint8_t co
     // Thunderbolt direct-bridge budget: prioritize quality over bandwidth conservation.
     // Higher bitrate significantly improves text and UI clarity despite 4:2:0 chroma.
     // Increased from 0.90/1.44 to 1.35/2.16 for enhanced detail preservation.
-    double bitsPerPixel=(codecMask&6)?1.35:2.16;
-    auto mbps=unsigned(std::ceil(double(result.width)*result.height*result.fps*bitsPerPixel/10000000))*10;
     if(bitrateOverride && (bitrateOverride<10000000 || bitrateOverride>MaxBitrate)) throw std::runtime_error("Invalid custom bitrate");
-    if(automaticCeiling<160000000 || automaticCeiling>LegacyMaxBitrate) throw std::runtime_error("Invalid automatic bitrate ceiling");
-    result.bitrate=bitrateOverride?bitrateOverride:std::clamp(uint64_t(mbps)*1000000,uint64_t(160000000),automaticCeiling);
+    if(automaticCeiling<MinimumBitrate || automaticCeiling>LegacyMaxBitrate) throw std::runtime_error("Invalid automatic bitrate ceiling");
+    result.bitrate=bitrateOverride?bitrateOverride:automaticBitrate(result.width,result.height,result.fps,codecMask,automaticCeiling);
     return result;
 }
 // Requested depth: 0 auto, 8 compatible SDR, 10 explicitly required Main10.
@@ -59,7 +57,7 @@ struct HostCapabilities {
         if(length>256 || length!=r.size-r.pos || current.width<320 || current.height<240 ||
             current.width>32768 || current.height>32768 || !current.hz || current.hz>1000 ||
             maximum.width<320 || maximum.height<240 || maximum.width>32768 || maximum.height>32768 ||
-            !maximum.hz || maximum.hz>1000 || (codecMask!=3 && codecMask!=7) || streamBits!=((codecMask&4)?10:8) || ((flags&128) && !(flags&64)))
+            !maximum.hz || maximum.hz>1000 || (codecMask!=3 && codecMask!=7 && codecMask!=11 && codecMask!=15 && codecMask!=27 && codecMask!=31 && codecMask!=59 && codecMask!=63) || streamBits!=((codecMask&60)?10:8) || ((flags&128) && !(flags&64)))
             throw std::runtime_error("Unsupported display capabilities");
         name.assign(reinterpret_cast<const char*>(r.data+r.pos),length);
     }

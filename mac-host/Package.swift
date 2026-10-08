@@ -6,7 +6,10 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [.executable(name: "ThunderDisplayHost", targets: ["ThunderDisplayHost"]), .executable(name: "ThunderDisplayBoot", targets: ["ThunderDisplayBoot"])],
     targets: [
-        .target(name: "Wire"),
+        // Pixel loops favor throughput over SwiftPM's default -Os C release
+        // setting. Keep other targets and debug diagnostics on their defaults.
+        .target(name: "RawPixelSupport", cSettings: [.unsafeFlags(["-O3"], .when(configuration: .release))]),
+        .target(name: "Wire", dependencies: ["RawPixelSupport"]),
         .target(name: "HostState", linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration")]),
         .target(name: "CursorSupport", linkerSettings: [.linkedFramework("AppKit")]),
         .target(name: "HIDBridge", linkerSettings: [.linkedFramework("IOKit"), .linkedFramework("Carbon"), .linkedFramework("CoreGraphics")]),

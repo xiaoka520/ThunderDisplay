@@ -1,8 +1,10 @@
 #include "cursor.hpp"
+#include "cursor_overlay.hpp"
 #include "cursor_wire.hpp"
 #include "setup.hpp"
 #include "image_clipboard.hpp"
 #include "tray.hpp"
+#include "pointer_input.hpp"
 #include "../version.h"
 #include <shellapi.h>
 #include <commctrl.h>
@@ -23,9 +25,9 @@ ClientOptions parse() {
         auto arg=utf8(args[i]);
         if(arg=="--help" || arg=="-h") {
             std::ostringstream help; help<<"ThunderDisplayClient [--host IPv4] [--token CODE] [--connect] [--mode auto|quality60|ultra120|low240]\n"
-                <<"  [--token-file PATH] [--codec auto|hevc|h264] [--fps 1..240]\n"
+                <<"  [--token-file PATH] [--codec auto|hevc|h264|raw] [--fps 1..240]\n"
                 <<"  [--width 2560] [--height 1600] [--bitrate 120] [--port 47990]\n"
-                <<"  [--display-pixels] [--no-clipboard] [--fullscreen] [--vsync] [--depth 0|8|10] [--lang auto|zh|en]\n"
+                <<"  [--display-pixels] [--no-clipboard] [--fullscreen] [--vsync] [--depth 0|8|10] [--lang auto|zh|en] [--debug-logs]\n"
                 <<"Ctrl+Alt+Enter: fullscreen (configurable in setup). Ctrl+Alt+Shift+Esc: release/capture input. Close window: disconnect.\n";
             MessageBoxW(nullptr,wide(help.str()).c_str(),L"ThunderDisplay",MB_OK); std::exit(0);
         }
@@ -36,6 +38,7 @@ ClientOptions parse() {
         if(arg=="--vsync") { o.vsync=true; continue; }
         if(arg=="--display-pixels") { o.nativePixels=false; continue; }
         if(arg=="--no-clipboard") { o.clipboard=false; continue; }
+        if(arg=="--debug-logs") { o.debugLogs=true; continue; }
         if(arg=="--connect") { o.autoConnect=true; continue; }
         if(arg=="--pairing") { o.pairing=true; continue; }
         if(arg=="--no-pairing") { o.pairing=false; continue; }
@@ -57,10 +60,11 @@ ClientOptions parse() {
         else if(arg=="--width") o.settings.width=uint16_t(number(320,4096));
         else if(arg=="--height") o.settings.height=uint16_t(number(240,4096));
         else if(arg=="--fps") { o.settings.fps=uint16_t(number(1,240)); o.autoFrameRate=false; }
-        else if(arg=="--bitrate") { o.settings.bitrate=uint64_t(number(10,20000))*1000000; o.customBitrate=true; }
+        else if(arg=="--bitrate") { o.settings.bitrate=uint64_t(number(10,unsigned(td::MaxBitrate/1000000)))*1000000; o.customBitrate=true; }
         else if(arg=="--codec") {
+            o.uncompressed=value=="raw";
             if(value=="auto") o.settings.codecMask=3; else if(value=="h264") o.settings.codecMask=1;
-            else if(value=="hevc") o.settings.codecMask=2; else throw std::runtime_error("Unknown codec");
+            else if(value=="hevc") o.settings.codecMask=2; else if(value=="raw") { o.settings.codecMask=8; o.uncompressed=true; } else throw std::runtime_error("Unknown codec");
         } else if(arg=="--mode") {
             if(value=="auto") { o.autoQuality=true; }
             else if(value=="quality60") { o.autoFrameRate=false; o.settings.fps=60; o.settings.bitrate=80000000; }
@@ -74,6 +78,7 @@ ClientOptions parse() {
         throw std::runtime_error("Supply the 32 character pairing code from the Mac setup window");
     if(o.settings.width%2 || o.settings.height%2) throw std::runtime_error("Resolution must be even");
     if(o.settings.fps<1 || o.settings.fps>240) throw std::runtime_error("FPS must be 1 to 240");
+    if(o.uncompressed) { o.colorDepth=10; o.nativePixels=true; o.settings.codecMask=8; }
     if(!o.pairing) o.token.clear();
     return o;
 }
@@ -90,11 +95,18 @@ struct App {
     std::set<uint16_t> pressed,physicalKeys,suppressedKeys,localKeys;
     uint16_t fullscreenHotkey=td::DefaultFullscreenHotkey;
     bool capture=true,fullscreen=false,remoteCaps=false;
+    bool relativeMouseCaptured=false, pointerClipped=false, pointerSuspended=false;
+    POINT savedPointer{}, pointerPin{};
+    std::map<HANDLE,POINT> absoluteMousePositions;
     unsigned buttons=0;
     WINDOWPLACEMENT placement{};
     HHOOK hook=nullptr;
     bool renewKeyboardHook=true, keyboardHookFailed=false;
     HCURSOR localCursor=nullptr; UINT cursorDPI=0;
+    CursorOverlay cursorOverlay;
+    std::optional<td::CursorRaster> cursorRaster;
+    std::optional<td::CursorPosition> remoteCursor;
+    UINT overlayDPI=0;
     struct NativeCursor { std::vector<td::PNGImage> images; double width,height,hotX,hotY; };
     std::optional<NativeCursor> nativeCursor;
     HCURSOR macCursor() {
@@ -111,6 +123,7 @@ struct App {
             raster=td::rasterCursor(dpi,int(image.width),int(image.height),source.width,source.height,source.hotX,source.hotY,pixels);
         }
         BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+        cursorRaster=raster;
         info.bmiHeader.biWidth=raster.size; info.bmiHeader.biHeight=-raster.size;
         info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32; info.bmiHeader.biCompression=BI_RGB;
         void* bits=nullptr; auto color=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
@@ -125,8 +138,21 @@ struct App {
         if(monochrome) DeleteObject(monochrome); DeleteObject(color);
         if(!created) return LoadCursorW(nullptr,IDC_ARROW);
         auto old=localCursor; localCursor=created; cursorDPI=dpi;
-        SetCursor(created); if(old) DestroyCursor(old);
+        SetCursor(relativeMouseCaptured?nullptr:created); if(old) DestroyCursor(old);
         return localCursor;
+    }
+    void updateRemoteCursor() {
+        int x=0,y=0;
+        if(!relativeMouseCaptured || !ready() || GetForegroundWindow()!=window || !session->remoteCursorEnabled() ||
+           !nativeCursor || !remoteCursor || !remoteCursor->visible ||
+           !renderer->remotePointerPosition(remoteCursor->x,remoteCursor->y,x,y)) { cursorOverlay.hide(); return; }
+        auto dpi=GetDpiForWindow(window);
+        if(overlayDPI!=dpi) {
+            macCursor();
+            if(!cursorRaster || !cursorOverlay.image(window,*cursorRaster)) { cursorOverlay.hide(); return; }
+            overlayDPI=dpi;
+        }
+        cursorOverlay.move(x,y);
     }
     DWORD clipboardSequence=0;
     std::optional<std::string> pendingClipboard;
@@ -144,9 +170,74 @@ struct App {
         if(remoteCaps) f|=32; return f;
     }
     void release() {
+        releasePointerLock();
         if(session) session->send(td::input(5,0,0)); pressed.clear(); buttons=0; ReleaseCapture();
     }
     bool ready() const { return session && !session->handingOver() && session->connected() && renderer && renderer->hasFrame(); }
+    td::PointerInputMode pointerMode() const {
+        return td::pointerInputMode(session && session->relativeMouseEnabled(),fullscreen,capture,
+            GetForegroundWindow()==window && !pointerSuspended,ready() && IsWindowVisible(window) && !IsIconic(window));
+    }
+    void releasePointerLock() {
+        cursorOverlay.hide();
+        if(!relativeMouseCaptured) return;
+        relativeMouseCaptured=false;
+        RAWINPUTDEVICE device{0x01,0x02,RIDEV_REMOVE,nullptr};
+        RegisterRawInputDevices(&device,1,sizeof(device));
+        RECT current{};
+        if(pointerClipped && GetClipCursor(&current) && current.left==pointerPin.x && current.top==pointerPin.y &&
+           current.right==pointerPin.x+1 && current.bottom==pointerPin.y+1) ClipCursor(nullptr);
+        pointerClipped=false; SetCursorPos(savedPointer.x,savedPointer.y);
+        SetCursor(LoadCursorW(nullptr,IDC_ARROW)); absoluteMousePositions.clear();
+    }
+    void updatePointerLock() {
+        if(pointerMode()!=td::PointerInputMode::Relative) { releasePointerLock(); return; }
+        RECT area{}; GetClientRect(window,&area);
+        POINT center{(area.left+area.right)/2,(area.top+area.bottom)/2}; ClientToScreen(window,&center);
+        if(relativeMouseCaptured && center.x==pointerPin.x && center.y==pointerPin.y) { updateRemoteCursor(); return; }
+        if(!relativeMouseCaptured) {
+            if(!GetCursorPos(&savedPointer)) return;
+            RAWINPUTDEVICE device{0x01,0x02,0,window}; // Foreground only; retain ordinary button/wheel messages.
+            if(!RegisterRawInputDevices(&device,1,sizeof(device))) {
+                capture=false; release();
+                diagnosticLog("input.mouse.error","Raw mouse registration failed; input released"); return;
+            }
+            relativeMouseCaptured=true;
+        }
+        RECT pin{center.x,center.y,center.x+1,center.y+1};
+        if(!ClipCursor(&pin)) {
+            capture=false; release();
+            diagnosticLog("input.mouse.error","Mouse confinement failed; input released"); return;
+        }
+        pointerPin=center; pointerClipped=true;
+        if(!SetCursorPos(center.x,center.y)) {
+            capture=false; release();
+            diagnosticLog("input.mouse.error","Mouse positioning failed; input released"); return;
+        }
+        SetCursor(nullptr);
+        updateRemoteCursor();
+    }
+    void rawMouse(LPARAM handle) {
+        if(!relativeMouseCaptured || pointerMode()!=td::PointerInputMode::Relative) return;
+        RAWINPUT raw{}; UINT size=sizeof(raw);
+        if(GetRawInputData(reinterpret_cast<HRAWINPUT>(handle),RID_INPUT,&raw,&size,sizeof(RAWINPUTHEADER))!=sizeof(raw) ||
+           raw.header.dwType!=RIM_TYPEMOUSE) return;
+        auto& mouse=raw.data.mouse;
+        LONG dx=mouse.lLastX,dy=mouse.lLastY;
+        if(mouse.usFlags&MOUSE_MOVE_ABSOLUTE) {
+            // Tablets / remote Windows sessions report normalized desktop positions.
+            const bool desktop=(mouse.usFlags&MOUSE_VIRTUAL_DESKTOP)!=0;
+            const auto width=GetSystemMetrics(desktop?SM_CXVIRTUALSCREEN:SM_CXSCREEN);
+            const auto height=GetSystemMetrics(desktop?SM_CYVIRTUALSCREEN:SM_CYSCREEN);
+            POINT next{LONG(int64_t(mouse.lLastX)*std::max(0,width-1)/65535),
+                       LONG(int64_t(mouse.lLastY)*std::max(0,height-1)/65535)};
+            auto previous=absoluteMousePositions.find(raw.header.hDevice);
+            if(previous==absoluteMousePositions.end()) { absoluteMousePositions[raw.header.hDevice]=next; return; }
+            dx=next.x-previous->second.x; dy=next.y-previous->second.y; previous->second=next;
+        }
+        dx=std::clamp<LONG>(dx,-32767,32767); dy=std::clamp<LONG>(dy,-32767,32767);
+        if(dx || dy) session->send(td::input(6,0,flags(),int32_t(dx),int32_t(dy)));
+    }
     void refreshKeyboardHook() {
         // Windows can silently remove a low-level hook when its owner stalls
         // during device initialization. Renew once per stream and on focus.
@@ -265,6 +356,15 @@ struct App {
         }
         const std::pair<const wchar_t*,const wchar_t*> diagnostics[]={
             {L"Video interrupted; requesting a fresh keyframe",L"画面中断，正在请求新的关键帧"},
+            {L"Mouse: fullscreen crosses Mac displays; windowed returns to Windows",L"鼠标：全屏可跨 Mac 屏幕，窗口模式可离开 TD 回到 Windows"},
+            {L"Cursor: video (multi-display control)",L"指针：多屏控制使用实际 Mac 视频指针"},
+            {L"Cursor: independent macOS cursor (multi-display control)",L"指针：多屏控制独立同步 Mac 指针（不等待视频编码）"},
+            {L"Uncompressed packed10: lossless unpack + GPU upload; no video decoder",L"无压缩 10 位：还原有效像素并上传显卡，跳过视频解码"},
+            {L"Uncompressed packed10 / SDR 10-bit",L"无压缩有效位 / SDR 10 位"},
+            {L"Link bitrate limit: ",L"链路码率上限："},
+            {L" (driver-reported receive speed)",L"（驱动报告的接收速率）"}, {L" (20 Gbps fallback)",L"（未检测到速率，默认 20 Gbps）"},
+            {L"Host protocol bitrate limit: ",L"Mac 版本支持的码率上限："},
+            {L" Mbps; update the Mac host for the full link range.",L" Mbps；更新 Mac 端后可使用完整链路范围。"},
             {L"Hardware encoder bitrate limit: requested ",L"硬件编码器码率限制：请求 "}, {L" Mbps, accepted ",L" Mbps，实际接受 "},
             {L"Scaling: ",L"画面缩放："}, {L"no sharpening",L"不锐化"}, {L"Video processor compatibility",L"兼容缩放"}, {L"fallback: ",L"回退原因："},
             {L"Clipboard active: yes",L"剪贴板同步：已开启"}, {L"Clipboard active: no",L"剪贴板同步：未开启"},
@@ -295,6 +395,9 @@ struct App {
             {L"Decoded frames ready; restore the remote display window",L"已解码画面，请恢复远程显示窗口"},
             {L"Video playing",L"画面传输正常"}, {L"First frame timed out: ",L"首帧超时，正在重连："},
             {L"Video packets: ",L"视频包："}, {L"Complete frames: ",L"完整帧："},
+            {L"Debug logs: sharing with Mac",L"调试日志：正在发送到 Mac"},
+            {L"Debug logs: waiting for Mac acknowledgment",L"调试日志：等待 Mac 确认"},
+            {L"Debug logs: update Mac to 0.8.26",L"调试日志：请将 Mac 更新到 0.8.26"},
             {L"Submitted: ",L"提交解码："}, {L"Decoded: ",L"解码输出："}
         };
         for(auto& entry:diagnostics) {
@@ -305,7 +408,7 @@ struct App {
         }
         auto logPath=ClientDiagnostics::instance().path();
         if(!logPath.empty()) description+=std::wstring(tr(L"\r\n诊断日志：",L"\r\nDiagnostics log: "))+logPath;
-        if(setup) setup->status(state,description);
+        if(setup) { if(session) if(auto link=session->networkLink()) setup->setNetworkLink(*link); setup->status(state,description); }
         auto caption=std::wstring(L"ThunderDisplay " TD_VERSION_WIDE L" | ")+state+L" | "+shortcutName()+tr(L" 全屏 · Ctrl+Alt+Shift+Esc 释放输入",L" fullscreen · Ctrl+Alt+Shift+Esc release input");
         if(!capture) caption+=tr(L" | 输入已释放",L" | Input released");
         SetWindowTextW(window,caption.c_str());
@@ -315,6 +418,7 @@ struct App {
     void connect(ClientOptions options) {
         disconnect(false);
         capture=true; remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0; fullscreenHotkey=options.fullscreenHotkey; fullscreenRequested=options.fullscreen; openOnFirstFrame=true;
+        pointerSuspended=false;
         try {
             if(options.autoQuality && options.displayBounds.right<=options.displayBounds.left) {
                 auto screens=detectDisplays();
@@ -338,11 +442,11 @@ struct App {
     }
     void disconnect(bool showSetup=true) {
         renewKeyboardHook=true;
-        release(); pendingClipboard.reset();pendingImage.reset();pendingImagePixels.reset();nativeCursor.reset();cursorDPI=0; KillTimer(window,7); KillTimer(window,8);
+        release(); pendingClipboard.reset();pendingImage.reset();pendingImagePixels.reset();nativeCursor.reset();cursorDPI=0;remoteCursor.reset();overlayDPI=0; KillTimer(window,7); KillTimer(window,8);
         if(session) session->stop();
         session.reset(); renderer.reset();
         // Remove notifications from the old worker before a new session can start.
-        MSG queued{}; while(PeekMessageW(&queued,window,StatusMessage,CursorMessage,PM_REMOVE)) {}
+        MSG queued{}; while(PeekMessageW(&queued,window,StatusMessage,CursorPositionMessage,PM_REMOVE)) {}
         if(fullscreen) toggleFullscreen();
         ShowWindow(window,SW_HIDE); openOnFirstFrame=false; remoteRecovery.clear();
         if(setup) { setup->setActive(false); title(); if(showSetup) setup->present(); }
@@ -384,6 +488,7 @@ struct App {
         if(command==4) PostQuitMessage(0);
     }
     void toggleFullscreen() {
+        release(); pointerSuspended=false;
         if(!fullscreen) {
             placement.length=sizeof(placement); GetWindowPlacement(window,&placement);
             MONITORINFO m{}; m.cbSize=sizeof(m); GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&m);
@@ -394,6 +499,7 @@ struct App {
             SetWindowPos(window,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
         }
         fullscreen=!fullscreen;
+        updatePointerLock();
     }
     uint16_t physicalFlags() const {
         uint16_t f=0;
@@ -452,7 +558,7 @@ struct App {
         return 1; // Includes Win, Alt+Tab, Alt+F4 and shell shortcuts during focused fullscreen.
     }
     bool mousePoint(LPARAM l,int32_t& x,int32_t& y) {
-        return renderer->pointerPosition(short(LOWORD(l)),short(HIWORD(l)),buttons!=0,x,y);
+        return renderer->pointerPosition(short(LOWORD(l)),short(HIWORD(l)),fullscreen && buttons!=0,x,y);
     }
     LRESULT message(UINT m,WPARAM w,LPARAM l) {
         if(m==taskbarCreated) { tray.refresh(true); title(); return 0; }
@@ -475,9 +581,11 @@ struct App {
             if(w==1) toggleFullscreen();
             if(w==2) {
                 capture=!capture;
+                pointerSuspended=false;
                 if(capture) remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0;
             }
             if(w==3) {
+                pointerSuspended=true;
                 wchar_t directory[MAX_PATH]{}; auto length=GetSystemDirectoryW(directory,MAX_PATH);
                 const auto executable=std::wstring(directory)+L"\\Taskmgr.exe";
                 if(!length || length>=MAX_PATH || reinterpret_cast<INT_PTR>(ShellExecuteW(window,L"open",executable.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32) {
@@ -486,30 +594,36 @@ struct App {
                     SetWindowTextW(window,tr(L"ThunderDisplay · 输入已释放",L"ThunderDisplay · Input released")); return 0;
                 }
             }
-            title(); return 0;
+            if(w==0) pointerSuspended=true;
+            updatePointerLock(); title(); return 0;
         case WM_CLOSE: disconnect(); return 0;
         case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE: td::UITheme::system().apply(window); icons.apply(window); tray.refresh(); title(); return 0;
+        case CursorPositionMessage:
+            if(session) if(auto position=session->takeCursorPosition()) { remoteCursor=*position; updateRemoteCursor(); }
+            return 0;
         case CursorMessage:
             if(session) if(auto payload=session->takeCursor()) {
                 try {
                     td::CursorPayload decoded(*payload);
                     std::vector<td::PNGImage> images;
                     for(const auto& png:decoded.images) images.push_back(td::decodePNG(png,true,1024,1024*1024));
-                    nativeCursor=NativeCursor{std::move(images),decoded.width,decoded.height,decoded.hotX,decoded.hotY};cursorDPI=0;
+                    nativeCursor=NativeCursor{std::move(images),decoded.width,decoded.height,decoded.hotX,decoded.hotY};cursorDPI=0;overlayDPI=0;
                     POINT point{};GetCursorPos(&point);RECT area{};GetWindowRect(window,&area);
-                    if(capture && ready() && GetForegroundWindow()==window && PtInRect(&area,point)) SetCursor(macCursor());
+                    if(relativeMouseCaptured) updateRemoteCursor();
+                    else if(capture && ready() && GetForegroundWindow()==window && PtInRect(&area,point)) SetCursor(macCursor());
                 } catch(const std::exception& error) { if(setup) setup->status(tr(L"系统指针同步失败",L"System cursor synchronization failed"),wide(error.what())); }
             }
             return 0;
-        case WM_DESTROY: return 0;
+        case WM_DESTROY: releasePointerLock(); return 0;
         case WM_SETFOCUS:
+            pointerSuspended=false; updatePointerLock();
             remoteCaps=(GetKeyState(VK_CAPITAL)&1)!=0;
             if(ready()) refreshKeyboardHook(); else renewKeyboardHook=true;
             return 0;
         case WM_KILLFOCUS: release(); return 0;
         case WM_CLIPBOARDUPDATE: clipboardChanged(); return 0;
         case WM_TIMER:
-            if(w==9) { tray.retry(); connectionWindowTick(); return 0; }
+            if(w==9) { tray.retry(); connectionWindowTick(); updatePointerLock(); return 0; }
             if(w==7) { KillTimer(window,7); clipboardChanged(); return 0; }
             if(w==8) { KillTimer(window,8); receiveClipboard(); return 0; } break;
         case ClipboardMessage:
@@ -517,13 +631,13 @@ struct App {
             else receiveClipboard(); return 0;
         case WM_CAPTURECHANGED: if(buttons) release(); return 0;
         case StatusMessage: title(); return 0;
-        case DisconnectedMessage: renewKeyboardHook=true;nativeCursor.reset();cursorDPI=0;release(); title(); connectionWindowTick(); return 0;
+        case DisconnectedMessage: renewKeyboardHook=true;nativeCursor.reset();cursorDPI=0;remoteCursor.reset();overlayDPI=0;release(); title(); connectionWindowTick(); return 0;
         case FramePresentedMessage:
             if(ready() && renewKeyboardHook) refreshKeyboardHook();
             if(ready() && openOnFirstFrame) {
                 openOnFirstFrame=false; showDisplay(); if(fullscreenRequested && !fullscreen) toggleFullscreen();
             }
-            title(); return 0;
+            updatePointerLock(); title(); return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps{}; auto dc=BeginPaint(window,&ps);
             bool image=false;
@@ -543,27 +657,61 @@ struct App {
         }
         case WM_SIZE:
             if(renderer) try { renderer->resize(); } catch(const std::exception& e) { diagnosticLog("display.resize.error",e.what()); }
+            updatePointerLock();
             return 0;
-        case WM_DPICHANGED: icons.apply(window); return 0;
+        case WM_DPICHANGED: icons.apply(window); overlayDPI=0; updateRemoteCursor(); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_SETCURSOR:
-            if(LOWORD(l)==HTCLIENT && capture && ready()) { SetCursor(session->localCursorEnabled()?macCursor():nullptr); return TRUE; }
+            if(LOWORD(l)==HTCLIENT && capture && ready()) {
+                if(relativeMouseCaptured) SetCursor(nullptr);
+                else {
+                    POINT point{}; GetCursorPos(&point); ScreenToClient(window,&point);
+                    int32_t x=0,y=0;
+                    const bool content=renderer->pointerPosition(point.x,point.y,false,x,y);
+                    SetCursor(!content?LoadCursorW(nullptr,IDC_ARROW):session->localCursorEnabled()?macCursor():nullptr);
+                }
+                return TRUE;
+            }
             break;
+        case WM_INPUT:
+            rawMouse(l);
+            return DefWindowProcW(window,m,w,l); // Release foreground raw-input resources.
+        case WM_MOUSELEAVE:
+            if(!fullscreen && buttons) release();
+            return 0;
         case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_RBUTTONDOWN: case WM_RBUTTONUP:
         case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-            if(!capture || !ready()) break;
-            int32_t x,y; if(!mousePoint(l,x,y)) break;
-            if(m==WM_MOUSEMOVE) session->send(td::input(1,0,flags(),x,y));
+            if(pointerMode()==td::PointerInputMode::Released) break;
+            const bool relative=pointerMode()==td::PointerInputMode::Relative;
+            if(relative) {
+                updatePointerLock();
+                if(!relativeMouseCaptured) break;
+                if(m==WM_MOUSEMOVE) return 0; // Synthetic positioning must never snap the Mac pointer back.
+            }
+            int32_t x=0,y=0;
+            if(!relative && !mousePoint(l,x,y)) {
+                if(!fullscreen && buttons) release();
+                break;
+            }
+            if(m==WM_MOUSEMOVE) {
+                TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,window,0}; TrackMouseEvent(&tracking);
+                session->send(td::input(1,0,flags(),x,y));
+            }
             else {
                 const uint16_t button=(m==WM_LBUTTONDOWN||m==WM_LBUTTONUP)?0:(m==WM_RBUTTONDOWN||m==WM_RBUTTONUP)?1:2;
                 const bool down=m==WM_LBUTTONDOWN||m==WM_RBUTTONDOWN||m==WM_MBUTTONDOWN;
-                session->send(td::input(2,button,flags()|(down?1:0),x,y));
+                if(!down && !(buttons&(1u<<button))) return 0;
+                session->send(td::input(relative?7:2,button,flags()|(down?1:0),x,y));
                 if(down) { buttons|=1u<<button; SetCapture(window); } else { buttons&=~(1u<<button); if(!buttons) ReleaseCapture(); }
             }
             return 0;
         }
         case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
-            if(capture && ready()) {
+            if(pointerMode()!=td::PointerInputMode::Released) {
+                if(!fullscreen) {
+                    POINT point{short(LOWORD(l)),short(HIWORD(l))}; ScreenToClient(window,&point);
+                    int32_t x=0,y=0; if(!renderer->pointerPosition(point.x,point.y,false,x,y)) break;
+                }
                 const int32_t delta=int32_t(short(HIWORD(w)))*48/WHEEL_DELTA;
                 session->send(td::input(4,0,flags(),m==WM_MOUSEHWHEEL?delta:0,m==WM_MOUSEWHEEL?delta:0)); return 0;
             }
@@ -598,7 +746,7 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
                 PostMessageW(target,options.exitExisting?exitForInstallerMessage():showSettingsMessage(),0,0);
             return 0;
         }
-        INITCOMMONCONTROLSEX controls{}; controls.dwSize=sizeof(controls); controls.dwICC=ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS;
+        INITCOMMONCONTROLSEX controls{}; controls.dwSize=sizeof(controls); controls.dwICC=ICC_STANDARD_CLASSES|ICC_BAR_CLASSES;
         if(!InitCommonControlsEx(&controls)) throw std::runtime_error("Common controls initialization failed");
         WSADATA data; if(WSAStartup(MAKEWORD(2,2),&data)) throw std::runtime_error("Winsock startup failed"); winsock=true;
         check(CoInitializeEx(nullptr,COINIT_MULTITHREADED),"COM startup"); com=true;
@@ -622,6 +770,11 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
             app.setup->onShowDisplay=[&app]{app.showDisplay();};
             app.setup->onLanguage=[&app]{app.title();};
             app.setup->onShortcut=[&app](uint16_t shortcut){app.fullscreenHotkey=shortcut; app.title();};
+            ClientDiagnostics::instance().setRemoteEnabled(app.setup->debugLogsEnabled());
+            app.setup->onDebugLogs=[&app](bool enabled) {
+                ClientDiagnostics::instance().setRemoteEnabled(enabled);
+                if(app.session) app.session->setDebugLogs(enabled);
+            };
             app.hook=SetWindowsHookExW(WH_KEYBOARD_LL,App::keyboard,wc.hInstance,0);
             if(!app.hook) throw std::runtime_error("Keyboard hook failed");
             app.title();

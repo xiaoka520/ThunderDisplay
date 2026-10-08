@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recovery = HostRecoveryState()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var lastDisplayRefresh: TimeInterval = 0
+    private var capturedDisplay: HostDisplay?, capturedBounds: CGRect?, capturedDesktopBounds: [CGRect] = []
     private let power = HostPowerManager()
     private var promptedScreen = false, promptedAccess = false
     private let permissions = PermissionMonitor()
@@ -29,7 +30,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu(), appItem = NSMenuItem(), editItem = NSMenuItem()
         let appMenu = NSMenu(title: "ThunderDisplay"), editMenu = NSMenu(title: ui("编辑", "Edit"))
         appMenu.addItem(withTitle: ui("设置…", "Settings…"), action: #selector(showSettings), keyEquivalent: ",").target = self
-        appMenu.addItem(withTitle: ui("卸载 ThunderDisplay…", "Uninstall ThunderDisplay…"), action: #selector(openUninstaller), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: ui("退出 ThunderDisplay", "Quit ThunderDisplay"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for (title, action, key) in [(ui("剪切", "Cut"), "cut:", "x"), (ui("复制", "Copy"), "copy:", "c"), (ui("粘贴", "Paste"), "paste:", "v"), (ui("全选", "Select All"), "selectAll:", "a")] {
@@ -164,6 +164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await Task.sleep(nanoseconds: 1_000_000_000)
                 NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: nil)
                 try await ready("WAKE")
+                let unchanged = server
+                NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
+                guard server === unchanged else { throw HostError("Unchanged display geometry interrupted the live host") }
+                // Simulate a stale arrangement snapshot, without changing any
+                // physical/virtual display or desktop mode on the user's Mac.
+                capturedDesktopBounds = []
                 NotificationCenter.default.post(name: NSApplication.didChangeScreenParametersNotification, object: nil)
                 guard server == nil && recovery.requested else { throw HostError("Display change disabled automatic recovery") }
                 try await ready("DISPLAY")
@@ -184,37 +190,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func displayConfigurationChanged() {
         guard !options.previewUI else { return }
         recovery.displaysChanged(at: ProcessInfo.processInfo.systemUptime)
-        
-        // Check if the currently captured display is still valid before disconnecting.
-        // This reduces unnecessary disconnections for minor display parameter changes.
-        if let selectedDisplay = setup?.selectedDisplay {
-            let displayID = selectedDisplay.id
-            let oldBounds = CGDisplayBounds(displayID)
-            
-            // Query current display bounds synchronously
-            let newBounds = CGDisplayBounds(displayID)
-            
-            // Check if display is still online (online displays have non-zero bounds)
-            let displayOnline = newBounds.width > 0 && newBounds.height > 0
-            if displayOnline {
-                let widthUnchanged = newBounds.width == oldBounds.width
-                let heightUnchanged = newBounds.height == oldBounds.height
-                if widthUnchanged && heightUnchanged {
-                    // Resolution unchanged - likely just refresh rate or color space change
-                    // Keep the connection alive to avoid unnecessary disruption
-                    log("Display parameters changed but resolution unchanged (\(Int(newBounds.width))×\(Int(newBounds.height))); maintaining connection")
-                    setup?.refreshDisplays()
-                    refresh()
-                    return
-                } else {
-                    log("Display resolution changed from \(Int(oldBounds.width))×\(Int(oldBounds.height)) to \(Int(newBounds.width))×\(Int(newBounds.height)); rebuilding")
-                }
-            } else {
-                log("Display went offline; rebuilding capture")
-            }
+        setup?.refreshDisplays()
+        // Compare with the configuration used to create capture/input. Two fresh
+        // CGDisplayBounds reads always agree and miss moves, hotplug and resizing.
+        if server != nil, let previous = capturedDisplay, let current = setup?.selectedDisplay,
+           previous.id == current.id, previous.width == current.width, previous.height == current.height,
+           capturedBounds == CGDisplayBounds(current.id), capturedDesktopBounds == DesktopPointer.activeDisplayBounds() {
+            server?.updateDisplayCapabilities(current.payload); capturedDisplay = current
+            refresh(); return
         }
-        
-        // Display removed, resolution changed, or no active connection - rebuild
+        log("Display selection, geometry or arrangement changed; rebuilding capture and input")
         stopServer(); permissions.resetCaptureHealth(); statusIsError = false
         refresh()
     }
@@ -362,11 +347,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let host = HostServer(ip: ip, options: selected, token: code)
             host.inputAllowed = { ConsoleSession.ownsDesktop(geteuid()) }
             host.displayCapabilities = display.payload
+            host.desktopBounds = DesktopPointer.activeDisplayBounds()
             host.localCursorAvailable = cursor.available
             host.allowClipboard = setup.allowClipboard.state == .on
             clipboard.onText = { [weak host] session, text in host?.sendClipboard(text, session: session) }
             clipboard.onImage = { [weak host] session, image in host?.sendImage(image, session: session) }
             cursor.onImage = { [weak host] session, image in host?.sendCursor(image, session: session) }
+            cursor.onPosition = { [weak host] session, point, visible in host?.sendCursorPosition(point, visible: visible, session: session) }
             host.onCursorState = { [weak self, weak host] session, enabled, variants in DispatchQueue.main.async {
                 guard let self, let host, self.server === host else { return }
                 self.cursor.setSession(session, enabled: enabled, variants: variants)
@@ -398,6 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.refresh()
             } }
             try host.start(); server = host; boundIP = ip; boundPort = port; statusIsError = false
+            capturedDisplay = display; capturedBounds = CGDisplayBounds(display.id); capturedDesktopBounds = host.desktopBounds
             handoverRetry?.invalidate(); handoverRetry = nil
             startupRetry?.invalidate(); startupRetry = nil
             recovery.started()
@@ -426,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clipboard.stop(); cursor.stop()
         setup?.clipboardState.stringValue = ui("尚未同步 · 需要两端均开启并建立连接", "Inactive · both platforms must enable sync and connect")
         server?.stop(); server = nil; boundIP = nil; boundPort = nil
+        capturedDisplay = nil; capturedBounds = nil; capturedDesktopBounds = []
         status = ui("服务已停止；可以修改连接设置后重新启动。", "Host stopped. Edit the connection settings and start again.")
     }
     private func loadPairing() {
@@ -471,8 +460,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.target = self; menu.addItem(settings)
         let pair = NSMenuItem(title: ui("复制配对码", "Copy pairing code"), action: #selector(copyCode), keyEquivalent: "")
         pair.target = self; pair.isEnabled = setup?.usePairing.state == .on; menu.addItem(pair)
-        let uninstall = NSMenuItem(title: ui("卸载 ThunderDisplay…", "Uninstall ThunderDisplay…"), action: #selector(openUninstaller), keyEquivalent: "")
-        uninstall.target = self; menu.addItem(uninstall)
         menu.addItem(.separator()); menu.addItem(NSMenuItem(title: ui("退出", "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item?.menu = menu
     }
@@ -499,15 +486,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !image.representations.isEmpty else { return }
         image.isTemplate = true
         button.title = ""; button.image = image; button.toolTip = "ThunderDisplay"
-    }
-    @objc private func openUninstaller() {
-        let url = URL(fileURLWithPath: "/Applications/ThunderDisplay Uninstaller.app")
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            let alert = NSAlert(); alert.messageText = ui("未找到卸载程序", "Uninstaller missing")
-            alert.informativeText = ui("请重新运行 ThunderDisplay 安装包修复安装。", "Run the ThunderDisplay installer again to repair the installation.")
-            alert.runModal(); return
-        }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
     @objc private func copyCode() { copyPairing() }
     func applicationWillTerminate(_ notification: Notification) {
@@ -570,6 +548,11 @@ do {
         let result = FreshPermissions(screen: CGPreflightScreenCaptureAccess(), access: CGPreflightPostEventAccess(), axTrusted: AXIsProcessTrusted())
         let data = try JSONEncoder().encode(result)
         FileHandle.standardOutput.write(data)
+    } else if options.captureRateCheck {
+        try captureRateCheck(displayID: options.display, raw: options.rawCaptureRateCheck, updates: options.updateCaptureRateCheck,
+            depth: options.captureDepthFive ? 5 : 3, unthrottled: options.unthrottledCaptureCheck)
+    } else if options.rawTransportCheck {
+        try rawTransportCheck()
     } else if options.captureCheck {
         try captureCheck(displayID: options.display, tenBit: options.captureCheck10, nativePixels: options.captureCheckNative, cursorVisible: !options.captureCheckLocalCursor, desktopSRGB: options.desktopColorCheck)
     } else if options.encoderCheck {

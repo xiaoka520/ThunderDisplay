@@ -18,5 +18,9 @@ int main() {
     REQUIRE(full.pointer(2559,1599,false,2560,1600,x,y)); REQUIRE(x==65535 && y==65535);
     td::PresentationGeometry letterbox(1920,1080,2560,1600,false);
     REQUIRE(letterbox.destination.top==80); REQUIRE(!letterbox.pointer(10,10,false,1920,1080,x,y));
+    REQUIRE(letterbox.remotePointer(0,0,1920,1080,x,y)); REQUIRE(x==0 && y==80);
+    REQUIRE(full.remotePointer(65535,65535,2560,1600,x,y)); REQUIRE(x==2559 && y==1599);
+    REQUIRE(!native.remotePointer(0,0,2560,1600,x,y));
+    REQUIRE(native.remotePointer(32768,32768,2560,1600,x,y)); REQUIRE(x==640 && y==400);
     std::cout<<"Pixel-exact, fit, letterbox and cropped pointer mapping tests passed\n";
 }
